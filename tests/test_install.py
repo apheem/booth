@@ -16,6 +16,26 @@ def tree(root):
     return sorted(str(p.relative_to(root)) for p in root.rglob("*") if "__pycache__" not in p.parts)
 
 
+STUB = """#!/bin/sh
+echo "${0##*/} $*" >> "$STUB_LOG"
+case $* in *is-enabled*) echo "${UNIT_STATE-enabled}"; [ "${UNIT_STATE-enabled}" = enabled ] || exit 1 ;; esac
+case $* in *Activate\\ quit*) [ "${QUIT_RC:-0}" = 0 ] || exit "$QUIT_RC" ;; esac
+case ${0##*/} in systemctl) exit "${SYSTEMCTL_RC:-0}" ;; gdbus) [ "${GDBUS_RC:-0}" = 0 ] || exit "$GDBUS_RC" ;; esac
+case $* in *NameHasOwner*)
+  if [ "$(grep -c NameHasOwner "$STUB_LOG")" -le "${OWNED_POLLS:-0}" ]; then echo "(true,)"; else echo "(false,)"; fi ;;
+esac
+"""
+QUIT = (f"gdbus call --session --dest {APP_ID} --object-path /io/github/apheem/Booth"
+        " --method org.gtk.Actions.Activate quit [] {}")
+OWNER = ("gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus"
+         f" --method org.freedesktop.DBus.NameHasOwner {APP_ID}")
+UNIT_CALLS = ["systemctl --user daemon-reload", "systemctl --user enable booth.service",
+              "systemctl --user restart booth.service"]
+STALE = "Booth is still running the old version"
+CLOSED = "Booth was closed to update it — open it again from the app grid."
+NO_SYSTEMD = "couldn't reach systemd; run: systemctl --user daemon-reload && systemctl --user restart booth.service"
+
+
 class Install(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -24,9 +44,19 @@ class Install(unittest.TestCase):
         self.home.mkdir()
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
         self.env["HOME"] = str(self.home)
+        # Stub systemctl, gdbus and sleep first on PATH record their argv in one log: an install test never reaches the
+        # real user manager or session bus. Booth's bus name reads as owned for the first OWNED_POLLS queries.
+        stubs = Path(tmp.name) / "stubs"
+        stubs.mkdir()
+        self.calls = Path(tmp.name) / "stubs.log"
+        for name in ("systemctl", "gdbus", "sleep"):
+            (stubs / name).write_text(STUB)
+            (stubs / name).chmod(0o755)
+        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", STUB_LOG=str(self.calls))
         self.app = self.home / ".local/share/booth/booth"
         self.launcher = self.home / ".local/bin/booth"
         self.desktop = self.home / f".local/share/applications/{APP_ID}.desktop"
+        self.unit = self.home / ".config/systemd/user/booth.service"
 
     def install(self, repo=REPO):
         return subprocess.run(["sh", str(repo / "install.sh")], env=self.env, cwd=self.home,
@@ -65,7 +95,118 @@ class Install(unittest.TestCase):
         code = [ln for ln in (REPO / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
         self.assertFalse([ln for ln in code if "sudo" in ln])
         written = {p.relative_to(self.home).parts[:2] for p in self.home.rglob("*") if p.is_file()}
-        self.assertEqual(written, {(".local", "bin"), (".local", "share")})
+        self.assertEqual(written, {(".local", "bin"), (".local", "share"), (".config", "systemd")})
+
+    def test_installs_enables_and_starts_the_service(self):
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # restart, not start: a re-install must run the new copy (start leaves a running old one as it is).
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + UNIT_CALLS)
+        self.assertNotIn("couldn't start", r.stderr)
+        self.assertNotIn(STALE, r.stdout + r.stderr)
+        unit = self.unit.read_text().splitlines()
+        self.assertIn(f'ExecStart=/bin/sh "{self.launcher}" --background', unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartSec=5", unit)  # a crash loop stays under systemd's start limit
+        self.assertIn("PartOf=graphical-session.target", unit)  # it stops with the session whose display it uses
+        self.assertIn("WantedBy=graphical-session.target", unit)  # GTK needs the session's display
+        self.assertIn("After=graphical-session.target", unit)
+        self.assertNotIn(str(REPO), self.unit.read_text())
+
+    def test_a_running_booth_is_asked_to_quit_and_waited_for_before_the_restart(self):
+        # Else the restarted unit's --background finds it, exits 0 and the old code keeps running.
+        self.env["OWNED_POLLS"] = "3"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(),
+                         [QUIT] + [OWNER, "sleep 0.5"] * 3 + [OWNER] + UNIT_CALLS)
+        self.assertNotIn(STALE, r.stdout + r.stderr)
+
+    def test_a_booth_that_wont_quit_is_waited_for_at_most_5_s_then_named(self):
+        self.env["OWNED_POLLS"] = "99"  # an old copy with no app.quit
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls.count("sleep 0.5"), 10)
+        self.assertEqual(len(calls), 1 + 11 + 10 + 3)
+        self.assertEqual(calls[-3:], UNIT_CALLS)
+        # nothing starts the new copy until it's gone: say how to start it then
+        self.assertIn(STALE + " — close Booth, then run: systemctl --user restart booth.service (or log out and in).",
+                      r.stderr)
+
+    def test_a_reinstall_keeps_the_service_switched_off(self):
+        self.assertEqual(self.install().returncode, 0)  # the first install enables it
+        self.env["UNIT_STATE"] = "disabled"  # then "Run in background" was switched off
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls[2:], ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload"])
+        self.assertNotIn("couldn't start", r.stderr)
+
+    def test_fsk_reinstall_with_no_user_bus_says_nothing(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.env.update(UNIT_STATE="", SYSTEMCTL_RC="1")  # is-enabled can't reach the user manager: no answer
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(NO_SYSTEMD, r.stderr)  # an enabled service would keep running the old copy: say how to restart
+        self.assertNotIn("systemctl --user restart booth.service", self.calls.read_text())
+        self.assertIn(CLOSED, r.stdout)
+
+    def test_fsk_reinstall_switched_off_closes_the_open_window_silently(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.env["UNIT_STATE"] = "disabled"
+        r = self.install()  # the quit closed the open Booth window and nothing restarts it
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(CLOSED, r.stdout)
+        self.env["QUIT_RC"] = "1"  # no Booth was running: nothing was closed
+        r = self.install()
+        self.assertNotIn(CLOSED, r.stdout + r.stderr)
+        self.env.update(QUIT_RC="0", OWNED_POLLS="99")  # an old copy that won't quit, with the switch off
+        self.calls.write_text("")
+        r = self.install()
+        self.assertIn(STALE + " — close Booth and open it again.", r.stderr)
+        self.assertNotIn("restart booth.service", r.stdout + r.stderr)  # that would start a disabled unit
+        self.assertNotIn(CLOSED, r.stdout)  # it wasn't closed
+
+    def test_a_restarted_service_says_nothing_about_closing(self):
+        self.assertEqual(self.install().returncode, 0)
+        r = self.install()  # enabled: the restart brings Booth back
+        self.assertNotIn(CLOSED, r.stdout + r.stderr)
+
+    def test_a_reinstall_restarts_an_enabled_service_without_enabling_it_again(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines()[2:],
+                         ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload",
+                          "systemctl --user restart booth.service"])
+
+    def test_with_no_session_bus_the_restart_still_runs(self):
+        self.env["GDBUS_RC"] = "1"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + UNIT_CALLS)
+        self.assertNotIn(STALE, r.stdout + r.stderr)
+
+    def test_the_unit_follows_xdg_config_home_unless_relative(self):
+        self.env["XDG_CONFIG_HOME"] = str(self.home / "cfg")
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue((self.home / "cfg/systemd/user/booth.service").is_file())
+        self.env["XDG_CONFIG_HOME"] = "rel/cfg"
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(self.unit.is_file())
+        self.assertFalse((self.home / "rel").exists())
+
+    def test_without_a_user_manager_the_app_still_installs_and_says_how_to_start_it(self):
+        self.env["SYSTEMCTL_RC"] = "1"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("systemctl --user enable --now booth.service", r.stderr)
+        self.assertTrue(self.unit.is_file())
+        self.assertEqual(tree(self.app), tree(REPO / "booth"))
 
     def test_rerun_is_safe_and_replaces_stale_files(self):
         self.assertEqual(self.install().returncode, 0)
@@ -76,6 +217,7 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(tree(self.app), tree(REPO / "booth"))
         self.assertEqual(list(self.app.parent.iterdir()), [self.app])
+        self.assertEqual(os.listdir(self.unit.parent), ["booth.service"])  # no staged booth.service.new left behind
 
     def test_relative_xdg_data_home_is_ignored(self):
         self.env["XDG_DATA_HOME"] = "rel/share"  # invalid per the XDG spec: must not install relative to the cwd
@@ -92,6 +234,7 @@ class Install(unittest.TestCase):
                            timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Usage", r.stdout)
+        self.assertIn("--background", r.stdout)  # the option the unit starts it with
 
     def test_a_home_with_shell_and_desktop_entry_specials(self):
         import gi
@@ -109,6 +252,16 @@ class Install(unittest.TestCase):
         self.assertRegex(exec_, r'^"(?:[^"`$\\]|\\["`$\\])*"$')
         exec_ = re.sub("%(.)", lambda m: "%" if m[1] == "%" else "<field code>", exec_)
         self.assertEqual(GLib.shell_parse_argv(exec_)[1], [str(launcher)])
+        # Unit-file quoting: in a quoted word \ and " take a backslash; %% is a literal %, $$ a literal $.
+        unit = self.home / ".config/systemd/user/booth.service"
+        start = next(ln for ln in unit.read_text().splitlines() if ln.startswith("ExecStart="))
+        m = re.fullmatch(r'ExecStart=/bin/sh "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" --background', start)
+        self.assertIsNotNone(m, start)
+        self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]), str(launcher))
+        if shutil.which("systemd-analyze"):  # read-only: parses the unit, starts nothing
+            v = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)], capture_output=True, text=True,
+                               timeout=60)
+            self.assertEqual(v.returncode, 0, v.stderr)
         env = {k: v for k, v in self.env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "PYTHONPATH")}
         r = subprocess.run([str(launcher), "--help"], env=env, cwd=self.home, capture_output=True, text=True,
                            timeout=60)

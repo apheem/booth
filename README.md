@@ -17,7 +17,14 @@ No pip installs, no sudo.
 
 It copies the repo app folder `booth/` to the install folder `~/.local/share/booth/booth/` (a real copy, never a
 symlink), and writes the launcher `~/.local/bin/booth` and the app-grid entry
-`~/.local/share/applications/io.github.apheem.Booth.desktop`. Re-running it replaces the previous install.
+`~/.local/share/applications/io.github.apheem.Booth.desktop`. It also writes the systemd user unit
+`~/.config/systemd/user/booth.service` (`booth --background`, started with your desktop session; it re-applies the
+camera settings at login and whenever the BRIO is plugged back in), enables it and (re)starts it. Opening Booth then
+shows the window of that running instance; "Run in Background" in the main menu disables or enables the service; on, it also
+keeps the open Booth running after its window closes.
+Re-running it replaces the previous install and keeps your "Run in Background" choice: it restarts the service only if
+it is enabled, and never enables one you switched off. A Booth it had to close and didn't restart is named, as is a
+service state it couldn't read (no user bus), with the command to restart it by hand.
 To check an install matches the repo:
 
     diff -rq -x __pycache__ booth ~/.local/share/booth/booth

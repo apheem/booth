@@ -2,6 +2,7 @@
 commands that set them."""
 import re
 import subprocess
+import threading
 
 from booth import xu
 
@@ -162,15 +163,20 @@ def status(ctrls, values):
 
 
 def restore_cmds(device, ctrls, saved):
-    """Commands that re-apply saved {name: value} controls this camera has, each clamped to its live range: auto modes
-    first, and no manual value whose auto mode stays on (the driver would refuse it). A saved menu value the menu lacks
-    is not sent, except the LED's, which falls back to Auto: Booth never turns the LED off unless the user picked Off."""
+    """Commands that re-apply saved {name: value} controls this camera has: restore_writes, as commands."""
+    return [set_cmd(device, name, value) for name, value in restore_writes(ctrls, saved)]
+
+
+def restore_writes(ctrls, saved):
+    """The ordered [(name, value)] that re-apply saved controls this camera has, each clamped to its live range: auto
+    modes first, and no manual value whose auto mode stays on (the driver would refuse it). A saved menu value the menu
+    lacks is not sent, except the LED's, which falls back to Auto: Booth never turns the LED off unless the user picked
+    Off."""
     saved = {n: v if "menu" not in ctrls.get(n, {}) or v in ctrls[n]["menu"] else xu.DEFAULTS.get(n)
              for n, v in saved.items()}
     saved = {n: v for n, v in saved.items() if v is not None}
     hold = held({n: c["value"] for n, c in ctrls.items() if "value" in c} | saved)
-    return [set_cmd(device, name, clamp(ctrls[name], value)) for name, value in ordered(saved)
-            if name in ctrls and name not in hold]
+    return [(name, clamp(ctrls[name], value)) for name, value in ordered(saved) if name in ctrls and name not in hold]
 
 
 def read_ctrls(device):
@@ -183,15 +189,20 @@ def read_ctrls(device):
     return parse_ctrls(out) | xu.read(device)
 
 
+WRITING = threading.RLock()  # one camera write at a time; a restore holds it for its whole batch (app.RESTORING)
+
+
 def run(cmd):
-    """Run one set command; False when it failed (the camera was unplugged or refused the value)."""
-    try:
-        if cmd[0] == XU_CMD:
-            name, _, value = cmd[3].removeprefix("--set-ctrl=").partition("=")
-            return xu.write(cmd[2], name, int(value))
-        return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+    """Run one set command, never while another thread's write or restore is on the camera; False when it failed (the
+    camera was unplugged or refused the value)."""
+    with WRITING:
+        try:
+            if cmd[0] == XU_CMD:
+                name, _, value = cmd[3].removeprefix("--set-ctrl=").partition("=")
+                return xu.write(cmd[2], name, int(value))
+            return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
 
 
 def restore(device, saved):
@@ -224,6 +235,18 @@ class Setter:
             self.queue.append(writes)
         if not self.batch:
             self._next()
+
+    def reapply(self, ctrls):
+        """Queue the saved controls again (a replug reset the camera) → the writes. Each goes at its saved value, or at
+        a newer one still queued or in flight (not saved yet), so it never lands after that newer one; never at a value
+        merely read from the camera. One write each, like a launch restore: a refusal skips only itself."""
+        wanted = {}
+        for batch in [self.batch] + self.queue:  # oldest first: the newest value of each control wins
+            wanted.update(batch)
+        writes = restore_writes(ctrls, {n: wanted.get(n, v) for n, v in self.settings["camera"].items()})
+        for write in writes:
+            self.set([write])
+        return writes
 
     def _next(self):
         if not self.batch and self.queue:

@@ -1,6 +1,9 @@
 import subprocess
+import threading
 import unittest
 from unittest import mock
+
+from gi.repository import GLib
 
 from booth import camera, xu
 from tests.fixture import read
@@ -337,6 +340,19 @@ class Restore(unittest.TestCase):
         self.assertEqual(self.restore(None, {"zoom_absolute": 250}), ([], []))
 
 
+class OneWriter(unittest.TestCase):
+    def test_a_write_waits_for_a_restore_holding_the_camera(self):
+        ran = []
+        with mock.patch("booth.camera.subprocess.run", lambda c, **kw: ran.append(c) or subprocess.CompletedProcess(c, 0)):
+            with camera.WRITING:  # a restore on another thread is writing its batch
+                writer = threading.Thread(target=camera.run, args=(zoom(300),))
+                writer.start()
+                writer.join(0.3)
+                self.assertEqual(ran, [])
+            writer.join(5)
+        self.assertEqual(ran, [zoom(300)])
+
+
 class RestoreXU(unittest.TestCase):
     def test_saved_fov_is_reapplied_at_launch_through_the_ioctl(self):
         with mock.patch.object(camera, "read_ctrls", return_value=brio()), \
@@ -466,6 +482,40 @@ class SetterTest(unittest.TestCase):
         self.spawn.finish(True)
         self.assertEqual(self.settings["camera"], {"zoom_absolute": 200, "fov": 0})
 
+    def test_a_replug_restore_never_lands_an_older_value_after_a_newer_one(self):
+        self.settings["camera"].update({"zoom_absolute": 150, AF: 0, FOCUS: 40})  # saved before the replug
+        self.setter.set([("zoom_absolute", 300)])  # a drag just after the replug: in flight, not saved yet
+        self.setter.set([(AF, 0), (FOCUS, 45)])  # and a newer focus, queued behind it
+        self.assertEqual(self.setter.reapply(brio()), [(AF, 0), ("zoom_absolute", 300), (FOCUS, 45)])
+        self.setter.set([("brightness", 140)])  # and a write after the restore was queued
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [zoom(300), cmd(AF, 0), cmd(FOCUS, 45), cmd(AF, 0), zoom(300), cmd(FOCUS, 45),
+                                           cmd("brightness", 140)])
+        self.assertEqual(self.settings["camera"], {"zoom_absolute": 300, AF: 0, FOCUS: 45, "brightness": 140})
+
+    def test_fsk_inflight_then_newer_queued_same_control(self):
+        self.settings["camera"]["zoom_absolute"] = 150  # saved before the replug
+        self.setter.set([("zoom_absolute", 300)])  # in flight
+        self.setter.set([("zoom_absolute", 350)])  # newer, queued behind it
+        self.assertEqual(self.setter.reapply(brio()), [("zoom_absolute", 350)])
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds[-1], zoom(350))
+        self.assertEqual(self.settings["camera"]["zoom_absolute"], 350)
+        self.assertEqual(self.saved[-1]["zoom_absolute"], 350)
+
+    def test_a_replug_restore_writes_the_saved_values_never_what_the_camera_reads_back(self):
+        # The page read the camera between the replug and the restore: it took the power-on defaults (zoom 100, AF on).
+        self.settings["camera"].update({"zoom_absolute": 250, AF: 0, FOCUS: 40})
+        before = dict(self.settings["camera"])
+        self.assertEqual(self.setter.reapply(brio()), [(AF, 0), ("zoom_absolute", 250), (FOCUS, 40)])
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [cmd(AF, 0), zoom(250), cmd(FOCUS, 40)])
+        self.assertEqual(self.settings["camera"], before)
+        self.assertTrue(all(saved == before for saved in self.saved))
+
     def test_batches_for_other_controls_do_not_collapse(self):
         self.setter.set([("zoom_absolute", 200)])
         self.setter.set([])  # nothing to send (a held manual value) must not stall the queue
@@ -494,6 +544,28 @@ class PageQuietTest(unittest.TestCase):
         self.assertEqual(sent, [])
         CameraPage.changed(page, "zoom_absolute", 250)  # the user moving it still sends
         self.assertEqual(sent, [[("zoom_absolute", 250)]])
+
+    def test_a_replug_reapplies_the_saved_values_and_the_page_shows_them(self):
+        from booth.ui.camera import CameraPage
+
+        page = mock.Mock(values={"zoom_absolute": 100, AF: 1}, ctrls=brio())  # the camera's power-on defaults
+        page.setter.reapply.return_value = [(AF, 0), ("zoom_absolute", 250)]
+        CameraPage.reapply(page)
+        page.setter.reapply.assert_called_once_with(page.ctrls)  # never the page's values: they may be the defaults
+        self.assertEqual(page.values, {"zoom_absolute": 250, AF: 0})
+        self.assertEqual(list(page.show.call_args.args[0]), [AF, "zoom_absolute"])
+
+    def test_a_finished_write_for_a_control_with_no_row_goes_on_to_the_next(self):
+        from booth.ui.camera import CameraPage
+
+        spawn, settings = FakeSpawn(), {"version": 1, "camera": {}}
+        page = mock.Mock(rows={}, errors={}, values={}, ctrls=brio())  # led_mode is saved but has no row on this page
+        page.setter = camera.Setter(settings, DEV, spawn, lambda s: None, {})
+        page.setter.set([("led_mode", 3)])
+        page.setter.set([("zoom_absolute", 200)])
+        self.assertEqual(CameraPage.finished(page, "led_mode", True, spawn.done.pop(0)), GLib.SOURCE_REMOVE)
+        self.assertEqual(spawn.cmds[-1], zoom(200))  # the queue did not stall
+        self.assertEqual(settings["camera"], {"led_mode": 3})
 
 
 if __name__ == "__main__":
