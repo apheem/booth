@@ -1,0 +1,319 @@
+"""The Microphone page's Scarlett group, through its real __init__ and handlers with stand-in widgets: 48V goes on only
+after the user confirms the dialog, never from a poll; each row writes its own control by name; outside changes and
+unplug/replug show up on the next poll; the Input choice is saved."""
+import types
+import unittest
+from unittest import mock
+
+from gi.repository import GObject
+
+from booth import scarlett
+from booth.ui import microphone
+from booth.ui import window as ui_window
+from tests.fixture import read
+from tests.test_app import Inline
+from tests.test_headset import DUMP
+
+CONTENTS = read("scarlett/amixer-contents.txt")
+
+
+def state(**values):
+    """A poll's result from the captured controls, with {control name: first value} replaced."""
+    ctrls = scarlett.parse_contents(CONTENTS)
+    for name, v in values.items():
+        ctrls[name]["values"] = [v]
+    return {"ctrls": ctrls, "mic": scarlett.mic(ctrls, DUMP, "XLR")}
+
+
+class Boom(Exception):
+    pass
+
+
+def boom(*_args):
+    raise Boom
+
+
+class _W:
+    """A widget stand-in that, like GTK, notifies its handler when a value really changes."""
+
+    def __init__(self, *_args, **kwargs):
+        self.handlers, self.active, self.selected, self.sensitive = {}, False, 0, True
+        self.description = self.subtitle = self.model = None
+        self.responses = []
+
+    def connect(self, signal, handler, *args):
+        self.handlers[signal] = (handler, args)
+
+    def emit(self, signal, *values):
+        handler, args = self.handlers[signal]
+        handler(self, *values, *args)
+
+    def get_active(self):
+        return self.active
+
+    def set_active(self, on):
+        if on != self.active:
+            self.active = on
+            self.emit("notify::active", None)
+
+    def get_selected(self):
+        return self.selected
+
+    def set_selected(self, i):
+        if i != self.selected:
+            self.selected = i
+            if "notify::selected" in self.handlers:
+                self.emit("notify::selected", None)
+
+    def set_model(self, model):
+        self.model = model
+
+    def set_sensitive(self, on):
+        self.sensitive = on
+
+    def set_description(self, text):
+        self.description = text
+
+    def set_subtitle(self, text):
+        self.subtitle = text
+
+    def add_response(self, rid, _label):
+        self.responses.append(rid)
+
+    def set_default_response(self, rid):
+        self.default_response = rid
+
+    def set_close_response(self, rid):
+        self.close_response = rid
+
+    def __getattr__(self, _name):  # add, set_response_appearance…
+        return lambda *_args: None
+
+
+Page = type("MicrophoneStandIn", (GObject.Object,), {
+    **{k: v for k, v in vars(microphone.MicrophonePage).items() if callable(v) and not k.startswith("__")},
+    "add": lambda self, _group: None, "poll": lambda self: True})
+
+
+class ScarlettGroup(unittest.TestCase):
+    def setUp(self):
+        self.ran, self.saved, self.dialogs = [], [], []
+        self.settings = {"microphone": {}}
+
+        real_send = scarlett.send
+
+        def send(make):
+            real_send(make, lambda *cmd: self.ran.append(list(cmd)), lambda: "Gen")
+
+        def dialog(**_kwargs):
+            d = _W()
+            d.present = lambda parent: self.dialogs.append(d)
+            return d
+        ns = types.SimpleNamespace
+        for patch in (
+                mock.patch.object(microphone, "super", lambda *a: ns(__init__=lambda: None), create=True),
+                mock.patch.object(microphone, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W, ComboRow=_W,
+                                                        AlertDialog=dialog, ResponseAppearance=ns(DESTRUCTIVE=2))),
+                mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295)),
+                mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
+                mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: f(*a)),
+                mock.patch.object(microphone.threading, "Thread", Inline),
+                mock.patch.object(microphone.scarlett, "send", send),
+                mock.patch.object(microphone.store, "save", self.saved.append)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.page = Page()
+        microphone.MicrophonePage.__init__(self.page, self.settings)
+        self.assertEqual([n for n in vars(self.page) if hasattr(microphone.MicrophonePage, n)], [])  # none shadowed
+
+    def show(self, s):
+        self.page.show(s, self.page.writer.writes)
+
+    def click(self, row, on):
+        row.active = on
+        row.emit("notify::active", None)
+
+    def select(self, row, i):
+        row.selected = i
+        row.emit("notify::selected", None)
+
+    def cset(self, name, value):
+        return ["amixer", "-c", "Gen", "cset", f"name={name}", value]
+
+    def test_turning_48v_on_asks_first_writes_nothing_and_leaves_the_switch_off(self):
+        self.show(state())
+        self.click(self.page.phantom, True)
+        self.assertEqual(self.ran, [])
+        self.assertFalse(self.page.phantom.active)
+        self.assertEqual(len(self.dialogs), 1)
+        self.assertEqual(self.dialogs[0].responses, ["cancel", "on"])
+
+    def test_confirming_the_dialog_turns_48v_on(self):
+        self.show(state())
+        self.click(self.page.phantom, True)
+        self.dialogs[0].emit("response", "on")
+        self.assertEqual(self.ran, [self.cset(scarlett.PHANTOM, "on")])
+        self.assertTrue(self.page.phantom.active)
+
+    def test_cancelling_the_dialog_writes_nothing(self):
+        self.show(state())
+        self.click(self.page.phantom, True)
+        self.dialogs[0].emit("response", "cancel")
+        self.assertEqual(self.ran, [])
+        self.assertFalse(self.page.phantom.active)
+
+    def test_the_dialogs_default_and_close_are_cancel_and_only_on_writes(self):
+        self.show(state())
+        self.click(self.page.phantom, True)
+        d = self.dialogs[0]
+        self.assertEqual((d.default_response, d.close_response), ("cancel", "cancel"))
+        d.emit("response", d.close_response)  # Escape or the window's close
+        d.emit("response", d.default_response)  # Enter
+        self.assertEqual((self.ran, self.page.phantom.active), ([], False))
+        d.emit("response", "on")
+        self.assertEqual(self.ran, [self.cset(scarlett.PHANTOM, "on")])
+
+    def test_48v_off_is_written_without_asking(self):
+        self.show(state(**{scarlett.PHANTOM: True}))
+        self.click(self.page.phantom, False)
+        self.assertEqual((self.ran, self.dialogs), ([self.cset(scarlett.PHANTOM, "off")], []))
+
+    def test_a_poll_showing_outside_changes_writes_nothing(self):
+        self.show(state(**{scarlett.PHANTOM: True, scarlett.DIRECT: True, scarlett.AIR: 2, scarlett.LEVEL: 1}))
+        self.assertEqual((self.ran, self.dialogs, self.saved), ([], [], []))
+        p = self.page
+        self.assertEqual((p.phantom.active, p.direct.active, p.air.selected, p.level.selected), (True, True, 2, 1))
+        self.show(state())  # and back
+        self.assertEqual((self.ran, self.dialogs), ([], []))
+        self.assertEqual((p.phantom.active, p.direct.active, p.air.selected, p.level.selected), (False, False, 1, 0))
+
+    def test_the_combos_list_the_devices_own_items(self):
+        self.show(state())
+        self.assertEqual(self.page.air.model, ["Off", "Presence", "Presence + Drive"])
+        self.assertEqual(self.page.level.model, ["Line", "Inst"])
+
+    def test_each_row_writes_only_its_own_control(self):
+        self.show(state())
+        self.select(self.page.air, 2)
+        self.select(self.page.level, 1)
+        self.click(self.page.direct, True)
+        self.assertEqual(self.ran, [self.cset(scarlett.AIR, "2"), self.cset(scarlett.LEVEL, "1"),
+                                    self.cset(scarlett.DIRECT, "on")])
+
+    def test_no_selection_writes_nothing(self):
+        self.show(state())
+        self.select(self.page.air, 4294967295)
+        self.assertEqual(self.ran, [])
+
+    def test_read_only_rows(self):
+        self.show(state())
+        self.assertEqual((self.page.firmware.subtitle, self.page.sync.subtitle), ("2188", "Locked"))
+        self.assertEqual(self.page.input.subtitle, "Capture channel 2 (FR)")
+
+    def test_unplugged_shows_plug_it_in_and_comes_back_on_replug(self):
+        self.show(state())
+        self.show(None)
+        self.assertEqual(self.page.group.description, "Scarlett not connected — plug it in")
+        self.assertFalse(any(row.sensitive for row in self.page.rows.values()))
+        self.show(state())
+        self.assertIsNone(self.page.group.description)
+        self.assertTrue(all(row.sensitive for row in self.page.rows.values()))
+        self.assertEqual(self.ran, [])
+
+    def test_input_defaults_to_xlr_and_the_choice_is_saved(self):
+        self.assertEqual(self.page.input.selected, 0)
+        self.select(self.page.input, 1)
+        self.assertEqual((self.settings["microphone"], self.saved, self.ran), ({"input": "Instrument"}, [self.settings], []))
+
+    def test_a_saved_input_is_selected_at_start(self):
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {"input": "Instrument"}})
+        self.assertEqual(page.input.selected, 1)
+
+
+    def real_poll(self, read):
+        """The page's own poll() over a stand-in scarlett.read; returns the main-loop queue its show() lands on."""
+        idle = []
+        for patch in (mock.patch.object(microphone.scarlett, "read", read),
+                      mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: idle.append((f, a)))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.page.poll = types.MethodType(microphone.MicrophonePage.poll, self.page)
+        return idle
+
+    def test_an_overlapping_poll_is_refused_and_the_next_one_after_show_runs(self):
+        reads = []
+        idle = self.real_poll(lambda choice: reads.append(choice) or state(**{scarlett.DIRECT: True}))
+        self.page.poll()
+        self.page.poll()  # the first one's read hasn't been shown yet
+        self.assertEqual(reads, ["XLR"])
+        f, a = idle.pop()
+        f(*a)
+        self.assertTrue(self.page.direct.active)
+        self.page.poll()  # consecutive polls both run
+        self.assertEqual(reads, ["XLR", "XLR"])
+        self.assertEqual(len(idle), 1)
+
+    def test_a_poll_that_read_before_a_write_landed_is_not_shown(self):
+        self.show(state())
+        since = self.page.writer.writes
+        self.select(self.page.air, 2)  # the write lands after the poll read Air = 1
+        self.page.show(state(), since)
+        self.assertEqual(self.page.air.selected, 2)
+        self.assertFalse(self.page.polling)
+        self.page.show(state(), self.page.writer.writes)  # the next poll shows it
+        self.assertEqual(self.page.air.selected, 1)
+
+    def test_changing_the_input_polls_again(self):
+        reads = []
+        self.real_poll(lambda choice: reads.append(choice))
+        self.select(self.page.input, 1)
+        self.assertEqual(reads, ["Instrument"])
+
+    def test_stop_removes_the_poll_timer(self):
+        removed = []
+        with mock.patch.object(microphone.GLib, "source_remove", removed.append):
+            self.page.stop()
+        self.assertEqual(removed, [self.page.timer])
+
+
+class WindowClose(unittest.TestCase):
+    def test_closing_the_window_stops_the_microphone_pages_poll(self):
+        ns, win = types.SimpleNamespace, mock.Mock()
+        with mock.patch.object(ui_window, "super", lambda *a: ns(__init__=lambda **k: None), create=True), \
+                mock.patch.object(ui_window, "Adw"), mock.patch.object(ui_window, "Gtk"), \
+                mock.patch.object(ui_window, "CameraPage"), mock.patch.object(ui_window, "HeadphonesPage"), \
+                mock.patch.object(ui_window, "MicrophonePage") as mic:
+            ui_window.Window.__init__(win, None, {}, None, {})
+        for c in win.connect.call_args_list:
+            if c.args[0] == "close-request":
+                c.args[1](win)
+        mic.return_value.stop.assert_called_once_with()
+
+
+class Worker(unittest.TestCase):
+    def setUp(self):
+        self.idle = []
+        for patch in (mock.patch.object(microphone.threading, "Thread", Inline),
+                      mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: self.idle.append((f, a)))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_a_write_reports_done_even_when_it_raises(self):
+        done = object()
+        page = mock.Mock(write=lambda make, d: microphone.MicrophonePage.write(page, make, d))
+        with mock.patch.object(microphone.scarlett, "send", boom), self.assertRaises(Boom):
+            microphone.MicrophonePage.spawn(page, None, done)
+        self.assertEqual(self.idle, [(done, ())])
+
+    def test_a_poll_reports_back_even_when_it_raises(self):
+        page = mock.Mock(polling=False, settings={"microphone": {}},
+                         read=lambda since: microphone.MicrophonePage.read(page, since))
+        page.writer.writes = 4
+        with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
+            microphone.MicrophonePage.poll(page)
+        self.assertEqual(self.idle, [(page.show, (None, 4))])
+
+
+if __name__ == "__main__":
+    unittest.main()

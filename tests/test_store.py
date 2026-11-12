@@ -77,6 +77,20 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_the_microphone_input_choice_round_trips(self):
+        settings = store.load(self.path)
+        self.assertEqual(settings["microphone"], {})  # no choice saved: XLR
+        settings["microphone"]["input"] = "Instrument"
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["microphone"], {"input": "Instrument"})
+
+    def test_a_bad_microphone_value_counts_as_corrupt(self):
+        # the Microphone page selects the saved input by name: anything but a known input would break it
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"microphone": 7}', '{"microphone": {"input": 7}}', '{"microphone": {"input": "Line"}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
     def test_failed_save_keeps_the_previous_file(self):
         old = store.defaults()
         old["camera"]["zoom_absolute"] = 250

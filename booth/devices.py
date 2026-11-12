@@ -11,6 +11,7 @@ SND_BY_ID = "/dev/snd/by-id"  # ALSA control links; the PRO X dongle's: usb-Logi
 CARDS = "/proc/asound/cards"
 PRO_X = "PRO X Wireless Gaming Headset"  # the dongle's ALSA card name
 PRO_X_USB = "usb-Logitech_PRO_X_Wireless_Gaming_Headset-"  # in its by-id link and its PipeWire node names
+SCARLETT = "Scarlett Solo 4th Gen"  # the interface's ALSA card name
 _CARD = re.compile(r"^\s*\d+ \[(\S+)\s*\]: .* - (.*)$")
 
 
@@ -88,6 +89,11 @@ def _read(path):
 def headset_card(read=_read):
     """The PRO X dongle's ALSA card id now, or None when it is unplugged."""
     return find_card(read(CARDS), PRO_X)
+
+
+def scarlett_card(read=_read):
+    """The Scarlett's ALSA card id now (e.g. "Gen"), or None when it is unplugged."""
+    return find_card(read(CARDS), SCARLETT)
 
 
 def parse_sinks(text):
