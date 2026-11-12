@@ -17,6 +17,12 @@ find "$dest/booth.new" -name __pycache__ -prune -exec rm -rf {} +
 rm -rf "$dest/booth"
 mv "$dest/booth.new" "$dest/booth"
 
+# The voice plugins, downloaded once into $dest/plugins (outside the app copy, which each run replaces) and verified
+# against the repo's sha256 pins. A failure doesn't stop the install: Booth refuses to load an unverified plugin.
+if ! PYTHONPATH=$dest python3 -P -m booth.plugins "$dest/plugins"; then
+  echo "install.sh: some voice plugins couldn't be fetched or verified (above); Booth won't load those until ./install.sh is run again with a network" >&2
+fi
+
 # Single-quoted in the launcher, each ' as '\'', so any HOME (" $ ` \ ') reaches python3 unchanged.
 dest_q=$(printf '%s' "$dest" | sed "s/'/'\\\\''/g")
 cat > "$bin/booth.new" <<EOF
