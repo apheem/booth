@@ -121,6 +121,12 @@ class Install(unittest.TestCase):
         self.assertIn("After=graphical-session.target", unit)
         self.assertNotIn(str(REPO), self.unit.read_text())
 
+    def test_the_voice_plugins_are_in_place_before_booth_is_quit_and_restarted(self):
+        lines = [ln for ln in (REPO / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
+        first = lambda s: next(i for i, ln in enumerate(lines) if s in ln)
+        self.assertLess(first("-m booth.plugins"), first("org.gtk.Actions.Activate quit"))
+        self.assertLess(first("-m booth.plugins"), first("systemctl --user restart booth.service"))
+
     def test_a_running_booth_is_asked_to_quit_and_waited_for_before_the_restart(self):
         # Else the restarted unit's --background finds it, exits 0 and the old code keeps running.
         self.env["OWNED_POLLS"] = "3"
