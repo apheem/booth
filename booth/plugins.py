@@ -50,9 +50,15 @@ def verify(name, where=None, manifest=MANIFEST):
         raise Refused(f"{name}: missing") from None
     except OSError as e:
         raise Refused(f"{name}: can't open ({e.strerror})") from None
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
         os.close(fd)
         raise Refused(f"{name}: not a regular file")
+    # The folder too: whoever can write it can swap the file between this check and the load.
+    for s in (st, os.stat(path.parent)):
+        if s.st_mode & 0o022 or s.st_uid != os.getuid():
+            os.close(fd)
+            raise Refused(f"{name}: it or its folder is writable by others or not yours")
     with os.fdopen(fd, "rb") as f:
         sha = hashlib.file_digest(f, "sha256").hexdigest()
     if sha != manifest[name]:
@@ -83,6 +89,15 @@ def fetch(where=None, manifest=MANIFEST):
     sources = [("RNNoise", _rnnoise, ["librnnoise_ladspa.so"]),
                (f"SWH plugins {SWH_VERSION}", _swh, list(SWH_FILES))]
     failed = []
+    old_umask = os.umask(0o022)  # what fetch creates must pass verify's mode check under any umask
+    try:
+        _fetch(where, manifest, sources, failed)
+    finally:
+        os.umask(old_umask)
+    return failed
+
+
+def _fetch(where, manifest, sources, failed):
     for what, download, names in sources:
         names = [n for n in names if n in manifest]
         todo = []
@@ -106,12 +121,12 @@ def fetch(where=None, manifest=MANIFEST):
                     continue
                 where.mkdir(exist_ok=True)
                 os.replace(stage / name, where / name)
+        # RuntimeError: an encrypted zip member, and (its subclass NotImplementedError) an unsupported compression
         except (OSError, subprocess.SubprocessError, zipfile.BadZipFile, zlib.error, KeyError,
-                ValueError) as e:
+                ValueError, RuntimeError) as e:
             failed.append(f"{what}: download failed ({e})")
         finally:
             shutil.rmtree(stage, ignore_errors=True)
-    return failed
 
 
 class _Hint(ctypes.Structure):

@@ -25,7 +25,8 @@ exit "${CURL_RC:-0}"
 """
 APT = """#!/bin/sh
 echo "apt-get $*" >> "$STUB_LOG"
-cp "$STUB_DIR/swh.deb" ./swh-plugins_0.4.17-3build1_amd64.deb
+[ "${APT_DEBS:-1}" -ge 1 ] && cp "$STUB_DIR/swh.deb" ./swh-plugins_0.4.17-3build1_amd64.deb
+[ "${APT_DEBS:-1}" -ge 2 ] && cp "$STUB_DIR/swh.deb" ./swh-plugins_0.4.17-3_amd64.deb
 exit "${APT_RC:-0}"
 """
 DPKG = """#!/bin/sh
@@ -41,10 +42,12 @@ class Verify(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.folder = self.dir / "plugins"
-        self.folder.mkdir()
+        self.folder.mkdir(mode=0o755)
+        self.folder.chmod(0o755)  # whatever the umask
 
     def put(self, name, data):
         (self.folder / name).write_bytes(data)
+        (self.folder / name).chmod(0o644)
 
     def refused(self, name, manifest=FAKE_MANIFEST):
         with self.assertRaises(plugins.Refused) as cm:
@@ -90,6 +93,23 @@ class Verify(unittest.TestCase):
         self.refused(SC4M)
         os.mkfifo(self.folder / RNNOISE)  # must not block waiting for a writer
         self.refused(RNNOISE)
+
+    def test_a_file_or_folder_others_can_write_is_refused(self):
+        self.put(SC4M, FAKE[SC4M])
+        for mode in (0o664, 0o646, 0o666):
+            (self.folder / SC4M).chmod(mode)
+            self.assertIn("writable by others", self.refused(SC4M))
+        (self.folder / SC4M).chmod(0o644)
+        for mode in (0o775, 0o757, 0o777):  # they could swap the file after it verifies
+            self.folder.chmod(mode)
+            self.assertIn("writable by others", self.refused(SC4M))
+        self.folder.chmod(0o755)
+        self.assertEqual(plugins.verify(SC4M, self.folder, FAKE_MANIFEST), self.folder / SC4M)
+
+    def test_a_file_or_folder_that_is_not_yours_is_refused(self):
+        self.put(SC4M, FAKE[SC4M])
+        with unittest.mock.patch("os.getuid", return_value=os.getuid() + 1):
+            self.assertIn("not yours", self.refused(SC4M))
 
     def test_a_name_not_in_the_manifest_is_refused(self):
         self.put("other.so", b"x")
@@ -225,6 +245,50 @@ class Fetch(unittest.TestCase):
         self.assertIn("RNNoise: download failed", failed[0])
         self.assertEqual(self.verified(), sorted([SC4M, LIMITER]))  # the SWH fetch still ran
 
+    def test_what_fetch_creates_verifies_under_a_loose_umask(self):
+        old = os.umask(0o002)
+        self.addCleanup(os.umask, old)
+        self.assertEqual(self.fetch(), [])
+        self.assertEqual(self.verified(), sorted(FAKE))
+        self.assertEqual(self.folder.stat().st_mode & 0o022, 0)
+        self.assertEqual(os.umask(0o002), 0o002)  # put back
+
+    def rezip(self, offset=None, value=None, member=plugins.RNNOISE_MEMBER):
+        zip_ = Path(self.env["STUB_DIR"]) / "linux-rnnoise.zip"
+        with zipfile.ZipFile(zip_, "w") as z:
+            z.writestr(member, FAKE[RNNOISE])
+        raw = bytearray(zip_.read_bytes())
+        if offset is not None:  # the local header's field, then the central directory's (2 bytes further in)
+            for sig, extra in ((b"PK\x03\x04", 0), (b"PK\x01\x02", 2)):
+                raw[raw.index(sig) + offset + extra] = value
+        zip_.write_bytes(bytes(raw))
+
+    def assert_rnnoise_alone_fails(self):
+        failed = self.fetch()
+        self.assertEqual(len(failed), 1, failed)
+        self.assertIn("RNNoise: download failed", failed[0])
+        self.assertEqual(self.verified(), sorted([SC4M, LIMITER]))  # the SWH fetch still ran
+
+    def test_a_zip_without_the_plugin_fails_rnnoise_alone(self):
+        self.rezip(member="linux-rnnoise/ladspa/renamed.so")
+        self.assert_rnnoise_alone_fails()
+
+    def test_an_encrypted_member_fails_rnnoise_alone(self):
+        self.rezip(6, 0x01)  # general purpose flag bit 0: encrypted
+        self.assert_rnnoise_alone_fails()
+
+    def test_an_unsupported_compression_fails_rnnoise_alone(self):
+        self.rezip(8, 99)  # compression method 99 (AES), which zipfile can't read
+        self.assert_rnnoise_alone_fails()
+
+    def test_apt_leaving_no_deb_or_two_fails_swh_alone(self):
+        for debs in ("0", "2"):
+            os.environ["APT_DEBS"] = debs
+            failed = self.fetch()
+            self.assertEqual(len(failed), 1, (debs, failed))
+            self.assertIn("SWH plugins 0.4.17-3build1: download failed", failed[0])
+            self.assertEqual(self.verified(), [RNNOISE])
+
     def test_glob_characters_in_the_data_path_are_literal(self):
         self.folder = self.dir / "a[1]" / "plugins"
         self.assertEqual(self.fetch(), [])
@@ -283,6 +347,7 @@ class Ports(unittest.TestCase):
             src, so = Path(tmp) / "fake.c", Path(tmp) / "fake.so"
             src.write_text(C_PLUGIN)
             subprocess.run(["gcc", "-shared", "-fPIC", "-o", so, src], check=True)
+            so.chmod(0o755)
             manifest = {"fake.so": hashlib.sha256(so.read_bytes()).hexdigest()}
             self.assertEqual(plugins.ports("fake.so", Path(tmp), manifest), [{
                 "label": "fake_mono", "id": 4242, "name": "Fake mono", "ports": [
@@ -297,6 +362,7 @@ class Ports(unittest.TestCase):
             data = so.read_bytes()
             so.unlink()  # a new file: rewriting the loaded one in place would crash this process
             so.write_bytes(data + b"\0")  # never loaded unless it verifies
+            so.chmod(0o755)
             with self.assertRaises(plugins.Refused):
                 plugins.ports("fake.so", Path(tmp), manifest)
 

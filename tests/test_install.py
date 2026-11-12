@@ -251,12 +251,24 @@ class Install(unittest.TestCase):
         self.env["XDG_DATA_HOME"] = str(self.home / "data")
         plugins = self.home / "data/booth/plugins"
         plugins.mkdir(parents=True)
+        plugins.chmod(0o755)  # whatever the umask: this test is about the sha256
         (plugins / "sc4m_1916.so").write_bytes(b"downloaded once")
+        (plugins / "sc4m_1916.so").chmod(0o644)
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f"-o {self.home}/data/booth/.plugins-fetch-", self.fetches.read_text())
         self.assertEqual((plugins / "sc4m_1916.so").read_bytes(), b"downloaded once")  # a failed fetch removes nothing
         self.assertIn("sc4m_1916.so: refused (sha256 mismatch)", r.stdout)
+
+    def test_the_plugin_fetch_never_imports_a_booth_folder_from_the_cwd(self):
+        decoy = self.home / "booth"  # install() runs from the home folder
+        decoy.mkdir()
+        (decoy / "__init__.py").write_text("")
+        (decoy / "plugins.py").write_text(f"open({str(self.home / 'decoy-ran')!r}, 'w')\n")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.home / "decoy-ran").exists())
+        self.assertIn("librnnoise_ladspa.so: refused (missing)", r.stdout)  # the installed module ran instead
 
     def test_launcher_runs_the_installed_copy(self):
         self.assertEqual(self.install().returncode, 0)
