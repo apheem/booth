@@ -18,19 +18,25 @@ class Window(Adw.ApplicationWindow):
     def __init__(self, app, settings, camera_node):
         super().__init__(application=app, title="Booth", default_width=860, default_height=560)
         self.set_size_request(360, 300)
+        camera_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Ready · 2.0×"
         self.pages = [
-            ("Camera", "camera-web-symbolic", page("Camera", CameraPage(settings, camera_node))),
+            ("Camera", "camera-web-symbolic", page("Camera", CameraPage(settings, camera_node, camera_status.set_label)),
+             camera_status),
             ("Microphone", "audio-input-microphone-symbolic",
-             page("Microphone", placeholder("Microphone", "audio-input-microphone-symbolic"))),
+             page("Microphone", placeholder("Microphone", "audio-input-microphone-symbolic")), None),
             ("Headphones", "audio-headphones-symbolic",
-             page("Headphones", placeholder("Headphones", "audio-headphones-symbolic"))),
+             page("Headphones", placeholder("Headphones", "audio-headphones-symbolic")), None),
         ]
 
         sidebar = Gtk.ListBox(css_classes=["navigation-sidebar"])
-        for title, icon, _ in self.pages:
+        for title, icon, _, subtitle in self.pages:
             row = Gtk.Box(spacing=12, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
             row.append(Gtk.Image(icon_name=icon))
-            row.append(Gtk.Label(label=title, xalign=0))
+            labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+            labels.append(Gtk.Label(label=title, xalign=0))
+            if subtitle:
+                labels.append(subtitle)
+            row.append(labels)
             sidebar.append(row)
 
         self.split = Adw.NavigationSplitView(sidebar=page("Booth", sidebar), content=self.pages[0][2])

@@ -38,6 +38,25 @@ class ParseControls(unittest.TestCase):
     def test_empty_listing(self):
         self.assertEqual(camera.parse_ctrls(""), {})
 
+    def test_int_ranges(self):
+        wb = self.ctrls["white_balance_temperature"]
+        self.assertEqual((wb["type"], wb["min"], wb["max"], wb["step"], wb["default"]), ("int", 2000, 7500, 10, 4000))
+        self.assertEqual(self.ctrls["backlight_compensation"]["max"], 1)
+
+    def test_inactive_manual_values_while_auto_is_on(self):
+        for name in ("exposure_time_absolute", "white_balance_temperature", "focus_absolute"):
+            self.assertTrue(self.ctrls[name]["inactive"], name)
+        self.assertFalse(self.ctrls["brightness"]["inactive"])
+
+    def test_disabled_control_is_left_out_with_its_menu(self):
+        text = ("           led1_mode 0x0a046d05 (menu)   : min=0 max=3 default=0 value=0 flags=disabled\n"
+                "\t\t\t\t0: Off\n"
+                "power_line_frequency 0x00980918 (menu)   : min=0 max=2 default=2 value=0 (Disabled)\n"
+                "\t\t\t\t0: Disabled\n")
+        self.assertEqual(camera.parse_ctrls(text),
+                         {"power_line_frequency": {"type": "menu", "inactive": False, "min": 0, "max": 2,
+                                                   "default": 2, "value": 0, "menu": {0: "Disabled"}}})
+
 
 class SetCommands(unittest.TestCase):
     def setUp(self):
@@ -55,14 +74,132 @@ class SetCommands(unittest.TestCase):
         self.assertEqual(camera.clamp(pan, 5000), 3600)
         self.assertEqual(camera.clamp(pan, -36000), -36000)
 
-    def test_restore_applies_saved_known_controls_clamped(self):
-        saved = {"zoom_absolute": 900, "not_on_this_camera": 4, "white_balance_automatic": 0}
+    def test_restore_applies_saved_known_controls_clamped_auto_modes_first(self):
+        saved = {"zoom_absolute": 900, "white_balance_temperature": 3006, "not_on_this_camera": 4,
+                 "white_balance_automatic": 0}
         self.assertEqual(camera.restore_cmds(DEV, self.ctrls, saved),
-                         [["v4l2-ctl", "-d", DEV, "--set-ctrl=zoom_absolute=500"],
-                          ["v4l2-ctl", "-d", DEV, "--set-ctrl=white_balance_automatic=0"]])
+                         [["v4l2-ctl", "-d", DEV, "--set-ctrl=white_balance_automatic=0"],
+                          ["v4l2-ctl", "-d", DEV, "--set-ctrl=zoom_absolute=500"],
+                          ["v4l2-ctl", "-d", DEV, "--set-ctrl=white_balance_temperature=3010"]])
+
+    def test_restore_every_auto_mode_before_every_manual_value(self):
+        saved = {"focus_absolute": 50, "exposure_time_absolute": 300, "white_balance_temperature": 5000,
+                 "focus_automatic_continuous": 0, "auto_exposure": 1, "white_balance_automatic": 0}
+        sets = [cmd[-1] for cmd in camera.restore_cmds(DEV, self.ctrls, saved)]
+        self.assertEqual(sets, ["--set-ctrl=focus_automatic_continuous=0", "--set-ctrl=auto_exposure=1",
+                                "--set-ctrl=white_balance_automatic=0", "--set-ctrl=focus_absolute=50",
+                                "--set-ctrl=exposure_time_absolute=300", "--set-ctrl=white_balance_temperature=5000"])
+
+    def test_restore_skips_a_manual_value_its_auto_mode_holds(self):
+        # the camera's own auto modes are on (fixture) and nothing saved turns them off: the driver would refuse these
+        saved = {"exposure_time_absolute": 300, "focus_absolute": 50, "white_balance_temperature": 5000,
+                 "brightness": 90}
+        self.assertEqual([cmd[-1] for cmd in camera.restore_cmds(DEV, self.ctrls, saved)], ["--set-ctrl=brightness=90"])
+        saved = {"auto_exposure": 3, "exposure_time_absolute": 300}
+        self.assertEqual([cmd[-1] for cmd in camera.restore_cmds(DEV, self.ctrls, saved)],
+                         ["--set-ctrl=auto_exposure=3"])
 
     def test_restore_nothing_saved(self):
         self.assertEqual(camera.restore_cmds(DEV, self.ctrls, {}), [])
+
+
+class Model(unittest.TestCase):
+    """The pure rules behind the Camera page's rows."""
+
+    def setUp(self):
+        self.ctrls = camera.parse_ctrls(read("brio/ctrls-index0.txt"))
+        self.values = {n: c["value"] for n, c in self.ctrls.items()}
+
+    def test_groups_hold_every_standard_control_once(self):
+        names = [n for _, main, advanced in camera.GROUPS for n in main + advanced]
+        self.assertEqual(sorted(names), sorted(self.ctrls))
+        self.assertEqual([g for g, _, _ in camera.GROUPS], ["Framing", "Image", "Focus"])
+        image = {g: (m, a) for g, m, a in camera.GROUPS}["Image"]
+        self.assertEqual(image[1], ["contrast", "saturation", "sharpness", "gain", "power_line_frequency"])
+        self.assertIn("brightness", image[0])
+
+    def test_labels(self):
+        self.assertEqual(camera.LABELS["exposure_dynamic_framerate"], "Keep 30 fps")
+        self.assertEqual(camera.LABELS["backlight_compensation"], "HDR")
+        self.assertEqual(camera.LABELS["power_line_frequency"], "Anti-flicker")
+
+    def test_keep_30_fps_on_means_no_dynamic_framerate(self):
+        self.assertEqual(camera.switch_values("exposure_dynamic_framerate"), (0, 1))
+        self.assertEqual(camera.switch_values("backlight_compensation"), (1, 0))
+        self.assertEqual(camera.switch_values("white_balance_automatic"), (1, 0))
+        self.assertEqual(camera.switch_values("auto_exposure"), (3, 1))  # on: aperture priority, off: manual
+
+    def test_row_kinds(self):
+        kinds = {n: camera.kind(n, c) for n, c in self.ctrls.items()}
+        self.assertEqual(kinds["backlight_compensation"], "switch")  # an int 0..1 on the BRIO
+        self.assertEqual(kinds["exposure_dynamic_framerate"], "switch")
+        self.assertEqual(kinds["auto_exposure"], "switch")
+        self.assertEqual(kinds["power_line_frequency"], "combo")
+        self.assertEqual(kinds["brightness"], "slider")
+        self.assertEqual(kinds["zoom_absolute"], "slider")
+
+    def test_anti_flicker_choices(self):
+        self.assertEqual(camera.choices(self.ctrls["power_line_frequency"]), [(0, "Off"), (1, "50 Hz"), (2, "60 Hz")])
+
+    def test_manual_values_are_insensitive_while_auto_is_on(self):
+        self.values["zoom_absolute"] = 200
+        self.assertEqual(camera.insensitive(self.ctrls, self.values),
+                         {"exposure_time_absolute", "white_balance_temperature", "focus_absolute"})
+        self.values.update(auto_exposure=1, white_balance_automatic=0, focus_automatic_continuous=0)
+        self.assertEqual(camera.insensitive(self.ctrls, self.values), set())
+
+    def test_pan_and_tilt_are_disabled_at_1x(self):
+        self.values.update(auto_exposure=1, white_balance_automatic=0, focus_automatic_continuous=0)
+        self.assertEqual(camera.insensitive(self.ctrls, self.values), {"pan_absolute", "tilt_absolute"})
+        self.values["zoom_absolute"] = 101
+        self.assertEqual(camera.insensitive(self.ctrls, self.values), set())
+
+    def test_defaults_the_camera_reports_auto_modes_first(self):
+        framing, image, focus = (camera.defaults(self.ctrls, main + adv) for _, main, adv in camera.GROUPS)
+        self.assertEqual(framing, [("zoom_absolute", 100), ("pan_absolute", 0), ("tilt_absolute", 0)])
+        self.assertEqual(focus, [("focus_automatic_continuous", 1), ("focus_absolute", 0)])
+        self.assertEqual(image[:2], [("auto_exposure", 3), ("white_balance_automatic", 1)])
+        self.assertEqual(dict(image)["exposure_dynamic_framerate"], 0)
+        self.assertEqual(dict(image)["power_line_frequency"], 2)
+        self.assertEqual(camera.defaults(self.ctrls, ["not_on_this_camera", "gain"]), [("gain", 0)])
+
+    def test_changes_sends_the_value(self):
+        self.values["brightness"] = 90
+        self.assertEqual(camera.changes(self.values, "brightness"), [("brightness", 90)])
+
+    def test_changes_holds_a_manual_value_while_auto_is_on(self):
+        self.values["exposure_time_absolute"] = 400
+        self.assertEqual(camera.changes(self.values, "exposure_time_absolute"), [])
+
+    def test_turning_auto_off_sends_the_manual_value_shown(self):
+        self.values.update(focus_automatic_continuous=0, focus_absolute=40)
+        self.assertEqual(camera.changes(self.values, "focus_automatic_continuous"),
+                         [("focus_automatic_continuous", 0), ("focus_absolute", 40)])
+        self.values["focus_automatic_continuous"] = 1
+        self.assertEqual(camera.changes(self.values, "focus_automatic_continuous"),
+                         [("focus_automatic_continuous", 1)])
+
+    def test_pan_is_sent_at_1x(self):  # disabled in the UI, but a reset still centers it
+        self.values["pan_absolute"] = 0
+        self.assertEqual(camera.changes(self.values, "pan_absolute"), [("pan_absolute", 0)])
+
+    def test_nudge_pan_and_tilt_one_step_within_range(self):
+        pan = self.ctrls["pan_absolute"]
+        self.assertEqual(camera.nudge(pan, 0, 1), 3600)
+        self.assertEqual(camera.nudge(pan, 0, -1), -3600)
+        self.assertEqual(camera.nudge(pan, 36000, 1), 36000)
+
+    def test_status(self):
+        self.assertEqual(camera.status(self.ctrls, {"zoom_absolute": 200}), "Ready · 2.0×")
+        self.assertEqual(camera.status(self.ctrls, {"zoom_absolute": 100}), "Ready · 1.0×")
+        self.assertEqual(camera.status({}, {}), "Not connected")
+
+    def test_zoom_label(self):
+        self.assertEqual(camera.zoom_label(self.ctrls["zoom_absolute"], 250), "2.5×")
+
+    def test_resolution_hint(self):
+        self.assertIn("picks the resolution", camera.RESOLUTION_HINT)
+        self.assertIn("not Booth", camera.RESOLUTION_HINT)
 
 
 class Commands(unittest.TestCase):
