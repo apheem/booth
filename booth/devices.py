@@ -34,6 +34,13 @@ def find_camera(paths, udev, formats):
     return None
 
 
+def replugged(name, event):
+    """A by-id folder event (the entry's new name, the Gio event's nick) → True when a camera may be back: a color node
+    (index0) appeared, or the folder itself, which udev removes with the last camera (Gio then reports only the folder,
+    none of its entries). discover() decides whether it is the BRIO."""
+    return event in ("created", "moved-in", "renamed") and (name.endswith("-video-index0") or name == "by-id")
+
+
 def _run(*cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout

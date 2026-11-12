@@ -24,9 +24,17 @@ class Install(unittest.TestCase):
         self.home.mkdir()
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
         self.env["HOME"] = str(self.home)
+        # A stub systemctl first on PATH records its argv: an install test never reaches the real user manager.
+        stubs = Path(tmp.name) / "stubs"
+        stubs.mkdir()
+        self.calls = Path(tmp.name) / "systemctl.log"
+        (stubs / "systemctl").write_text('#!/bin/sh\necho "$*" >> "$SYSTEMCTL_LOG"\nexit "${SYSTEMCTL_RC:-0}"\n')
+        (stubs / "systemctl").chmod(0o755)
+        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", SYSTEMCTL_LOG=str(self.calls))
         self.app = self.home / ".local/share/booth/booth"
         self.launcher = self.home / ".local/bin/booth"
         self.desktop = self.home / f".local/share/applications/{APP_ID}.desktop"
+        self.unit = self.home / ".config/systemd/user/booth.service"
 
     def install(self, repo=REPO):
         return subprocess.run(["sh", str(repo / "install.sh")], env=self.env, cwd=self.home,
@@ -65,7 +73,38 @@ class Install(unittest.TestCase):
         code = [ln for ln in (REPO / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
         self.assertFalse([ln for ln in code if "sudo" in ln])
         written = {p.relative_to(self.home).parts[:2] for p in self.home.rglob("*") if p.is_file()}
-        self.assertEqual(written, {(".local", "bin"), (".local", "share")})
+        self.assertEqual(written, {(".local", "bin"), (".local", "share"), (".config", "systemd")})
+
+    def test_installs_enables_and_starts_the_service(self):
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # restart, not start: a re-install must run the new copy (start leaves a running old one as it is).
+        self.assertEqual(self.calls.read_text().splitlines(),
+                         ["--user daemon-reload", "--user enable booth.service", "--user restart booth.service"])
+        self.assertNotIn("couldn't start", r.stderr)
+        unit = self.unit.read_text().splitlines()
+        self.assertIn(f'ExecStart=/bin/sh "{self.launcher}" --background', unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("WantedBy=graphical-session.target", unit)  # GTK needs the session's display
+        self.assertIn("After=graphical-session.target", unit)
+        self.assertNotIn(str(REPO), self.unit.read_text())
+
+    def test_the_unit_follows_xdg_config_home_unless_relative(self):
+        self.env["XDG_CONFIG_HOME"] = str(self.home / "cfg")
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue((self.home / "cfg/systemd/user/booth.service").is_file())
+        self.env["XDG_CONFIG_HOME"] = "rel/cfg"
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(self.unit.is_file())
+        self.assertFalse((self.home / "rel").exists())
+
+    def test_without_a_user_manager_the_app_still_installs_and_says_how_to_start_it(self):
+        self.env["SYSTEMCTL_RC"] = "1"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("systemctl --user enable --now booth.service", r.stderr)
+        self.assertTrue(self.unit.is_file())
+        self.assertEqual(tree(self.app), tree(REPO / "booth"))
 
     def test_rerun_is_safe_and_replaces_stale_files(self):
         self.assertEqual(self.install().returncode, 0)
@@ -92,6 +131,7 @@ class Install(unittest.TestCase):
                            timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Usage", r.stdout)
+        self.assertIn("--background", r.stdout)  # the option the unit starts it with
 
     def test_a_home_with_shell_and_desktop_entry_specials(self):
         import gi
@@ -109,6 +149,16 @@ class Install(unittest.TestCase):
         self.assertRegex(exec_, r'^"(?:[^"`$\\]|\\["`$\\])*"$')
         exec_ = re.sub("%(.)", lambda m: "%" if m[1] == "%" else "<field code>", exec_)
         self.assertEqual(GLib.shell_parse_argv(exec_)[1], [str(launcher)])
+        # Unit-file quoting: in a quoted word \ and " take a backslash; %% is a literal %, $$ a literal $.
+        unit = self.home / ".config/systemd/user/booth.service"
+        start = next(ln for ln in unit.read_text().splitlines() if ln.startswith("ExecStart="))
+        m = re.fullmatch(r'ExecStart=/bin/sh "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" --background', start)
+        self.assertIsNotNone(m, start)
+        self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]), str(launcher))
+        if shutil.which("systemd-analyze"):  # read-only: parses the unit, starts nothing
+            v = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)], capture_output=True, text=True,
+                               timeout=60)
+            self.assertEqual(v.returncode, 0, v.stderr)
         env = {k: v for k, v in self.env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "PYTHONPATH")}
         r = subprocess.run([str(launcher), "--help"], env=env, cwd=self.home, capture_output=True, text=True,
                            timeout=60)

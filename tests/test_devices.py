@@ -2,7 +2,7 @@ import os
 import unittest
 
 from booth import devices
-from tests.fixture import read, brio_nodes
+from tests.fixture import FAKE_SERIAL, read, brio_nodes
 
 
 class FakeHost:
@@ -109,6 +109,27 @@ class Parsers(unittest.TestCase):
         props = devices.parse_udev(read("brio/udev-index0.txt"))
         self.assertEqual((props["ID_VENDOR_ID"], props["ID_MODEL_ID"]), ("046d", "085e"))
         self.assertEqual(props["ID_V4L_CAPABILITIES"], ":capture:")
+
+
+class Replugged(unittest.TestCase):
+    """By-id folder events as Gio reports them: (the new name, the event's nick)."""
+    INDEX0 = f"usb-046d_Logitech_BRIO_{FAKE_SERIAL}-video-index0"
+
+    def test_a_color_node_appearing_is_a_replug(self):
+        self.assertTrue(devices.replugged(self.INDEX0, "created"))
+        self.assertTrue(devices.replugged(self.INDEX0, "renamed"))  # udev links a temp name, then renames it
+        self.assertTrue(devices.replugged(self.INDEX0, "moved-in"))
+
+    def test_the_folder_appearing_is_a_replug(self):
+        # udev removes by-id with the last camera; Gio then reports only the folder's return, never its entries.
+        self.assertTrue(devices.replugged("by-id", "created"))
+
+    def test_other_events_are_not(self):
+        for name, event in [(self.INDEX0, "deleted"), (self.INDEX0, "changes-done-hint"),
+                            (self.INDEX0, "attribute-changed"), (self.INDEX0, "moved-out"), ("by-id", "deleted"),
+                            (self.INDEX0.replace("index0", "index2"), "created"), (".#udev-tmp", "created"),
+                            (self.INDEX0.replace("index0", "index1"), "renamed")]:
+            self.assertFalse(devices.replugged(name, event), (name, event))
 
 
 if __name__ == "__main__":

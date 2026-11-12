@@ -1,5 +1,5 @@
 """The main window: a navigation split view with Camera, Microphone and Headphones; one column when narrow."""
-from gi.repository import Adw, Gtk
+from gi.repository import Adw, Gio, Gtk
 
 from booth.ui.camera import CameraPage
 
@@ -8,9 +8,12 @@ def placeholder(title, icon):
     return Adw.StatusPage(title=title, description="Coming soon", icon_name=icon)
 
 
-def page(title, child):
-    view = Adw.ToolbarView(content=child)
-    view.add_top_bar(Adw.HeaderBar())
+def page(title, child, menu=None):
+    view, header = Adw.ToolbarView(content=child), Adw.HeaderBar()
+    if menu:
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, primary=True,
+                                       tooltip_text="Main Menu"))
+    view.add_top_bar(header)
     return Adw.NavigationPage(title=title, child=view)
 
 
@@ -39,7 +42,9 @@ class Window(Adw.ApplicationWindow):
             row.append(labels)
             sidebar.append(row)
 
-        self.split = Adw.NavigationSplitView(sidebar=page("Booth", sidebar), content=self.pages[0][2])
+        menu = Gio.Menu()
+        menu.append("Run in Background", "app.run-in-background")  # a check item: booth.service enabled and running
+        self.split = Adw.NavigationSplitView(sidebar=page("Booth", sidebar, menu), content=self.pages[0][2])
         sidebar.connect("row-selected", self.on_selected)
         sidebar.connect("row-activated", lambda *_: self.split.set_show_content(True))
         sidebar.select_row(sidebar.get_row_at_index(0))

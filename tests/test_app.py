@@ -1,13 +1,28 @@
-"""The launch wiring: Booth finds the BRIO and re-applies the saved controls before the window opens."""
+"""The launch wiring: Booth finds the BRIO and re-applies the saved controls before the window opens; with
+--background it lives with no window and re-applies them at login and on every replug."""
 import contextlib
 import io
+import threading
 import unittest
 from unittest import mock
 
-from booth import app, camera
+from gi.repository import Gio, GLib
+
+from booth import app, camera, service
 from tests.fixture import read
+from tests.test_service import Timers
 
 DEV = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_FAKESER1-video-index0"
+
+
+class Inline:
+    """threading.Thread stand-in that runs its target on start()."""
+
+    def __init__(self, target, daemon):
+        self.target = target
+
+    def start(self):
+        self.target()
 
 
 class RestoreAtLaunch(unittest.TestCase):
@@ -34,31 +49,76 @@ class RestoreAtLaunch(unittest.TestCase):
     def test_unplugged_camera(self):
         self.assertEqual(self.launch(None), (None, [], ""))
 
+    def test_two_restores_never_interleave(self):  # startup, replug and window-open restores run on their own threads
+        log, first_in, go = [], threading.Event(), threading.Event()
+
+        def restore(dev, saved):
+            log.append(("in", saved))
+            if saved == "a":
+                first_in.set()
+                go.wait(5)
+            log.append(("out", saved))
+            return []
+
+        with mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
+                mock.patch.object(camera, "restore", restore):
+            a = threading.Thread(target=app.restore_camera, args=({"camera": "a"},))
+            a.start()
+            self.assertTrue(first_in.wait(5))
+            b = threading.Thread(target=app.restore_camera, args=({"camera": "b"},))
+            b.start()
+            b.join(0.3)
+            self.assertEqual(log, [("in", "a")])
+            go.set()
+            a.join(5)
+            b.join(5)
+        self.assertEqual(log, [("in", "a"), ("out", "a"), ("in", "b"), ("out", "b")])
+
 
 class LaunchOffTheMainLoop(unittest.TestCase):
     def test_restore_and_the_first_read_run_on_a_worker_then_the_window_opens(self):
         threads, idle = [], []
-        stub = mock.Mock(window=None, starting=False)
+        stub = mock.Mock(window=None, starting=False, background=False, held=False)
         stub.start = lambda settings: app.Application.start(stub, settings)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
                 mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
+                mock.patch.object(app.service, "run", return_value=True) as is_enabled, \
                 mock.patch.object(app, "restore_camera", return_value=DEV) as restore, \
                 mock.patch.object(camera, "read_ctrls", return_value={"zoom_absolute": {}}) as read_ctrls:
             app.Application.do_activate(stub)
             restore.assert_not_called()  # nothing touches the camera on the main loop
             read_ctrls.assert_not_called()
+            is_enabled.assert_not_called()
             stub.hold.assert_called_once_with()
             app.Application.do_activate(stub)  # activated again while starting: one worker
             self.assertEqual(len(threads), 1)
             threads[0]()
-            self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, DEV, {"zoom_absolute": {}}))])
+            self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, DEV, {"zoom_absolute": {}}, True))])
+        is_enabled.assert_called_once_with(service.IS_ENABLED)  # the switch shows the unit's state as it is now
         restore.assert_called_once_with({"version": 1, "camera": {}})
         read_ctrls.assert_called_once_with(DEV)
 
+    def test_the_background_instance_opens_its_window_without_restoring_again(self):
+        threads, idle = [], []
+        stub = mock.Mock(window=None, starting=False, background=True, held=True, monitor=mock.Mock())
+        stub.start = lambda settings: app.Application.start(stub, settings)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
+                mock.patch.object(app.service, "run", return_value=False), \
+                mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
+                mock.patch.object(app, "restore_camera") as restore, \
+                mock.patch.object(camera, "read_ctrls", return_value={"zoom_absolute": {}}):
+            app.Application.do_activate(stub)
+            threads[0]()
+        restore.assert_not_called()  # it keeps the camera restored itself: a second restore could race a replug's
+        stub.watch.assert_not_called()
+        self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, DEV, {"zoom_absolute": {}}, False))])
+
     def test_a_crash_in_the_worker_still_opens_the_window(self):
         threads, idle = [], []
-        stub = mock.Mock(window=None, starting=False)
+        stub = mock.Mock(window=None, starting=False, background=False, held=False)
         stub.start = lambda settings: app.Application.start(stub, settings)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
@@ -66,11 +126,10 @@ class LaunchOffTheMainLoop(unittest.TestCase):
                 mock.patch.object(app, "restore_camera", side_effect=RuntimeError("boom")):
             app.Application.do_activate(stub)
             self.assertRaises(RuntimeError, threads[0])
-        self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, None, {}))])
-
+        self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, None, {}, False))])
 
     def test_activate_again_presents_the_open_window_and_builds_no_second(self):
-        threads, stub = [], mock.Mock(window=mock.Mock(), starting=False)
+        threads, stub = [], mock.Mock(window=mock.Mock(), starting=False, background=False)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app, "Window") as window:
             app.Application.do_activate(stub)
@@ -82,11 +141,163 @@ class LaunchOffTheMainLoop(unittest.TestCase):
     def test_a_window_that_fails_to_build_releases_the_app_and_prints_why(self):
         stub, err = mock.Mock(window=None, starting=True), io.StringIO()
         with mock.patch.object(app, "Window", side_effect=RuntimeError("no display")), contextlib.redirect_stderr(err):
-            self.assertEqual(app.Application.show_window(stub, {"camera": {}}, None, {}), app.GLib.SOURCE_REMOVE)
+            self.assertEqual(app.Application.show_window(stub, {"camera": {}}, None, {}, False), app.GLib.SOURCE_REMOVE)
         stub.release.assert_called_once_with()
         self.assertIs(stub.starting, False)  # the next launch's activate tries again
         self.assertIsNone(stub.window)
         self.assertIn("no display", err.getvalue())
+
+    def test_the_window_shows_the_switch_state_and_forgets_itself_when_closed(self):
+        stub = mock.Mock(window=None, starting=True)
+        with mock.patch.object(app, "Window") as window:
+            app.Application.show_window(stub, {"camera": {}}, None, {}, True)
+        self.assertIs(stub.run_in_background.set_state.call_args.args[0].get_boolean(), True)
+        window.return_value.connect.assert_called_once_with("close-request", stub.on_close)
+        self.assertIs(app.Application.on_close(stub, stub.window), False)  # False: the window does close
+        self.assertIsNone(stub.window)  # so the next activate builds a new one instead of presenting a dead one
+
+
+def options(background):
+    opts = GLib.VariantDict.new(None)
+    if background:
+        opts.insert_value("background", GLib.Variant.new_boolean(True))
+    return opts
+
+
+class BackgroundLaunch(unittest.TestCase):
+    def test_a_plain_launch_registers_and_activates_as_usual(self):
+        # GApplication then activates here, or in the running instance over D-Bus: it shows its window there.
+        stub = mock.Mock(background=False)
+        self.assertEqual(app.Application.do_handle_local_options(stub, options(False)), -1)
+        stub.register.assert_not_called()
+        self.assertIs(stub.background, False)
+
+    def test_background_launch_becomes_the_background_instance(self):
+        stub = mock.Mock(background=False)
+        stub.get_is_remote.return_value = False
+        self.assertEqual(app.Application.do_handle_local_options(stub, options(True)), -1)
+        stub.register.assert_called_once_with(None)
+        self.assertIs(stub.background, True)
+
+    def test_background_launch_while_booth_runs_fails_so_the_service_retries(self):
+        stub, err = mock.Mock(background=False), io.StringIO()
+        stub.get_is_remote.return_value = True
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(app.Application.do_handle_local_options(stub, options(True)), 1)
+        self.assertIs(stub.background, False)
+        stub.activate.assert_not_called()  # the running instance opens no window for it
+        self.assertIn("already running", err.getvalue())
+
+    def test_the_background_activate_watches_and_opens_no_window(self):
+        threads, stub = [], mock.Mock(background=True, monitor=None, window=None, starting=False)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app, "Window") as window:
+            app.Application.do_activate(stub)
+        stub.watch.assert_called_once_with()
+        window.assert_not_called()
+        self.assertEqual(threads, [])
+
+    def test_watch_holds_for_good_monitors_by_id_and_restores_now(self):
+        stub = mock.Mock(held=False)
+        with mock.patch.object(app.Gio.File, "new_for_path") as new_for_path:
+            app.Application.watch(stub)
+        stub.hold.assert_called_once_with()  # no window, and closing one later never quits
+        self.assertIs(stub.held, True)
+        new_for_path.assert_called_once_with("/dev/v4l/by-id")
+        monitor = new_for_path.return_value.monitor_directory.return_value
+        self.assertIs(stub.monitor, monitor)
+        monitor.connect.assert_called_once_with("changed", stub.on_by_id)
+        stub.restore_saved.assert_called_once_with()  # the restore at login
+        self.assertIsInstance(stub.replug, service.Debounce)
+
+
+class Replug(unittest.TestCase):
+    SAVED = {"version": 1, "camera": {"zoom_absolute": 250, "exposure_time_absolute": 300, "auto_exposure": 1}}
+
+    def event(self, stub, file, other, event):
+        app.Application.on_by_id(stub, None, Gio.File.new_for_path(file), other and Gio.File.new_for_path(other), event)
+
+    def test_ten_fast_replugs_restore_the_current_saved_state_once_auto_modes_first(self):
+        timers, ran, stub = Timers(), [], mock.Mock()
+        stub.restore_saved = lambda: app.Application.restore_saved(stub)
+        stub.replug = service.Debounce(app.REPLUG_MS, stub.restore_saved, timers.add, timers.remove)
+
+        def run(cmd):
+            ran.append(cmd[-1])
+            return True
+
+        with mock.patch.object(app.threading, "Thread", Inline), \
+                mock.patch.object(app.store, "load", return_value=self.SAVED) as load, \
+                mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
+                mock.patch.object(camera, "read_ctrls", return_value=camera.parse_ctrls(read("brio/ctrls-index0.txt"))), \
+                mock.patch.object(camera, "run", run):
+            for _ in range(5):
+                self.event(stub, "/dev/v4l/by-id", None, Gio.FileMonitorEvent.CREATED)  # the folder came back
+                self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)  # udev's link
+                self.event(stub, DEV, None, Gio.FileMonitorEvent.DELETED)  # an unplug restores nothing
+            load.assert_not_called()
+            self.assertEqual(ran, [])
+            timers.fire()
+        load.assert_called_once_with()  # read when the restore runs, so it is the saved state as it is then
+        self.assertEqual(ran, ["--set-ctrl=auto_exposure=1", "--set-ctrl=zoom_absolute=250",
+                               "--set-ctrl=exposure_time_absolute=300"])
+        self.assertEqual(timers.pending, {})
+
+    def test_an_ir_node_or_unplug_event_never_restores(self):
+        stub = mock.Mock()
+        self.event(stub, DEV.replace("index0", "index2"), None, Gio.FileMonitorEvent.CREATED)
+        self.event(stub, DEV, None, Gio.FileMonitorEvent.DELETED)
+        stub.replug.poke.assert_not_called()
+
+
+class RunInBackgroundSwitch(unittest.TestCase):
+    def flip(self, stub, on, ok):
+        idle, ran = [], []
+        with mock.patch.object(app.threading, "Thread", Inline), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                mock.patch.object(app.service, "run", lambda cmd: ran.append(cmd) or ok):
+            app.Application.on_background(stub, stub.action, GLib.Variant.new_boolean(on))
+        return ran, idle
+
+    def test_the_command_runs_off_the_main_loop_and_reports_back(self):
+        for background in (False, True):
+            stub = mock.Mock(background=background)
+            ran, idle = self.flip(stub, False, True)
+            self.assertEqual(ran, [service.switch(False, background)])
+            self.assertEqual(idle, [(stub.switched, (stub.action, False, True))])
+
+    def switched(self, background, held, on, ok=True):
+        stub, err = mock.Mock(background=background, held=held), io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(app.Application.switched(stub, stub.action, on, ok), GLib.SOURCE_REMOVE)
+        return stub, err.getvalue()
+
+    def test_off_inside_the_service_lets_go_so_it_exits_when_the_window_closes(self):
+        stub, _ = self.switched(background=True, held=True, on=False)
+        self.assertIs(stub.action.set_state.call_args.args[0].get_boolean(), False)
+        stub.release.assert_called_once_with()
+        stub.hold.assert_not_called()
+        self.assertIs(stub.held, False)
+
+    def test_on_again_inside_the_service_holds_again(self):
+        stub, _ = self.switched(background=True, held=False, on=True)
+        self.assertIs(stub.action.set_state.call_args.args[0].get_boolean(), True)
+        stub.hold.assert_called_once_with()
+        self.assertIs(stub.held, True)
+
+    def test_a_plain_instance_neither_holds_nor_releases(self):
+        for on in (False, True):
+            stub, _ = self.switched(background=False, held=False, on=on)
+            self.assertIs(stub.action.set_state.call_args.args[0].get_boolean(), on)
+            stub.hold.assert_not_called()
+            stub.release.assert_not_called()
+
+    def test_a_failed_command_leaves_the_switch_as_it_was_and_says_so(self):
+        stub, err = self.switched(background=True, held=True, on=False, ok=False)
+        stub.action.set_state.assert_not_called()
+        stub.release.assert_not_called()
+        self.assertIn("booth.service", err)
+
 
 if __name__ == "__main__":
     unittest.main()
