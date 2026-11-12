@@ -12,10 +12,9 @@ ARROWS = [("go-previous-symbolic", "Pan left", camera.PAN, -1), ("go-up-symbolic
 
 
 class CameraPage(Adw.PreferencesPage):
-    def __init__(self, settings, node, status=lambda text: None):
+    def __init__(self, settings, node, ctrls, status=lambda text: None):
         super().__init__()
-        self.settings, self.node, self.status = settings, node, status
-        self.ctrls = camera.read_ctrls(node) if node else {}
+        self.settings, self.node, self.status, self.ctrls = settings, node, status, ctrls
         self.values = {n: c["value"] for n, c in self.ctrls.items() if "value" in c}
         self.rows, self.widgets, self.errors, self.quiet = {}, {}, {}, False
         self.setter = camera.Setter(settings, node, self.spawn, store.save, self.values)
@@ -61,7 +60,7 @@ class CameraPage(Adw.PreferencesPage):
             if self.values[name] in keys:
                 row.set_selected(keys.index(self.values[name]))
             row.connect("notify::selected", lambda r, _p: self.changed(name, keys[r.get_selected()]))
-            self.widgets[name] = lambda v: row.set_selected(keys.index(v))
+            self.widgets[name] = lambda v: v in keys and row.set_selected(keys.index(v))
         else:
             scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, ctrl["min"], ctrl["max"], ctrl["step"] or 1)
             scale.set_value(self.values[name])
@@ -97,7 +96,7 @@ class CameraPage(Adw.PreferencesPage):
         if self.quiet:  # the page itself is moving the widget (a reset, a revert): nothing to send
             return
         self.values[name] = value
-        self.setter.set(camera.changes(self.values, name))
+        self.setter.set(camera.changes(self.ctrls, self.values, name))
         self.refresh()
 
     def reset(self, names):

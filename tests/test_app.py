@@ -35,5 +35,58 @@ class RestoreAtLaunch(unittest.TestCase):
         self.assertEqual(self.launch(None), (None, [], ""))
 
 
+class LaunchOffTheMainLoop(unittest.TestCase):
+    def test_restore_and_the_first_read_run_on_a_worker_then_the_window_opens(self):
+        threads, idle = [], []
+        stub = mock.Mock(window=None, starting=False)
+        stub.start = lambda settings: app.Application.start(stub, settings)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
+                mock.patch.object(app, "restore_camera", return_value=DEV) as restore, \
+                mock.patch.object(camera, "read_ctrls", return_value={"zoom_absolute": {}}) as read_ctrls:
+            app.Application.do_activate(stub)
+            restore.assert_not_called()  # nothing touches the camera on the main loop
+            read_ctrls.assert_not_called()
+            stub.hold.assert_called_once_with()
+            app.Application.do_activate(stub)  # activated again while starting: one worker
+            self.assertEqual(len(threads), 1)
+            threads[0]()
+            self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, DEV, {"zoom_absolute": {}}))])
+        restore.assert_called_once_with({"version": 1, "camera": {}})
+        read_ctrls.assert_called_once_with(DEV)
+
+    def test_a_crash_in_the_worker_still_opens_the_window(self):
+        threads, idle = [], []
+        stub = mock.Mock(window=None, starting=False)
+        stub.start = lambda settings: app.Application.start(stub, settings)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
+                mock.patch.object(app, "restore_camera", side_effect=RuntimeError("boom")):
+            app.Application.do_activate(stub)
+            self.assertRaises(RuntimeError, threads[0])
+        self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, None, {}))])
+
+
+    def test_activate_again_presents_the_open_window_and_builds_no_second(self):
+        threads, stub = [], mock.Mock(window=mock.Mock(), starting=False)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app, "Window") as window:
+            app.Application.do_activate(stub)
+        stub.window.present.assert_called_once_with()
+        window.assert_not_called()
+        stub.hold.assert_not_called()
+        self.assertEqual(threads, [])
+
+    def test_a_window_that_fails_to_build_releases_the_app_and_prints_why(self):
+        stub, err = mock.Mock(window=None, starting=True), io.StringIO()
+        with mock.patch.object(app, "Window", side_effect=RuntimeError("no display")), contextlib.redirect_stderr(err):
+            self.assertEqual(app.Application.show_window(stub, {"camera": {}}, None, {}), app.GLib.SOURCE_REMOVE)
+        stub.release.assert_called_once_with()
+        self.assertIs(stub.starting, False)  # the next launch's activate tries again
+        self.assertIsNone(stub.window)
+        self.assertIn("no display", err.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

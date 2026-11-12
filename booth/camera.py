@@ -3,6 +3,8 @@ commands that set them."""
 import re
 import subprocess
 
+from booth import xu
+
 _CTRL = re.compile(r"^\s*(\w+) 0x[0-9a-f]+ \((\w+)\)\s*: (.*)$")
 _MENU = re.compile(r"^\s+(\d+): (.*)$")
 _NUM = re.compile(r"\b(min|max|step|default|value)=(-?\d+)")
@@ -34,18 +36,22 @@ def clamp(ctrl, value):
     return int(min(hi, max(lo, lo + round((value - lo) / step) * step)))
 
 
+XU_CMD = "uvc-xu"  # not a program: run() does an extension-unit write in-process, through xu.write
+
+
 def set_cmd(device, name, value):
-    return ["v4l2-ctl", "-d", device, f"--set-ctrl={name}={value}"]
+    """The one place a write is dispatched: extension-unit controls (FoV, LED) by ioctl, the rest by v4l2-ctl."""
+    return [XU_CMD if name in xu.CONTROLS else "v4l2-ctl", "-d", device, f"--set-ctrl={name}={value}"]
 
 
 ZOOM, PAN, TILT = "zoom_absolute", "pan_absolute", "tilt_absolute"
 
 # The Camera page: (group, main rows, rows under Advanced), each row a control name.
 GROUPS = [
-    ("Framing", [ZOOM, PAN, TILT], []),
+    ("Framing", [ZOOM, PAN, TILT, "fov"], []),
     ("Image", ["auto_exposure", "exposure_time_absolute", "exposure_dynamic_framerate", "backlight_compensation",
                "white_balance_automatic", "white_balance_temperature", "brightness"],
-     ["contrast", "saturation", "sharpness", "gain", "power_line_frequency"]),
+     ["contrast", "saturation", "sharpness", "gain", "power_line_frequency", "led_mode"]),
     ("Focus", ["focus_automatic_continuous", "focus_absolute"], []),
 ]
 LABELS = {
@@ -54,7 +60,7 @@ LABELS = {
     "white_balance_automatic": "Auto white balance", "white_balance_temperature": "White balance",
     "brightness": "Brightness", "contrast": "Contrast", "saturation": "Saturation", "sharpness": "Sharpness",
     "gain": "Gain", "power_line_frequency": "Anti-flicker", "focus_automatic_continuous": "Autofocus",
-    "focus_absolute": "Focus",
+    "focus_absolute": "Focus", "fov": "Field of view", "led_mode": "LED",
 }
 RESOLUTION_HINT = "The calling app (e.g. Zoom) picks the resolution, not Booth."
 PAN_HINT = "Zoom in to move the frame"
@@ -85,8 +91,10 @@ def kind(name, ctrl):
 
 
 def choices(ctrl):
-    """A menu's [(value, label)], "Disabled" shown as "Off"."""
-    return [(v, "Off" if label == "Disabled" else label) for v, label in sorted(ctrl["menu"].items())]
+    """A menu's [(value, label)], "Disabled" shown as "Off", plus the camera's value or default when the menu lacks it
+    (shown as itself, never as item 0)."""
+    extra = {v: f"Unknown ({v})" for v in (ctrl.get("value"), ctrl.get("default")) if v is not None}
+    return [(v, "Off" if label == "Disabled" else label) for v, label in sorted((extra | ctrl["menu"]).items())]
 
 
 def held(values):
@@ -101,8 +109,9 @@ def insensitive(ctrls, values):
 
 
 def ordered(values):
-    """{name: value} as [(name, value)], auto modes first, so a manual value is set once its auto mode is off."""
-    return sorted(values.items(), key=lambda kv: kv[0] not in AUTOS)
+    """{name: value} as [(name, value)], auto modes first, so a manual value is set once its auto mode is off; then FoV,
+    which may reset zoom and pan on the BRIO."""
+    return sorted(values.items(), key=lambda kv: (kv[0] not in AUTOS, kv[0] != "fov"))
 
 
 def defaults(ctrls, names):
@@ -126,11 +135,13 @@ def revert(values, taken, missed):
     return missed
 
 
-def changes(values, name):
-    """What to set after `name` changed to values[name]: nothing for a manual value its auto mode holds; when an auto
-    mode was just turned off, also the manual value shown, so the camera matches the page."""
+def changes(ctrls, values, name):
+    """What to set after `name` changed to values[name]: nothing for a manual value its auto mode holds, or for a menu
+    value the menu lacks ("Unknown (n)" is shown, never sent or saved); when an auto mode was just turned off, also the
+    manual value shown, so the camera matches the page."""
     hold = held(values)
-    sends = [] if name in hold else [(name, values[name])]
+    unknown = "menu" in ctrls.get(name, {}) and values[name] not in ctrls[name]["menu"]
+    sends = [] if name in hold or unknown else [(name, values[name])]
     return sends + [(m, values[m]) for m, (auto, _) in AUTO.items() if auto == name and m in values and m not in hold]
 
 
@@ -152,27 +163,34 @@ def status(ctrls, values):
 
 def restore_cmds(device, ctrls, saved):
     """Commands that re-apply saved {name: value} controls this camera has, each clamped to its live range: auto modes
-    first, and no manual value whose auto mode stays on (the driver would refuse it)."""
+    first, and no manual value whose auto mode stays on (the driver would refuse it). A saved menu value the menu lacks
+    is not sent, except the LED's, which falls back to Auto: Booth never turns the LED off unless the user picked Off."""
+    saved = {n: v if "menu" not in ctrls.get(n, {}) or v in ctrls[n]["menu"] else xu.DEFAULTS.get(n)
+             for n, v in saved.items()}
+    saved = {n: v for n, v in saved.items() if v is not None}
     hold = held({n: c["value"] for n, c in ctrls.items() if "value" in c} | saved)
     return [set_cmd(device, name, clamp(ctrls[name], value)) for name, value in ordered(saved)
             if name in ctrls and name not in hold]
 
 
 def read_ctrls(device):
-    """The live control model of `device`, or {} when it can't be read (unplugged, busy)."""
+    """The live control model of `device`, extension-unit controls included, or {} when it can't be read."""
     try:
         out = subprocess.run(["v4l2-ctl", "-d", device, "--list-ctrls-menus"],
                              capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
-    return parse_ctrls(out)
+    return parse_ctrls(out) | xu.read(device)
 
 
 def run(cmd):
     """Run one set command; False when it failed (the camera was unplugged or refused the value)."""
     try:
+        if cmd[0] == XU_CMD:
+            name, _, value = cmd[3].removeprefix("--set-ctrl=").partition("=")
+            return xu.write(cmd[2], name, int(value))
         return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
 

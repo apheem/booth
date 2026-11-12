@@ -2,10 +2,19 @@ import subprocess
 import unittest
 from unittest import mock
 
-from booth import camera
+from booth import camera, xu
 from tests.fixture import read
 
 DEV = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_FAKESER1-video-index0"
+# what xu.read gives for the BRIO on this desk: FoV at 65°, LED on Auto
+XU = {"fov": {"type": "menu", "inactive": False, "min": 0, "max": 2, "step": 1, "default": 0, "value": 2,
+              "menu": dict(xu.MENUS["fov"])},
+      "led_mode": {"type": "menu", "inactive": False, "min": 0, "max": 3, "step": 1, "default": 3, "value": 3,
+                   "menu": dict(xu.MENUS["led_mode"])}}
+
+
+def brio():
+    return camera.parse_ctrls(read("brio/ctrls-index0.txt")) | XU
 
 
 class ParseControls(unittest.TestCase):
@@ -102,6 +111,32 @@ class SetCommands(unittest.TestCase):
     def test_restore_nothing_saved(self):
         self.assertEqual(camera.restore_cmds(DEV, self.ctrls, {}), [])
 
+    def test_fov_and_led_are_extension_unit_writes(self):
+        self.assertEqual(camera.set_cmd(DEV, "fov", 1), [camera.XU_CMD, "-d", DEV, "--set-ctrl=fov=1"])
+        self.assertEqual(camera.set_cmd(DEV, "led_mode", 0), [camera.XU_CMD, "-d", DEV, "--set-ctrl=led_mode=0"])
+
+    def test_restore_reapplies_fov_and_led_with_the_others(self):
+        saved = {"fov": 1, "led_mode": 0, "zoom_absolute": 250}
+        self.assertEqual(camera.restore_cmds(DEV, brio(), saved),
+                         [camera.set_cmd(DEV, "fov", 1), camera.set_cmd(DEV, "led_mode", 0),
+                          camera.set_cmd(DEV, "zoom_absolute", 250)])
+        self.assertEqual(camera.restore_cmds(DEV, self.ctrls, saved), [camera.set_cmd(DEV, "zoom_absolute", 250)])
+
+    def test_restore_a_saved_value_outside_the_menu(self):
+        # LED: Auto, never Off unless the user picked Off; FoV and other menus: the camera is left as it is
+        for bad in (-1, 4, 99):
+            saved = {"led_mode": bad, "fov": bad, "power_line_frequency": bad}
+            self.assertEqual(camera.restore_cmds(DEV, brio(), saved), [camera.set_cmd(DEV, "led_mode", 3)])
+        self.assertEqual(camera.restore_cmds(DEV, brio(), {"led_mode": 0, "fov": 2}),
+                         [camera.set_cmd(DEV, "fov", 2), camera.set_cmd(DEV, "led_mode", 0)])
+
+    def test_restore_sets_fov_before_zoom_pan_and_tilt(self):  # a FoV change on the BRIO may reset zoom and pan
+        saved = {"zoom_absolute": 250, "pan_absolute": 3600, "tilt_absolute": -3600, "fov": 1,
+                 "white_balance_automatic": 1}
+        self.assertEqual([cmd[-1] for cmd in camera.restore_cmds(DEV, brio(), saved)],
+                         ["--set-ctrl=white_balance_automatic=1", "--set-ctrl=fov=1", "--set-ctrl=zoom_absolute=250",
+                          "--set-ctrl=pan_absolute=3600", "--set-ctrl=tilt_absolute=-3600"])
+
 
 class Model(unittest.TestCase):
     """The pure rules behind the Camera page's rows."""
@@ -112,16 +147,30 @@ class Model(unittest.TestCase):
 
     def test_groups_hold_every_standard_control_once(self):
         names = [n for _, main, advanced in camera.GROUPS for n in main + advanced]
-        self.assertEqual(sorted(names), sorted(self.ctrls))
+        self.assertEqual(sorted(names), sorted(brio()))
+        self.assertIn("fov", camera.GROUPS[0][1])
+        self.assertIn("led_mode", camera.GROUPS[1][2])  # Image → Advanced
         self.assertEqual([g for g, _, _ in camera.GROUPS], ["Framing", "Image", "Focus"])
         image = {g: (m, a) for g, m, a in camera.GROUPS}["Image"]
-        self.assertEqual(image[1], ["contrast", "saturation", "sharpness", "gain", "power_line_frequency"])
+        self.assertEqual(image[1], ["contrast", "saturation", "sharpness", "gain", "power_line_frequency", "led_mode"])
         self.assertIn("brightness", image[0])
 
     def test_labels(self):
         self.assertEqual(camera.LABELS["exposure_dynamic_framerate"], "Keep 30 fps")
         self.assertEqual(camera.LABELS["backlight_compensation"], "HDR")
         self.assertEqual(camera.LABELS["power_line_frequency"], "Anti-flicker")
+        self.assertEqual((camera.LABELS["fov"], camera.LABELS["led_mode"]), ("Field of view", "LED"))
+
+    def test_fov_and_led_rows(self):
+        ctrls = brio()
+        self.assertEqual(camera.choices(ctrls["fov"]), [(0, "90°"), (1, "78°"), (2, "65°")])
+        ctrls["led_mode"].update(value=4, default=5)  # bytes the menu lacks show as themselves, never as item 0 "Off"
+        self.assertEqual(camera.choices(ctrls["led_mode"]),
+                         [(0, "Off"), (1, "On"), (2, "Blink"), (3, "Auto"), (4, "Unknown (4)"), (5, "Unknown (5)")])
+        self.assertEqual((camera.kind("fov", ctrls["fov"]), camera.kind("led_mode", ctrls["led_mode"])),
+                         ("combo", "combo"))
+        framing = camera.defaults(ctrls, camera.GROUPS[0][1] + camera.GROUPS[0][2])
+        self.assertIn(("fov", 0), framing)  # ↺ Framing goes back to the camera's 90°
 
     def test_keep_30_fps_on_means_no_dynamic_framerate(self):
         self.assertEqual(camera.switch_values("exposure_dynamic_framerate"), (0, 1))
@@ -178,23 +227,29 @@ class Model(unittest.TestCase):
 
     def test_changes_sends_the_value(self):
         self.values["brightness"] = 90
-        self.assertEqual(camera.changes(self.values, "brightness"), [("brightness", 90)])
+        self.assertEqual(camera.changes(self.ctrls, self.values, "brightness"), [("brightness", 90)])
 
     def test_changes_holds_a_manual_value_while_auto_is_on(self):
         self.values["exposure_time_absolute"] = 400
-        self.assertEqual(camera.changes(self.values, "exposure_time_absolute"), [])
+        self.assertEqual(camera.changes(self.ctrls, self.values, "exposure_time_absolute"), [])
 
     def test_turning_auto_off_sends_the_manual_value_shown(self):
         self.values.update(focus_automatic_continuous=0, focus_absolute=40)
-        self.assertEqual(camera.changes(self.values, "focus_automatic_continuous"),
+        self.assertEqual(camera.changes(self.ctrls, self.values, "focus_automatic_continuous"),
                          [("focus_automatic_continuous", 0), ("focus_absolute", 40)])
         self.values["focus_automatic_continuous"] = 1
-        self.assertEqual(camera.changes(self.values, "focus_automatic_continuous"),
+        self.assertEqual(camera.changes(self.ctrls, self.values, "focus_automatic_continuous"),
                          [("focus_automatic_continuous", 1)])
+
+    def test_a_value_the_menu_lacks_is_shown_but_never_sent(self):  # "Unknown (4)": an undocumented XU byte
+        ctrls = brio()
+        for n, v in (("led_mode", 4), ("fov", 7), ("power_line_frequency", 9)):
+            self.assertEqual(camera.changes(ctrls, {**self.values, n: v}, n), [], n)
+        self.assertEqual(camera.changes(ctrls, {**self.values, "led_mode": 0}, "led_mode"), [("led_mode", 0)])
 
     def test_pan_is_sent_at_1x(self):  # disabled in the UI, but a reset still centers it
         self.values["pan_absolute"] = 0
-        self.assertEqual(camera.changes(self.values, "pan_absolute"), [("pan_absolute", 0)])
+        self.assertEqual(camera.changes(self.ctrls, self.values, "pan_absolute"), [("pan_absolute", 0)])
 
     def test_nudge_pan_and_tilt_one_step_within_range(self):
         pan = self.ctrls["pan_absolute"]
@@ -223,10 +278,32 @@ class Commands(unittest.TestCase):
 
     def test_read_ctrls_asks_for_controls_with_menus(self):
         out = subprocess.CompletedProcess([], 0, stdout=read("brio/ctrls-index0.txt"))
-        with mock.patch("booth.camera.subprocess.run", return_value=out) as run:
+        with mock.patch("booth.camera.subprocess.run", return_value=out) as run, \
+                mock.patch.object(xu, "read", return_value=XU) as xread:
             ctrls = camera.read_ctrls(DEV)
         self.assertEqual(run.call_args.args[0], ["v4l2-ctl", "-d", DEV, "--list-ctrls-menus"])
         self.assertEqual(ctrls["power_line_frequency"]["menu"], {0: "Disabled", 1: "50 Hz", 2: "60 Hz"})
+        self.assertEqual((ctrls["fov"]["value"], ctrls["led_mode"]["value"]), (2, 3))  # read back at page open
+        xread.assert_called_once_with(DEV)
+
+    def test_run_sends_an_extension_unit_write_through_the_ioctl(self):
+        with mock.patch.object(xu, "write", return_value=True) as write, \
+                mock.patch("booth.camera.subprocess.run") as sub:
+            self.assertIs(camera.run(camera.set_cmd(DEV, "fov", 1)), True)
+        write.assert_called_once_with(DEV, "fov", 1)
+        sub.assert_not_called()
+        for refusal in (mock.Mock(return_value=False), mock.Mock(side_effect=OSError(32, "Broken pipe"))):
+            with mock.patch.object(xu, "write", refusal):
+                self.assertIs(camera.run(camera.set_cmd(DEV, "led_mode", 0)), False)
+
+    def test_read_ctrls_when_the_node_cannot_be_opened(self):  # unplugged between discovery and page open
+        out = subprocess.CompletedProcess([], 0, stdout=read("brio/ctrls-index0.txt"))
+        with mock.patch("booth.camera.subprocess.run", return_value=out), \
+                mock.patch.object(xu, "descriptors", return_value=b""), \
+                mock.patch.object(xu.os, "open", side_effect=FileNotFoundError(2, "No such file or directory")):
+            ctrls = camera.read_ctrls(DEV)
+        self.assertIn("zoom_absolute", ctrls)
+        self.assertNotIn("fov", ctrls)
 
     def test_read_ctrls_unreadable_camera(self):
         with mock.patch("booth.camera.subprocess.run", side_effect=subprocess.TimeoutExpired("v4l2-ctl", 5)):
@@ -258,6 +335,15 @@ class Restore(unittest.TestCase):
 
     def test_no_camera_runs_nothing(self):
         self.assertEqual(self.restore(None, {"zoom_absolute": 250}), ([], []))
+
+
+class RestoreXU(unittest.TestCase):
+    def test_saved_fov_is_reapplied_at_launch_through_the_ioctl(self):
+        with mock.patch.object(camera, "read_ctrls", return_value=brio()), \
+                mock.patch.object(xu, "write", return_value=True) as write, \
+                mock.patch("booth.camera.subprocess.run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertEqual(camera.restore(DEV, {"fov": 1, "zoom_absolute": 250}), [])
+        write.assert_called_once_with(DEV, "fov", 1)
 
 
 class FakeSpawn:
@@ -369,6 +455,17 @@ class SetterTest(unittest.TestCase):
         self.assertEqual(values, {"zoom_absolute": 100, AF: 1, FOCUS: 0})
         self.assertIn(FOCUS, camera.held(values))  # so the focus row is insensitive again
 
+    def test_fov_goes_through_the_same_queue_and_is_saved_once_taken(self):
+        self.setter.set([("zoom_absolute", 200)])
+        self.setter.set([("fov", 1)])
+        self.assertEqual(self.spawn.finish(True), [])
+        self.assertEqual(self.spawn.cmds, [zoom(200), camera.set_cmd(DEV, "fov", 1)])
+        self.assertEqual(self.spawn.finish(False), ["fov"])  # refused: not saved, the row goes back
+        self.assertEqual(self.settings["camera"], {"zoom_absolute": 200})
+        self.setter.set([("fov", 0)])
+        self.spawn.finish(True)
+        self.assertEqual(self.settings["camera"], {"zoom_absolute": 200, "fov": 0})
+
     def test_batches_for_other_controls_do_not_collapse(self):
         self.setter.set([("zoom_absolute", 200)])
         self.setter.set([])  # nothing to send (a held manual value) must not stall the queue
@@ -390,7 +487,7 @@ class PageQuietTest(unittest.TestCase):
         from booth.ui.camera import CameraPage
 
         sent = []
-        page = mock.Mock(quiet=False, values={"zoom_absolute": 300})
+        page = mock.Mock(quiet=False, values={"zoom_absolute": 300}, ctrls=brio())
         page.setter.set = sent.append
         page.widgets = {"zoom_absolute": lambda v: CameraPage.changed(page, "zoom_absolute", v)}  # a widget's signal
         CameraPage.show(page, ["zoom_absolute"])

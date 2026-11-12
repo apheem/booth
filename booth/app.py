@@ -1,11 +1,13 @@
 """The Booth application: a single-instance libadwaita app. Logic lives in the pure modules; this file only wires."""
 import sys
+import threading
+import traceback
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw  # noqa: E402
+from gi.repository import Adw, GLib  # noqa: E402
 
 from booth import camera, devices, store  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
@@ -24,13 +26,35 @@ def restore_camera(settings):
 class Application(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
-        self.window = None
+        self.window, self.starting = None, False
 
     def do_activate(self):
-        if self.window is None:
+        if self.window is not None:
+            self.window.present()
+        elif not self.starting:  # the camera can block for seconds per query: restore and read it off the main loop
+            self.starting = True
+            self.hold()  # no window yet: keeps the app alive until show_window()
             settings = store.load()
-            self.window = Window(self, settings, restore_camera(settings))
-        self.window.present()
+            threading.Thread(target=lambda: self.start(settings), daemon=True).start()
+
+    def start(self, settings):
+        node, ctrls = None, {}
+        try:
+            node = restore_camera(settings)
+            ctrls = camera.read_ctrls(node) if node else {}  # the Camera page's model, read after the restore
+        finally:
+            GLib.idle_add(self.show_window, settings, node, ctrls)
+
+    def show_window(self, settings, node, ctrls):
+        try:
+            self.window = Window(self, settings, node, ctrls)
+            self.window.present()
+        except Exception:  # no window: release lets Booth exit instead of living on with nothing to show
+            traceback.print_exc()
+        finally:
+            self.starting = False
+            self.release()
+        return GLib.SOURCE_REMOVE
 
 
 def main(argv):
