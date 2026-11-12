@@ -62,6 +62,9 @@ class Install(unittest.TestCase):
         return subprocess.run(["sh", str(repo / "install.sh")], env=self.env, cwd=self.home,
                               capture_output=True, text=True, timeout=60)
 
+    def test_install_script_is_executable_as_the_readme_runs_it(self):
+        self.assertTrue(os.access(REPO / "install.sh", os.X_OK), "README says ./install.sh")
+
     def test_installs_launcher_desktop_entry_and_a_copy_of_the_app(self):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
