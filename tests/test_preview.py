@@ -61,6 +61,13 @@ def error(code, text="x"):
     return GLib.Error.new_literal(Gst.ResourceError.quark(), text, code)
 
 
+class Root(GObject.Object):  # the page's window: only its `suspended` matters here
+    suspended = GObject.Property(type=bool, default=False)
+
+    def is_suspended(self):
+        return self.suspended
+
+
 class Recorder:
     def __init__(self):
         self.frames, self.threads, self.failures = [], [], []
@@ -82,6 +89,14 @@ class Pipeline(unittest.TestCase):
     def test_the_appsink_keeps_one_buffer_and_drops_old_frames(self):
         sink = Gst.parse_launch(fake(DEV)).get_by_name("sink")
         self.assertEqual((sink.get_property("max-buffers"), sink.get_property("drop")), (1, True))
+
+    def test_start_opens_the_node_it_was_given(self):
+        given = []
+        page = preview.Preview(DEV, print, print, launch=lambda node: given.append(node) or fake(node))
+        self.addCleanup(drain)
+        self.addCleanup(page.stop)
+        page.start()
+        self.assertEqual(given, [DEV])
 
     def test_no_camera_no_pipeline(self):
         page = preview.Preview(None, print, print, launch=fake)
@@ -257,12 +272,6 @@ class Shown(unittest.TestCase):
         gi.require_version("Adw", "1")
         from booth.ui.camera import CameraPage
 
-        class Root(GObject.Object):  # the window: only its `suspended` matters here
-            suspended = GObject.Property(type=bool, default=False)
-
-            def is_suspended(self):
-                return self.suspended
-
         page, shown = mock.Mock(live=False), []
         page.get_root.return_value = Root()
         page.preview_shown = shown.append
@@ -307,6 +316,54 @@ class Shown(unittest.TestCase):
         CameraPage, page = self.page()[0], mock.Mock(node=DEV)  # no such by-id link here: unplugged
         CameraPage.preview_failed(page, preview.UNAVAILABLE)
         page.problem.set_title.assert_called_once_with(preview.DISCONNECTED)
+
+
+class Wired(unittest.TestCase):
+    """The page's real preview wiring (preview_group's signals down to preview_shown) on a plain object: a widget
+    needs a display, so Gtk and Adw are stubbed and Preview records what the page asks of it."""
+
+    def test_the_page_previews_its_own_node_from_map_to_unmap(self):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from booth.ui import camera as ui
+        calls = []
+
+        class Rec:
+            def __init__(self, node, show, failed, launch=None):
+                calls.append(node)
+
+            def start(self):
+                calls.append("start")
+
+            def stop(self):
+                calls.append("stop")
+
+        class Page:
+            P = ui.CameraPage
+            preview_group, preview_mapped, preview_unmapped = P.preview_group, P.preview_mapped, P.preview_unmapped
+            preview_update, preview_shown, preview_failed = P.preview_update, P.preview_shown, P.preview_failed
+            node, handlers, mapped, window = DEV, {}, False, Root()
+
+            def connect(self, signal, handler):
+                self.handlers[signal] = handler
+
+            def emit(self, signal):  # what GTK does as the page is shown and left
+                self.mapped = signal == "map"
+                self.handlers.get(signal, lambda _page: None)(self)
+
+            def get_mapped(self):
+                return self.mapped
+
+            def get_root(self):
+                return self.window
+
+        page = Page()
+        with mock.patch.object(ui, "Gtk"), mock.patch.object(ui, "Adw"), mock.patch.object(preview, "Preview", Rec):
+            page.preview_group()
+        page.emit("map")
+        page.emit("unmap")
+        self.assertEqual(calls, [DEV, "start", "stop"])
 
 
 class Problem(unittest.TestCase):
