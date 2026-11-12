@@ -225,6 +225,18 @@ class ScarlettGroup(unittest.TestCase):
         self.select(self.page.input, 1)
         self.assertEqual((self.settings["microphone"], self.saved, self.ran), ({"input": "Instrument"}, [self.settings], []))
 
+    def test_a_failed_save_says_so_on_the_input_row_until_a_good_one(self):
+        self.show(state())
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(30, "Read-only file system")):
+            self.select(self.page.input, 1)
+        self.assertEqual(self.settings["microphone"], {"input": "Instrument"})
+        self.assertEqual(self.page.input.subtitle, "Set, but not saved: Read-only file system")
+        self.show(state())  # the next poll keeps the note
+        self.assertEqual(self.page.input.subtitle, "Set, but not saved: Read-only file system")
+        self.select(self.page.input, 0)  # saved this time
+        self.show(state())
+        self.assertEqual(self.page.input.subtitle, "Capture channel 2 (FR)")
+
     def test_a_saved_input_is_selected_at_start(self):
         page = Page()
         microphone.MicrophonePage.__init__(page, {"microphone": {"input": "Instrument"}})
@@ -289,6 +301,18 @@ class WindowClose(unittest.TestCase):
             if c.args[0] == "close-request":
                 c.args[1](win)
         mic.return_value.stop.assert_called_once_with()
+
+    def test_closing_the_window_stops_the_headphones_pages_poll(self):
+        ns, win = types.SimpleNamespace, mock.Mock()
+        with mock.patch.object(ui_window, "super", lambda *a: ns(__init__=lambda **k: None), create=True), \
+                mock.patch.object(ui_window, "Adw"), mock.patch.object(ui_window, "Gtk"), \
+                mock.patch.object(ui_window, "CameraPage"), mock.patch.object(ui_window, "MicrophonePage"), \
+                mock.patch.object(ui_window, "HeadphonesPage") as hp:
+            ui_window.Window.__init__(win, None, {}, None, {})
+        for c in win.connect.call_args_list:
+            if c.args[0] == "close-request":
+                c.args[1](win)
+        hp.return_value.stop.assert_called_once_with()
 
 
 class Worker(unittest.TestCase):

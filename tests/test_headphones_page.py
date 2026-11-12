@@ -43,6 +43,25 @@ class Worker(unittest.TestCase):
             headphones.HeadphonesPage.poll(page)
         self.assertEqual(self.idle, [(page.show, (None, 4))])  # show() clears polling
 
+    def test_an_overlapping_poll_is_refused_and_the_next_one_after_show_runs(self):
+        reads = []
+        page = mock.Mock(polling=False, read=lambda since: headphones.HeadphonesPage.read(page, since))
+        page.writer.fresh.return_value = False  # show() only clears polling here
+        with mock.patch.object(headphones.headset, "state", lambda: reads.append(1)):
+            headphones.HeadphonesPage.poll(page)
+            headphones.HeadphonesPage.poll(page)  # a slow pw-dump: the first one's read hasn't been shown yet
+            self.assertEqual(len(reads), 1)
+            f, a = self.idle.pop()
+            headphones.HeadphonesPage.show(page, *a)
+            headphones.HeadphonesPage.poll(page)
+        self.assertEqual(len(reads), 2)
+
+    def test_stop_removes_the_poll_timer(self):
+        page, removed = mock.Mock(timer=7), []
+        with mock.patch.object(headphones.GLib, "source_remove", removed.append):
+            headphones.HeadphonesPage.stop(page)
+        self.assertEqual(removed, [7])
+
 
 class UseForAllSound(unittest.TestCase):
     def default(self, result, on=True):
@@ -83,6 +102,16 @@ class UseForAllSound(unittest.TestCase):
             headphones.HeadphonesPage.remember(page, "scarlett")
         self.assertEqual(page.settings["headphones"], {"previous_default": "scarlett"})
         save.assert_called_once_with(page.settings)
+
+    def test_a_failed_save_says_so_on_the_row_and_a_good_one_clears_it(self):
+        page = mock.Mock(settings={"camera": {}, "headphones": {}})
+        with mock.patch.object(headphones.store, "save", side_effect=OSError(28, "No space left on device")):
+            headphones.HeadphonesPage.remember(page, "scarlett")
+        self.assertEqual(page.settings["headphones"], {"previous_default": "scarlett"})
+        page.switch.set_subtitle.assert_called_once_with("Set, but not saved: No space left on device")
+        with mock.patch.object(headphones.store, "save"):
+            headphones.HeadphonesPage.remember(page, None)
+        page.switch.set_subtitle.assert_called_with(headphones.SWITCH_SUBTITLE)
 
 
 class _W:

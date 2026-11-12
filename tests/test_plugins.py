@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 import unittest.mock
 import zipfile
@@ -81,18 +82,27 @@ class Verify(unittest.TestCase):
 
     def test_a_symlink_is_refused_even_to_matching_bytes(self):
         (self.dir / "elsewhere.so").write_bytes(FAKE[SC4M])
+        (self.dir / "elsewhere.so").chmod(0o644)  # safe modes whatever the umask: only the symlink is wrong
+        self.dir.chmod(0o755)
         (self.folder / SC4M).symlink_to(self.dir / "elsewhere.so")
-        self.refused(SC4M)
+        self.assertIn("can't open", self.refused(SC4M))
         (self.folder / SC4M).unlink()
         shutil.copy(self.dir / "elsewhere.so", self.folder / "copy.so")
         (self.folder / SC4M).symlink_to("copy.so")  # inside the folder too: only the real file is trusted
-        self.refused(SC4M)
+        self.assertIn("can't open", self.refused(SC4M))
 
     def test_a_folder_or_fifo_in_its_place_is_refused(self):
-        (self.folder / SC4M).mkdir()
-        self.refused(SC4M)
-        os.mkfifo(self.folder / RNNOISE)  # must not block waiting for a writer
-        self.refused(RNNOISE)
+        (self.folder / SC4M).mkdir(mode=0o755)
+        (self.folder / SC4M).chmod(0o755)  # safe modes whatever the umask: only the type is wrong
+        self.assertIn("not a regular file", self.refused(SC4M))
+        os.mkfifo(self.folder / RNNOISE, 0o644)
+        (self.folder / RNNOISE).chmod(0o644)
+        out = []  # must not block waiting for a writer: a hang fails this test instead of the gate
+        t = threading.Thread(target=lambda: out.append(self.refused(RNNOISE)), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "verify() blocked on a fifo")
+        self.assertIn("not a regular file", out[0])
 
     def test_a_file_or_folder_others_can_write_is_refused(self):
         self.put(SC4M, FAKE[SC4M])
