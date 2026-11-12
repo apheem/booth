@@ -4,7 +4,8 @@
 # writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop.
 set -eu
 repo=$(cd "$(dirname "$0")" && pwd)
-share=${XDG_DATA_HOME:-$HOME/.local/share}
+share=${XDG_DATA_HOME:-}
+case $share in /*) ;; *) share=$HOME/.local/share ;; esac  # the XDG spec: a relative path is invalid and ignored
 dest=$share/booth
 bin=$HOME/.local/bin
 mkdir -p "$dest" "$bin" "$share/applications"
@@ -24,12 +25,14 @@ EOF
 chmod 755 "$bin/booth.new"
 mv "$bin/booth.new" "$bin/booth"
 
+# Desktop-entry quoting: in a quoted Exec argument " ` $ \ take a backslash, itself escaped in the value; % is doubled.
+exec_arg=$(printf '%s' "$bin/booth" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')
 cat > "$share/applications/io.github.apheem.Booth.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Booth
 Comment=Camera, microphone and headphones in one place
-Exec=$bin/booth
+Exec="$exec_arg"
 Icon=camera-web
 Categories=AudioVideo;Settings;
 StartupNotify=true

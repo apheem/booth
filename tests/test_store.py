@@ -76,7 +76,29 @@ class Store(unittest.TestCase):
         new["camera"]["zoom_absolute"] = 400
         with mock.patch("booth.store.json.dump", dump_then_crash), self.assertRaises(OSError):
             store.save(new, self.path)
+        self.assertEqual(os.listdir(self.path.parent), ["settings.json"])  # no temp file left behind
         self.assertEqual(store.load(self.path)["camera"], {"zoom_absolute": 250})
+
+    def test_too_deeply_nested_counts_as_corrupt(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("[" * 200000)
+        self.assertEqual(store.load(self.path), store.defaults())
+        self.assertFalse(self.path.exists())
+        self.assertEqual(len(list(self.path.parent.iterdir())), 1)
+
+    def test_settings_path_is_a_directory(self):
+        self.path.mkdir(parents=True)
+        self.assertEqual(store.load(self.path), store.defaults())
+        self.assertFalse(self.path.exists())  # moved aside, so the next save can write the file
+        store.save(store.defaults(), self.path)
+
+    def test_unreadable_and_unrenamable_file_loads_defaults(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('{"camera": {}}')
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")), \
+                mock.patch("booth.store.os.replace", side_effect=PermissionError(13, "denied")):
+            self.assertEqual(store.load(self.path), store.defaults())
+        self.assertTrue(self.path.exists())
 
     def test_missing_keys_take_defaults(self):
         self.path.parent.mkdir(parents=True)
@@ -92,6 +114,9 @@ class Store(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.dir)}):
             self.assertEqual(store.path(), self.dir / "booth" / "settings.json")
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "", "HOME": str(self.dir)}):
+            self.assertEqual(store.path(), self.dir / ".config" / "booth" / "settings.json")
+        # The XDG spec says a relative path is invalid and must be ignored.
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "rel/config", "HOME": str(self.dir)}):
             self.assertEqual(store.path(), self.dir / ".config" / "booth" / "settings.json")
 
 

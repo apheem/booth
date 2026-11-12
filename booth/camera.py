@@ -86,7 +86,9 @@ class Setter:
             self.spawn(set_cmd(self.device, self.name, value), lambda ok: self._done(value, ok))
 
     def _done(self, value, ok):
-        if ok:
-            self.settings["camera"][self.name] = value
-            self.save(self.settings)
-        self._next()
+        try:
+            if ok:
+                self.settings["camera"][self.name] = value
+                self.save(self.settings)  # an OSError (disk full, read-only) is raised to the page, after _next
+        finally:
+            self._next()

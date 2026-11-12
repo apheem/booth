@@ -117,11 +117,15 @@ class FakeSpawn:
         self.cmds, self.done = [], []
 
     def __call__(self, cmd, done):
-        self.cmds.append(cmd[-1])
+        self.cmds.append(cmd)
         self.done.append(done)
 
     def finish(self, ok):
         self.done.pop(0)(ok)
+
+
+def zoom(v):
+    return ["v4l2-ctl", "-d", DEV, f"--set-ctrl=zoom_absolute={v}"]
 
 
 class SetterTest(unittest.TestCase):
@@ -135,9 +139,9 @@ class SetterTest(unittest.TestCase):
     def test_one_set_in_flight_and_the_last_value_wins(self):
         for v in (200, 300, 400):
             self.setter.set(v)
-        self.assertEqual(self.spawn.cmds, ["--set-ctrl=zoom_absolute=200"])
+        self.assertEqual(self.spawn.cmds, [zoom(200)])
         self.spawn.finish(True)
-        self.assertEqual(self.spawn.cmds, ["--set-ctrl=zoom_absolute=200", "--set-ctrl=zoom_absolute=400"])
+        self.assertEqual(self.spawn.cmds, [zoom(200), zoom(400)])
         self.spawn.finish(True)
         self.assertEqual(self.spawn.done, [])
         self.assertEqual(self.saved, [{"zoom_absolute": 200}, {"zoom_absolute": 400}])
@@ -150,6 +154,17 @@ class SetterTest(unittest.TestCase):
         self.setter.set(260)  # a failure doesn't wedge the setter
         self.spawn.finish(True)
         self.assertEqual(self.saved, [{"zoom_absolute": 260}])
+
+    def test_a_failed_save_does_not_wedge_the_setter(self):
+        def save(settings):
+            raise OSError(28, "No space left on device")
+
+        self.setter.save = save
+        self.setter.set(250)
+        with self.assertRaises(OSError):  # surfaced to the page, which says so
+            self.spawn.finish(True)
+        self.setter.set(300)
+        self.assertEqual(self.spawn.cmds, [zoom(250), zoom(300)])
 
 
 if __name__ == "__main__":
