@@ -273,7 +273,7 @@ class Replug(unittest.TestCase):
         app.Application.on_by_id(stub, None, Gio.File.new_for_path(file), other and Gio.File.new_for_path(other), event)
 
     def test_ten_fast_replugs_restore_the_current_saved_state_once_auto_modes_first(self):
-        timers, ran, stub = Timers(), [], mock.Mock(window=None)
+        timers, ran, stub = Timers(), [], mock.Mock(window=None, closed_page=None)
         stub.restore_saved = lambda: app.Application.restore_saved(stub)
         stub.replug = service.Debounce(app.REPLUG_MS, stub.restore_saved, timers.add, timers.remove)
 
@@ -356,7 +356,7 @@ class Replug(unittest.TestCase):
         self.assertEqual((page.values["zoom_absolute"], page.values["auto_exposure"]), (250, 1))  # the page shows them
 
     def test_a_worker_restore_waits_for_a_write_in_flight_then_goes_through_a_page_that_opened(self):
-        threads, idle, stub = [], [], mock.Mock(window=None)
+        threads, idle, stub = [], [], mock.Mock(window=None, closed_page=None)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()):
             app.Application.restore_saved(stub)
         with mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append(f)), \
@@ -373,8 +373,48 @@ class Replug(unittest.TestCase):
         restore.assert_not_called()  # no second writer: the page's Setter restores, behind its own writes
         self.assertEqual(idle, [stub.window.camera.reapply])
 
+    def test_fsk_restore_alone_reads_the_file_before_the_write_it_waited_for_is_saved(self):
+        # A held instance: the user dragged zoom to 300 and closed the window while that write was on the camera (its
+        # save comes after, on the main loop). A replug restore then must not write the older saved 150 after it.
+        from booth.ui.camera import CameraPage
+        from tests.test_camera import FakeSpawn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        spawn, ctrls = FakeSpawn(), camera.parse_ctrls(read("brio/ctrls-index0.txt"))
+        with mock.patch.dict(os.environ, XDG_CONFIG_HOME=tmp.name), \
+                mock.patch.object(app.threading, "Thread", Inline), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: f(*a)), \
+                mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
+                mock.patch.object(camera, "read_ctrls", return_value=ctrls), \
+                mock.patch.object(camera, "run", lambda cmd: spawn.cmds.append(cmd) or True):
+            store.save({"version": 1, "camera": {"zoom_absolute": 150}})
+            page = mock.Mock(ctrls=ctrls, values={n: c["value"] for n, c in ctrls.items() if "value" in c})
+            page.setter = camera.Setter(store.load(), DEV, spawn, store.save, page.values)
+            page.reapply = lambda: CameraPage.reapply(page)
+            stub = mock.Mock(window=mock.Mock(camera=page), closed_page=None)
+            page.setter.set([("zoom_absolute", 300)])  # on the camera
+            app.Application.on_close(stub, stub.window)
+            app.Application.restore_saved(stub)  # the replug
+            while spawn.done:
+                spawn.finish(True)
+            self.assertEqual([c[-1] for c in spawn.cmds if "zoom" in c[-1]][-1], "--set-ctrl=zoom_absolute=300")
+            self.assertEqual(store.load()["camera"]["zoom_absolute"], 300)
+
+    def test_a_window_closed_while_the_worker_waited_restores_through_its_setter(self):
+        threads, idle, stub = [], [], mock.Mock(window=None, closed_page=None)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()):
+            app.Application.restore_saved(stub)
+        stub.closed_page = mock.Mock()  # a window opened, wrote and closed before the worker got the camera
+        with mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append(f)), \
+                mock.patch.object(app, "restore_camera") as restore:
+            threads[0]()
+        restore.assert_not_called()  # its last write may be unsaved: the file could be older than the camera
+        self.assertEqual(idle, [stub.closed_page.reapply])
+
     def test_with_no_window_or_no_camera_on_the_page_a_worker_restores(self):
-        for stub in (mock.Mock(window=None), mock.Mock()):
+        idle_page = mock.Mock(setter=mock.Mock(batch=[], queue=[]))  # a closed page with every write saved
+        for stub in (mock.Mock(window=None, closed_page=idle_page), mock.Mock(closed_page=None)):
             if stub.window:
                 stub.window.camera.ctrls = {}  # the page opened while the BRIO was unplugged: it can't write
             with mock.patch.object(app.threading, "Thread", Inline), \

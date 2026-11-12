@@ -494,6 +494,17 @@ class SetterTest(unittest.TestCase):
                                            cmd("brightness", 140)])
         self.assertEqual(self.settings["camera"], {"zoom_absolute": 300, AF: 0, FOCUS: 45, "brightness": 140})
 
+    def test_fsk_inflight_then_newer_queued_same_control(self):
+        self.settings["camera"]["zoom_absolute"] = 150  # saved before the replug
+        self.setter.set([("zoom_absolute", 300)])  # in flight
+        self.setter.set([("zoom_absolute", 350)])  # newer, queued behind it
+        self.assertEqual(self.setter.reapply(brio()), [("zoom_absolute", 350)])
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds[-1], zoom(350))
+        self.assertEqual(self.settings["camera"]["zoom_absolute"], 350)
+        self.assertEqual(self.saved[-1]["zoom_absolute"], 350)
+
     def test_a_replug_restore_writes_the_saved_values_never_what_the_camera_reads_back(self):
         # The page read the camera between the replug and the restore: it took the power-on defaults (zoom 100, AF on).
         self.settings["camera"].update({"zoom_absolute": 250, AF: 0, FOCUS: 40})

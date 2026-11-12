@@ -18,7 +18,8 @@ def tree(root):
 
 STUB = """#!/bin/sh
 echo "${0##*/} $*" >> "$STUB_LOG"
-case $* in *is-enabled*) echo "${UNIT_STATE:-enabled}"; [ "${UNIT_STATE:-enabled}" = enabled ] || exit 1 ;; esac
+case $* in *is-enabled*) echo "${UNIT_STATE-enabled}"; [ "${UNIT_STATE-enabled}" = enabled ] || exit 1 ;; esac
+case $* in *Activate\\ quit*) [ "${QUIT_RC:-0}" = 0 ] || exit "$QUIT_RC" ;; esac
 case ${0##*/} in systemctl) exit "${SYSTEMCTL_RC:-0}" ;; gdbus) [ "${GDBUS_RC:-0}" = 0 ] || exit "$GDBUS_RC" ;; esac
 case $* in *NameHasOwner*)
   if [ "$(grep -c NameHasOwner "$STUB_LOG")" -le "${OWNED_POLLS:-0}" ]; then echo "(true,)"; else echo "(false,)"; fi ;;
@@ -31,6 +32,8 @@ OWNER = ("gdbus call --session --dest org.freedesktop.DBus --object-path /org/fr
 UNIT_CALLS = ["systemctl --user daemon-reload", "systemctl --user enable booth.service",
               "systemctl --user restart booth.service"]
 STALE = "Booth is still running the old version"
+CLOSED = "Booth was closed to update it — open it again from the app grid."
+NO_SYSTEMD = "couldn't reach systemd; run: systemctl --user daemon-reload && systemctl --user restart booth.service"
 
 
 class Install(unittest.TestCase):
@@ -140,6 +143,37 @@ class Install(unittest.TestCase):
         calls = self.calls.read_text().splitlines()
         self.assertEqual(calls[2:], ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload"])
         self.assertNotIn("couldn't start", r.stderr)
+
+    def test_fsk_reinstall_with_no_user_bus_says_nothing(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.env.update(UNIT_STATE="", SYSTEMCTL_RC="1")  # is-enabled can't reach the user manager: no answer
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(NO_SYSTEMD, r.stderr)  # an enabled service would keep running the old copy: say how to restart
+        self.assertNotIn("systemctl --user restart booth.service", self.calls.read_text())
+        self.assertIn(CLOSED, r.stdout)
+
+    def test_fsk_reinstall_switched_off_closes_the_open_window_silently(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.env["UNIT_STATE"] = "disabled"
+        r = self.install()  # the quit closed the open Booth window and nothing restarts it
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(CLOSED, r.stdout)
+        self.env["QUIT_RC"] = "1"  # no Booth was running: nothing was closed
+        r = self.install()
+        self.assertNotIn(CLOSED, r.stdout + r.stderr)
+        self.env.update(QUIT_RC="0", OWNED_POLLS="99")  # an old copy that won't quit, with the switch off
+        self.calls.write_text("")
+        r = self.install()
+        self.assertIn(STALE + " — close Booth and open it again.", r.stderr)
+        self.assertNotIn("restart booth.service", r.stdout + r.stderr)  # that would start a disabled unit
+        self.assertNotIn(CLOSED, r.stdout)  # it wasn't closed
+
+    def test_a_restarted_service_says_nothing_about_closing(self):
+        self.assertEqual(self.install().returncode, 0)
+        r = self.install()  # enabled: the restart brings Booth back
+        self.assertNotIn(CLOSED, r.stdout + r.stderr)
 
     def test_a_reinstall_restarts_an_enabled_service_without_enabling_it_again(self):
         self.assertEqual(self.install().returncode, 0)

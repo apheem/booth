@@ -28,10 +28,16 @@ def camera_page(window):
     return page if page is not None and camera.ZOOM in page.ctrls else None
 
 
-def restore_alone(app):
-    """A replug restore with no Camera page to do it, on a worker."""
+def busy(page):
+    """A closed window's Camera page whose Setter still has writes to send or save, else None."""
+    return page if page is not None and (page.setter.batch or page.setter.queue) else None
+
+
+def restore_alone(app, closed):
+    """A replug restore with no Camera page to do it, on a worker. `closed`: the closed page restore_saved saw idle."""
     with RESTORING:  # after any page write in flight, so the saved values are read as that write left them
-        if page := camera_page(app.window):  # the window opened meanwhile: its Setter restores, behind its writes
+        # the window opened meanwhile, or another closed with its writes maybe unsaved: its Setter restores, behind them
+        if page := camera_page(app.window) or (app.closed_page if app.closed_page is not closed else None):
             GLib.idle_add(page.reapply)
             return
         restore_camera(store.load())
@@ -49,7 +55,7 @@ def restore_camera(settings):
 class Application(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
-        self.window, self.starting = None, False
+        self.window, self.starting, self.closed_page = None, False, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
@@ -98,10 +104,12 @@ class Application(Adw.Application):
             self.replug.poke()
 
     def restore_saved(self):
-        if page := camera_page(self.window):  # one writer: the page queues it behind its own writes
+        # one writer: the page queues it behind its own writes, even a closed one's whose last write isn't saved yet
+        if page := camera_page(self.window) or busy(self.closed_page):
             page.reapply()
             return
-        threading.Thread(target=lambda: restore_alone(self), daemon=True).start()
+        closed = self.closed_page
+        threading.Thread(target=lambda: restore_alone(self, closed), daemon=True).start()
 
     def start(self, settings):
         node, ctrls, enabled = None, {}, False
@@ -130,7 +138,8 @@ class Application(Adw.Application):
             self.release()
         return GLib.SOURCE_REMOVE
 
-    def on_close(self, _window):
+    def on_close(self, window):
+        self.closed_page = camera_page(window) or self.closed_page  # set first: a worker reads window, then this
         self.window = None  # the closed window is gone: the next activate builds a new one
         return False
 

@@ -23,7 +23,8 @@ camera settings at login and whenever the BRIO is plugged back in), enables it a
 shows the window of that running instance; "Run in Background" in the main menu disables or enables the service; on, it also
 keeps the open Booth running after its window closes.
 Re-running it replaces the previous install and keeps your "Run in Background" choice: it restarts the service only if
-it is enabled, and never enables one you switched off.
+it is enabled, and never enables one you switched off. A Booth it had to close and didn't restart is named, as is a
+service state it couldn't read (no user bus), with the command to restart it by hand.
 To check an install matches the repo:
 
     diff -rq -x __pycache__ booth ~/.local/share/booth/booth
