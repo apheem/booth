@@ -466,6 +466,16 @@ class SetterTest(unittest.TestCase):
         self.spawn.finish(True)
         self.assertEqual(self.settings["camera"], {"zoom_absolute": 200, "fov": 0})
 
+    def test_a_replug_restore_never_lands_an_older_value_after_a_newer_one(self):
+        self.settings["camera"].update({"zoom_absolute": 150, AF: 0, FOCUS: 40})  # saved before the replug
+        self.setter.set([("zoom_absolute", 300)])  # a drag just after the replug: in flight, not saved yet
+        self.setter.reapply(brio(), {"zoom_absolute": 300, AF: 0, FOCUS: 40})  # the page's values
+        self.setter.set([(FOCUS, 50)])  # and a write after the restore was queued
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [zoom(300), cmd(AF, 0), zoom(300), cmd(FOCUS, 50)])  # the queued 40 collapsed
+        self.assertEqual(self.settings["camera"], {"zoom_absolute": 300, AF: 0, FOCUS: 50})
+
     def test_batches_for_other_controls_do_not_collapse(self):
         self.setter.set([("zoom_absolute", 200)])
         self.setter.set([])  # nothing to send (a held manual value) must not stall the queue

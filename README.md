@@ -20,7 +20,8 @@ symlink), and writes the launcher `~/.local/bin/booth` and the app-grid entry
 `~/.local/share/applications/io.github.apheem.Booth.desktop`. It also writes the systemd user unit
 `~/.config/systemd/user/booth.service` (`booth --background`, started with your desktop session; it re-applies the
 camera settings at login and whenever the BRIO is plugged back in), enables it and (re)starts it. Opening Booth then
-shows the window of that running instance; "Run in Background" in the main menu turns the service off or on.
+shows the window of that running instance; "Run in Background" in the main menu disables or enables the service; on, it also
+keeps the open Booth running after its window closes.
 Re-running it replaces the previous install.
 To check an install matches the repo:
 

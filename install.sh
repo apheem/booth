@@ -42,7 +42,8 @@ EOF
 
 # booth.service runs the installed launcher with --background. It's wanted by graphical-session.target, not
 # default.target: GTK needs the session's display, which default.target (also reached with no login screen) lacks.
-# RestartSec keeps Restart=on-failure under the start limit while a window-only Booth holds the name (see app.py).
+# PartOf: it stops with the session. RestartSec spaces a crash's restarts (a --background start that finds Booth
+# already running exits 0, so it is never restarted).
 config=${XDG_CONFIG_HOME:-}
 case $config in /*) ;; *) config=$HOME/.config ;; esac
 units=$config/systemd/user

@@ -6,12 +6,10 @@ UNIT = "booth.service"
 IS_ENABLED = ["systemctl", "--user", "is-enabled", "--quiet", UNIT]
 
 
-def switch(on, in_service):
-    """The command for the switch turned `on` or off. Off from inside the service only disables it: stopping it would
-    kill the window the switch is in, so the app lets go of its hold and exits cleanly when that window closes."""
-    if on:
-        return ["systemctl", "--user", "enable", "--now", UNIT]
-    return ["systemctl", "--user", "disable", UNIT] if in_service else ["systemctl", "--user", "disable", "--now", UNIT]
+def switch(on):
+    """The command for the switch turned `on` or off. It never starts or stops the unit: the window's own process is the
+    primary instance, so it holds on (and the unit takes over at the next login) or lets go and exits with its window."""
+    return ["systemctl", "--user", "enable" if on else "disable", UNIT]
 
 
 def run(cmd):

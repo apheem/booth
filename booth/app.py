@@ -1,8 +1,9 @@
 """The Booth application: a single-instance libadwaita app. Logic lives in the pure modules; this file only wires.
 
-`booth --background` (booth.service, at login) runs with no window and keeps the camera's saved settings applied: now,
-and whenever the BRIO is plugged back in. A plain launch while it runs shows the window in that same process (GApplication
-is single-instance over D-Bus), and closing the window leaves it running."""
+Every primary instance keeps the camera's saved settings applied: at launch, and whenever the BRIO is plugged back in.
+`booth --background` (booth.service, at login) does it with no window. A plain launch while Booth runs shows the window
+in that same process (GApplication is single-instance over D-Bus). With "Run in background" on, the process is held:
+closing the window leaves it running."""
 import sys
 import threading
 import traceback
@@ -44,16 +45,18 @@ class Application(Adw.Application):
     def do_handle_local_options(self, options):
         if options.contains("background"):
             self.register(None)
-            if self.get_is_remote():  # Booth already runs: a failure, so booth.service retries until that one quits
+            if self.get_is_remote():  # Booth already runs and does the work: a clean exit, no Restart= loop
                 print("Booth: already running", file=sys.stderr)
-                return 1
+                return 0
             self.background = True
         return -1  # register and activate: here, or in the running instance, which shows its window
 
     def do_activate(self):
-        if self.background and self.monitor is None:
+        if self.monitor is None:  # the primary instance's first activate
             self.watch()
-        elif self.window is not None:
+            if self.background:
+                return
+        if self.window is not None:
             self.window.present()
         elif not self.starting:  # the camera can block for seconds per query: restore and read it off the main loop
             self.starting = True
@@ -62,25 +65,31 @@ class Application(Adw.Application):
             threading.Thread(target=lambda: self.start(settings), daemon=True).start()
 
     def watch(self):
-        """The background instance: held so it lives with no window, restoring the camera now and on every replug."""
-        self.hold()
-        self.held = True
+        """Restore the camera on every replug. The background instance is held, so it lives with no window, and restores
+        now; a window instance restores in start(), before it reads the camera for its page."""
         self.replug = service.Debounce(REPLUG_MS, self.restore_saved, GLib.timeout_add, GLib.source_remove)
         self.monitor = Gio.File.new_for_path(devices.BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
         self.monitor.connect("changed", self.on_by_id)
-        self.restore_saved()
+        if self.background:
+            self.hold()
+            self.held = True
+            self.restore_saved()
 
     def on_by_id(self, _monitor, file, other, event):
         if devices.replugged((other or file).get_basename(), event.value_nick):
             self.replug.poke()
 
     def restore_saved(self):
+        page = self.window.camera if self.window is not None else None
+        if page is not None and camera.ZOOM in page.ctrls:  # one writer: the page queues it behind its own writes
+            page.reapply()
+            return
         threading.Thread(target=lambda: restore_camera(store.load()), daemon=True).start()
 
     def start(self, settings):
         node, ctrls, enabled = None, {}, False
         try:
-            # the background instance keeps the camera restored itself; another restore here could race a replug's
+            # a held instance keeps the camera restored itself; another restore here could race a replug's
             node = devices.discover()["camera"] if self.held else restore_camera(settings)
             ctrls = camera.read_ctrls(node) if node else {}  # the Camera page's model, read after the restore
             enabled = service.run(service.IS_ENABLED)
@@ -106,7 +115,7 @@ class Application(Adw.Application):
 
     def on_background(self, action, value):
         on = value.get_boolean()
-        cmd = service.switch(on, self.background)
+        cmd = service.switch(on)
         threading.Thread(target=lambda: GLib.idle_add(self.switched, action, on, service.run(cmd)), daemon=True).start()
 
     def switched(self, action, on, ok):
@@ -114,7 +123,7 @@ class Application(Adw.Application):
             print(f"Booth: couldn't {'enable' if on else 'disable'} {service.UNIT}", file=sys.stderr)
             return GLib.SOURCE_REMOVE
         action.set_state(GLib.Variant.new_boolean(on))
-        if self.background and on != self.held:  # off: exit when the window closes (a clean exit stays stopped)
+        if on != self.held:  # on: this process stays as the background instance; off: it exits when the window closes
             (self.hold if on else self.release)()
             self.held = on
         return GLib.SOURCE_REMOVE

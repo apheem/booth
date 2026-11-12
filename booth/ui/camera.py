@@ -106,6 +106,11 @@ class CameraPage(Adw.PreferencesPage):
         self.setter.set(camera.reset_batch(self.ctrls, names))
         self.refresh()
 
+    def reapply(self):
+        """A replug reset the camera: send the saved controls again, at the values the page shows, behind its writes."""
+        self.setter.reapply(self.ctrls, self.values)
+        self.refresh()
+
     def show(self, names):
         """Move the widgets of `names` to self.values without sending anything."""
         self.quiet = True
@@ -129,7 +134,7 @@ class CameraPage(Adw.PreferencesPage):
         threading.Thread(target=lambda: GLib.idle_add(self.finished, name, camera.run(cmd), done), daemon=True).start()
 
     def finished(self, name, ok, done):
-        row, missed = self.rows[name], []
+        row, missed = self.rows.get(name), []  # a saved control with no row must not stall the Setter's queue
         self.errors[row] = None if ok else "The camera did not take this value"
         try:
             missed = done(ok)

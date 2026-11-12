@@ -9,8 +9,9 @@ from unittest import mock
 from gi.repository import Gio, GLib
 
 from booth import app, camera, service
+from booth.ui import window as ui_window
 from tests.fixture import read
-from tests.test_service import Timers
+from tests.test_service import Clock, Timers
 
 DEV = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_FAKESER1-video-index0"
 
@@ -148,10 +149,11 @@ class LaunchOffTheMainLoop(unittest.TestCase):
         self.assertIn("no display", err.getvalue())
 
     def test_the_window_shows_the_switch_state_and_forgets_itself_when_closed(self):
-        stub = mock.Mock(window=None, starting=True)
-        with mock.patch.object(app, "Window") as window:
-            app.Application.show_window(stub, {"camera": {}}, None, {}, True)
-        self.assertIs(stub.run_in_background.set_state.call_args.args[0].get_boolean(), True)
+        for enabled in (False, True):
+            stub = mock.Mock(window=None, starting=True)
+            with mock.patch.object(app, "Window") as window:
+                app.Application.show_window(stub, {"camera": {}}, None, {}, enabled)
+            self.assertIs(stub.run_in_background.set_state.call_args.args[0].get_boolean(), enabled)
         window.return_value.connect.assert_called_once_with("close-request", stub.on_close)
         self.assertIs(app.Application.on_close(stub, stub.window), False)  # False: the window does close
         self.assertIsNone(stub.window)  # so the next activate builds a new one instead of presenting a dead one
@@ -179,11 +181,12 @@ class BackgroundLaunch(unittest.TestCase):
         stub.register.assert_called_once_with(None)
         self.assertIs(stub.background, True)
 
-    def test_background_launch_while_booth_runs_fails_so_the_service_retries(self):
+    def test_background_launch_while_booth_runs_exits_cleanly_so_the_service_never_loops(self):
+        # The running instance already restores on replug; a failure here would restart every RestartSec.
         stub, err = mock.Mock(background=False), io.StringIO()
         stub.get_is_remote.return_value = True
         with contextlib.redirect_stderr(err):
-            self.assertEqual(app.Application.do_handle_local_options(stub, options(True)), 1)
+            self.assertEqual(app.Application.do_handle_local_options(stub, options(True)), 0)
         self.assertIs(stub.background, False)
         stub.activate.assert_not_called()  # the running instance opens no window for it
         self.assertIn("already running", err.getvalue())
@@ -197,18 +200,36 @@ class BackgroundLaunch(unittest.TestCase):
         window.assert_not_called()
         self.assertEqual(threads, [])
 
-    def test_watch_holds_for_good_monitors_by_id_and_restores_now(self):
-        stub = mock.Mock(held=False)
+    def test_a_window_instance_also_watches_then_opens_its_window(self):
+        threads, stub = [], mock.Mock(background=False, monitor=None, window=None, starting=False)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}):
+            app.Application.do_activate(stub)
+        stub.watch.assert_called_once_with()  # opened from the app grid, it still restores on replug
+        self.assertEqual(len(threads), 1)  # and start(): the launch restore, then the window
+
+    def watch(self, background):
+        stub = mock.Mock(held=False, background=background)
         with mock.patch.object(app.Gio.File, "new_for_path") as new_for_path:
             app.Application.watch(stub)
-        stub.hold.assert_called_once_with()  # no window, and closing one later never quits
-        self.assertIs(stub.held, True)
         new_for_path.assert_called_once_with("/dev/v4l/by-id")
         monitor = new_for_path.return_value.monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
-        stub.restore_saved.assert_called_once_with()  # the restore at login
         self.assertIsInstance(stub.replug, service.Debounce)
+        return stub
+
+    def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
+        stub = self.watch(background=True)
+        stub.hold.assert_called_once_with()  # no window, and closing one later never quits
+        self.assertIs(stub.held, True)
+        stub.restore_saved.assert_called_once_with()  # the restore at login
+
+    def test_watch_in_a_window_instance_leaves_the_launch_restore_to_start(self):
+        stub = self.watch(background=False)
+        stub.hold.assert_not_called()  # it lives with its window unless Run in Background is switched on
+        self.assertIs(stub.held, False)
+        stub.restore_saved.assert_not_called()
 
 
 class Replug(unittest.TestCase):
@@ -218,7 +239,7 @@ class Replug(unittest.TestCase):
         app.Application.on_by_id(stub, None, Gio.File.new_for_path(file), other and Gio.File.new_for_path(other), event)
 
     def test_ten_fast_replugs_restore_the_current_saved_state_once_auto_modes_first(self):
-        timers, ran, stub = Timers(), [], mock.Mock()
+        timers, ran, stub = Timers(), [], mock.Mock(window=None)
         stub.restore_saved = lambda: app.Application.restore_saved(stub)
         stub.replug = service.Debounce(app.REPLUG_MS, stub.restore_saved, timers.add, timers.remove)
 
@@ -243,6 +264,41 @@ class Replug(unittest.TestCase):
                                "--set-ctrl=exposure_time_absolute=300"])
         self.assertEqual(timers.pending, {})
 
+    def test_udevs_rename_alone_restores(self):  # another camera keeps by-id present: no folder event comes
+        stub = mock.Mock()
+        self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)
+        stub.replug.poke.assert_called_once_with()
+
+    def test_a_burst_inside_the_debounce_window_restores_once(self):
+        clock, restores, stub = Clock(), [], mock.Mock()
+        stub.replug = service.Debounce(app.REPLUG_MS, lambda: restores.append(clock.now), clock.add, clock.remove)
+        for _ in range(10):  # a flapping cable: an index0 link every 150 ms
+            self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)
+            clock.advance(150)
+        clock.advance(10_000)
+        self.assertEqual(restores, [1350 + app.REPLUG_MS])  # once, after the last event
+        self.assertGreaterEqual(app.REPLUG_MS, 1000)  # long enough to span a replug's burst of udev events
+
+    def test_with_the_window_open_the_page_restores_behind_its_own_writes(self):
+        stub = mock.Mock()
+        stub.window.camera.ctrls = {camera.ZOOM: {}}
+        with mock.patch.object(app.threading, "Thread") as thread:
+            app.Application.restore_saved(stub)
+        stub.window.camera.reapply.assert_called_once_with()  # one writer: no thread races the page's Setter
+        thread.assert_not_called()
+
+    def test_with_no_window_or_no_camera_on_the_page_a_worker_restores(self):
+        for stub in (mock.Mock(window=None), mock.Mock()):
+            if stub.window:
+                stub.window.camera.ctrls = {}  # the page opened while the BRIO was unplugged: it can't write
+            with mock.patch.object(app.threading, "Thread", Inline), \
+                    mock.patch.object(app, "restore_camera") as restore, \
+                    mock.patch.object(app.store, "load", return_value=self.SAVED):
+                app.Application.restore_saved(stub)
+            restore.assert_called_once_with(self.SAVED)
+            if stub.window:
+                stub.window.camera.reapply.assert_not_called()
+
     def test_an_ir_node_or_unplug_event_never_restores(self):
         stub = mock.Mock()
         self.event(stub, DEV.replace("index0", "index2"), None, Gio.FileMonitorEvent.CREATED)
@@ -263,7 +319,7 @@ class RunInBackgroundSwitch(unittest.TestCase):
         for background in (False, True):
             stub = mock.Mock(background=background)
             ran, idle = self.flip(stub, False, True)
-            self.assertEqual(ran, [service.switch(False, background)])
+            self.assertEqual(ran, [service.switch(False)])
             self.assertEqual(idle, [(stub.switched, (stub.action, False, True))])
 
     def switched(self, background, held, on, ok=True):
@@ -285,10 +341,20 @@ class RunInBackgroundSwitch(unittest.TestCase):
         stub.hold.assert_called_once_with()
         self.assertIs(stub.held, True)
 
-    def test_a_plain_instance_neither_holds_nor_releases(self):
+    def test_on_in_a_window_instance_holds_it_so_it_outlives_its_window(self):
+        stub, _ = self.switched(background=False, held=False, on=True)
+        self.assertIs(stub.action.set_state.call_args.args[0].get_boolean(), True)
+        stub.hold.assert_called_once_with()  # it goes on as the background instance; the unit takes over at login
+        self.assertIs(stub.held, True)
+
+    def test_off_in_a_window_instance_lets_go(self):
+        stub, _ = self.switched(background=False, held=True, on=False)
+        stub.release.assert_called_once_with()
+        self.assertIs(stub.held, False)
+
+    def test_the_same_state_again_neither_holds_nor_releases(self):
         for on in (False, True):
-            stub, _ = self.switched(background=False, held=False, on=on)
-            self.assertIs(stub.action.set_state.call_args.args[0].get_boolean(), on)
+            stub, _ = self.switched(background=False, held=on, on=on)
             stub.hold.assert_not_called()
             stub.release.assert_not_called()
 
@@ -297,6 +363,16 @@ class RunInBackgroundSwitch(unittest.TestCase):
         stub.action.set_state.assert_not_called()
         stub.release.assert_not_called()
         self.assertIn("booth.service", err)
+
+
+class MenuWiring(unittest.TestCase):
+    def test_the_menu_item_names_an_action_the_app_registers(self):
+        menu = ui_window.main_menu()
+        name = menu.get_item_attribute_value(0, "action", GLib.VariantType.new("s")).get_string()
+        self.assertTrue(name.startswith("app."), name)
+        action = app.Application().lookup_action(name.removeprefix("app."))
+        self.assertIsNotNone(action)
+        self.assertEqual(action.get_state().get_type_string(), "b")  # a check item
 
 
 if __name__ == "__main__":

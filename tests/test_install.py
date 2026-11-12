@@ -85,6 +85,8 @@ class Install(unittest.TestCase):
         unit = self.unit.read_text().splitlines()
         self.assertIn(f'ExecStart=/bin/sh "{self.launcher}" --background', unit)
         self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartSec=5", unit)  # a crash loop stays under systemd's start limit
+        self.assertIn("PartOf=graphical-session.target", unit)  # it stops with the session whose display it uses
         self.assertIn("WantedBy=graphical-session.target", unit)  # GTK needs the session's display
         self.assertIn("After=graphical-session.target", unit)
         self.assertNotIn(str(REPO), self.unit.read_text())

@@ -162,15 +162,20 @@ def status(ctrls, values):
 
 
 def restore_cmds(device, ctrls, saved):
-    """Commands that re-apply saved {name: value} controls this camera has, each clamped to its live range: auto modes
-    first, and no manual value whose auto mode stays on (the driver would refuse it). A saved menu value the menu lacks
-    is not sent, except the LED's, which falls back to Auto: Booth never turns the LED off unless the user picked Off."""
+    """Commands that re-apply saved {name: value} controls this camera has: restore_writes, as commands."""
+    return [set_cmd(device, name, value) for name, value in restore_writes(ctrls, saved)]
+
+
+def restore_writes(ctrls, saved):
+    """The ordered [(name, value)] that re-apply saved controls this camera has, each clamped to its live range: auto
+    modes first, and no manual value whose auto mode stays on (the driver would refuse it). A saved menu value the menu
+    lacks is not sent, except the LED's, which falls back to Auto: Booth never turns the LED off unless the user picked
+    Off."""
     saved = {n: v if "menu" not in ctrls.get(n, {}) or v in ctrls[n]["menu"] else xu.DEFAULTS.get(n)
              for n, v in saved.items()}
     saved = {n: v for n, v in saved.items() if v is not None}
     hold = held({n: c["value"] for n, c in ctrls.items() if "value" in c} | saved)
-    return [set_cmd(device, name, clamp(ctrls[name], value)) for name, value in ordered(saved)
-            if name in ctrls and name not in hold]
+    return [(name, clamp(ctrls[name], value)) for name, value in ordered(saved) if name in ctrls and name not in hold]
 
 
 def read_ctrls(device):
@@ -224,6 +229,13 @@ class Setter:
             self.queue.append(writes)
         if not self.batch:
             self._next()
+
+    def reapply(self, ctrls, wanted):
+        """Queue the saved controls again (a replug reset the camera) at their newest `wanted` value, so a write still
+        queued or in flight is never followed by an older one. One write each, like a launch restore: a refusal skips
+        only itself."""
+        for write in restore_writes(ctrls, {n: wanted.get(n, v) for n, v in self.settings["camera"].items()}):
+            self.set([write])
 
     def _next(self):
         if not self.batch and self.queue:

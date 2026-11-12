@@ -6,17 +6,14 @@ from booth import service
 
 
 class Switch(unittest.TestCase):
-    def test_on_enables_and_starts_the_service(self):
-        for in_service in (False, True):
-            self.assertEqual(service.switch(True, in_service), ["systemctl", "--user", "enable", "--now", "booth.service"])
+    def test_on_only_enables(self):
+        # The window's process is the primary instance and holds itself: a second, --background one has nothing to do.
+        self.assertEqual(service.switch(True), ["systemctl", "--user", "enable", "booth.service"])
 
-    def test_off_from_a_plain_instance_disables_and_stops_it(self):
-        self.assertEqual(service.switch(False, False), ["systemctl", "--user", "disable", "--now", "booth.service"])
-
-    def test_off_from_inside_the_service_only_disables(self):
-        # Stopping would kill the window the switch is in: the app lets go of its hold instead and exits when the
+    def test_off_only_disables(self):
+        # Stopping could kill the window the switch is in: the app lets go of its hold instead and exits when the
         # window closes, a clean exit that Restart=on-failure leaves stopped.
-        self.assertEqual(service.switch(False, True), ["systemctl", "--user", "disable", "booth.service"])
+        self.assertEqual(service.switch(False), ["systemctl", "--user", "disable", "booth.service"])
 
     def test_is_enabled_query(self):
         self.assertEqual(service.IS_ENABLED, ["systemctl", "--user", "is-enabled", "--quiet", "booth.service"])
@@ -25,6 +22,7 @@ class Switch(unittest.TestCase):
         self.assertTrue(service.run(["true"]))
         self.assertFalse(service.run(["false"]))
         self.assertFalse(service.run(["/nonexistent/systemctl"]))
+        self.assertFalse(service.run(["sh", "-c", "exit 4"]))  # is-enabled's "no such unit": not enabled
 
 
 class Timers:
@@ -46,6 +44,28 @@ class Timers:
         (sid, (_, callback)), = self.pending.items()
         del self.pending[sid]
         return callback()
+
+
+class Clock:
+    """GLib.timeout_add / source_remove on a fake clock: advance(ms) runs each timer as it comes due."""
+
+    def __init__(self):
+        self.now, self.pending, self.ids = 0, {}, itertools.count(1)
+
+    def add(self, ms, callback):
+        sid = next(self.ids)
+        self.pending[sid] = (self.now + ms, callback)
+        return sid
+
+    def remove(self, sid):
+        del self.pending[sid]
+
+    def advance(self, ms):
+        end = self.now + ms
+        while due := sorted((t, sid) for sid, (t, _) in self.pending.items() if t <= end):
+            self.now, sid = due[0]
+            self.pending.pop(sid)[1]()
+        self.now = end
 
 
 class DebounceTest(unittest.TestCase):
