@@ -1,0 +1,4 @@
+ioctl: VIDIOC_ENUM_FMT
+	Type: Video Capture
+
+	[0]: 'GREY' (8-bit Greyscale)
