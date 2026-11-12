@@ -9,15 +9,15 @@ import threading
 
 from gi.repository import Adw, GLib, Gtk
 
-from booth import headset
+from booth import headset, store
 
 POLL_S = 2
 
 
 class HeadphonesPage(Adw.PreferencesPage):
-    def __init__(self, status=lambda text: None):
+    def __init__(self, settings, status=lambda text: None):
         super().__init__()
-        self.status, self.quiet, self.polling = status, False, False
+        self.settings, self.status, self.quiet, self.polling = settings, status, False, False
         self.writer = headset.Writer(self.spawn)
         self.group = Adw.PreferencesGroup(title="PRO X Wireless")
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
@@ -44,8 +44,15 @@ class HeadphonesPage(Adw.PreferencesPage):
     def poll(self):
         if not self.polling:  # a slow pw-dump never piles up threads
             self.polling, since = True, self.writer.writes
-            threading.Thread(target=lambda: GLib.idle_add(self.show, headset.state(), since), daemon=True).start()
+            threading.Thread(target=lambda: self.read(since), daemon=True).start()
         return GLib.SOURCE_CONTINUE
+
+    def read(self, since):
+        state = None
+        try:
+            state = headset.state()
+        finally:  # always: show() clears polling, else the page stops following outside changes
+            GLib.idle_add(self.show, state, since)
 
     def show(self, state, since):
         self.polling = False
@@ -69,7 +76,24 @@ class HeadphonesPage(Adw.PreferencesPage):
     def on_default(self, row, _param):
         if not self.quiet:
             on = row.get_active()
-            self.writer.want("default", lambda dump: headset.default_cmd(dump, on))
+            self.writer.want("default", lambda dump: self.default(dump, on))
+
+    def default(self, dump, on):
+        # on the writer's thread, after any earlier switch write's remember() ran: read the remembered sink now
+        cmd, replaced = headset.default_cmd(dump, on, self.settings["headphones"].get("previous_default"))
+        if replaced:
+            GLib.idle_add(self.remember, replaced)
+        return cmd
+
+    def remember(self, name):
+        self.settings["headphones"]["previous_default"] = name
+        store.save(self.settings)  # on the main loop, like the Camera page's saves of the same dict
 
     def spawn(self, make, done):
-        threading.Thread(target=lambda: (headset.send(make), GLib.idle_add(done)), daemon=True).start()
+        threading.Thread(target=lambda: self.write(make, done), daemon=True).start()
+
+    def write(self, make, done):
+        try:
+            headset.send(make)
+        finally:  # always: done() clears Writer.busy, else no write is ever sent again
+            GLib.idle_add(done)

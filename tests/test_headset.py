@@ -109,20 +109,34 @@ class Volume(unittest.TestCase):
 
 
 class UseForAllSound(unittest.TestCase):
-    def test_on_makes_the_pro_x_the_default_sink(self):
-        self.assertEqual(headset.default_cmd(DUMP, True), ["wpctl", "set-default", "33"])
+    """On remembers the default sink it replaces, by node name; off puts that one back, or clears WirePlumber's
+    configured default sink (setting 0) when it is gone. Never a sink picked by priority."""
 
-    def test_off_hands_the_default_to_the_highest_priority_other_sink(self):
-        self.assertEqual(headset.default_cmd(DUMP, False), ["wpctl", "set-default", "176"])  # the Scarlett, 1009
+    def test_on_makes_the_pro_x_the_default_sink_and_remembers_the_one_before(self):
+        self.assertEqual(headset.default_cmd(dump(lambda o: default_sink(o, SCARLETT)), True),
+                         (["wpctl", "set-default", "33"], SCARLETT))
 
-    def test_off_with_no_other_sink_changes_nothing(self):
-        def only_pro_x(objects):
-            objects[:] = [o for o in objects if o is node(objects, PRO_X) or o["type"].endswith("Metadata")]
-        alone = dump(only_pro_x)
-        self.assertIsNone(headset.default_cmd(alone, False))
+    def test_on_by_the_id_of_now_after_a_replug(self):
+        self.assertEqual(headset.default_cmd(dump(lambda o: node(o, PRO_X).update(id=90)), True)[0],
+                         ["wpctl", "set-default", "90"])
+
+    def test_on_when_the_pro_x_already_is_the_default_remembers_nothing(self):
+        self.assertEqual(headset.default_cmd(dump(lambda o: default_sink(o, PRO_X)), True)[1], None)
+
+    def test_off_puts_back_the_remembered_sink_by_its_id_of_now(self):
+        moved = dump(lambda o: node(o, SCARLETT).update(id=201))
+        self.assertEqual(headset.default_cmd(moved, False, SCARLETT), (["wpctl", "set-default", "201"], None))
+
+    def test_off_with_the_remembered_sink_gone_clears_the_configured_default(self):
+        gone = dump(lambda o: o.remove(node(o, SCARLETT)))
+        self.assertEqual(headset.default_cmd(gone, False, SCARLETT), (["wpctl", "clear-default", "0"], None))
+
+    def test_off_with_nothing_remembered_clears_the_configured_default(self):
+        self.assertEqual(headset.default_cmd(DUMP, False, None), (["wpctl", "clear-default", "0"], None))
 
     def test_no_pro_x_sink_no_command(self):
-        self.assertIsNone(headset.default_cmd(dump(lambda o: o.remove(node(o, PRO_X))), True))
+        self.assertEqual(headset.default_cmd(dump(lambda o: o.remove(node(o, PRO_X))), True), (None, None))
+        self.assertEqual(headset.default_cmd(dump(lambda o: o.remove(node(o, PRO_X))), False, SCARLETT), (None, None))
 
 
 class State(unittest.TestCase):
@@ -182,6 +196,14 @@ class WriterTest(unittest.TestCase):
         self.assertFalse(self.writer.fresh(since))  # in flight
         self.spawned[0][1]()
         self.assertFalse(self.writer.fresh(since))  # done, but the poll read the old value
+        self.assertTrue(self.writer.fresh(self.writer.writes))
+
+    def test_a_poll_begun_while_a_write_is_in_flight_is_not_shown(self):
+        self.writer.want("volume", 10)
+        since = self.writer.writes
+        self.assertFalse(self.writer.fresh(since))  # still in flight: the poll may have read the old value
+        self.spawned[0][1]()
+        self.assertFalse(self.writer.fresh(since))  # done, but it may have read before the write landed
         self.assertTrue(self.writer.fresh(self.writer.writes))
 
 

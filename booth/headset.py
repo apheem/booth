@@ -70,17 +70,21 @@ def volume_cmd(dump, percent):
     return ["wpctl", "set-volume", "-l", "1.0", str(sinks[name][0]), f"{min(max(percent, 0), 100) / 100:.2f}"]
 
 
-def default_cmd(dump, on):
-    """"Use for all sound" switched `on` → make the PRO X the default sink; off → hand the default to the
-    highest-priority other sink. None when there is no such sink."""
-    sinks, _ = devices.parse_sinks(dump)
+def default_cmd(dump, on, previous=None):
+    """"Use for all sound" switched `on` → (make the PRO X the default sink, the default sink it replaces to remember by
+    node name, or None when that is the PRO X itself). Off → (set the default back to `previous`, resolved now by its
+    name; when it is gone or unknown, clear WirePlumber's configured default sink, setting 0 = Audio/Sink, so it picks
+    one by its own rules, None). Never a sink picked by priority here: that would be saved as the configured default.
+    (None, None) when the PRO X sink is gone."""
+    sinks, default = devices.parse_sinks(dump)
     name = devices.find_sink(sinks)
     if name is None:
-        return None
+        return None, None
     if on:
-        return ["wpctl", "set-default", str(sinks[name][0])]
-    others = [v for n, v in sinks.items() if n != name]
-    return ["wpctl", "set-default", str(max(others, key=lambda v: v[1])[0])] if others else None
+        return ["wpctl", "set-default", str(sinks[name][0])], (default if default != name else None)
+    if previous in sinks:
+        return ["wpctl", "set-default", str(sinks[previous][0])], None
+    return ["wpctl", "clear-default", "0"], None
 
 
 def state(run=devices._run):
@@ -108,8 +112,9 @@ def send(make, run=devices._run):
 class Writer:
     """The Headphones page's writes, one at a time, off the main loop. While one runs, a newer ask of the same kind
     replaces the queued one (a slider drag sends the last value asked for); kinds never drop each other.
-    `spawn(make, done)` runs send(make) elsewhere and calls done() back on the main loop. `writes` counts the asks,
-    so a poll begun before one, or while one is busy, is not shown (it may have read the old value)."""
+    `spawn(make, done)` runs send(make) elsewhere and calls done() back on the main loop. `writes` counts the asks
+    and the finished writes, so a poll begun before one, or while one is busy, is not shown (it may have read the old
+    value)."""
 
     def __init__(self, spawn):
         self.spawn, self.pending, self.busy, self.writes = spawn, {}, False, 0
@@ -120,10 +125,14 @@ class Writer:
         if not self.busy:
             self._next()
 
+    def _done(self):
+        self.writes += 1  # a poll begun while it ran may have read before it landed
+        self._next()
+
     def _next(self):
         self.busy = bool(self.pending)
         if self.busy:
-            self.spawn(self.pending.popitem()[1], self._next)
+            self.spawn(self.pending.popitem()[1], self._done)
 
     def fresh(self, since):
         """True when a poll begun at `writes == since` may be shown."""

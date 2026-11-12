@@ -64,6 +64,19 @@ class Store(unittest.TestCase):
             self.assertFalse(self.path.exists(), text)
         self.assertEqual(len(list(self.path.parent.iterdir())), 3)
 
+    def test_the_headphones_previous_default_sink_round_trips(self):
+        settings = store.load(self.path)
+        settings["headphones"]["previous_default"] = "alsa_output.usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00"
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["headphones"], settings["headphones"])
+
+    def test_a_bad_headphones_value_counts_as_corrupt(self):
+        # "Use for all sound" reads it on every turn-off: a wrong type there would break the switch
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"headphones": 7}', '{"headphones": {"previous_default": 7}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
     def test_failed_save_keeps_the_previous_file(self):
         old = store.defaults()
         old["camera"]["zoom_absolute"] = 250

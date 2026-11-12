@@ -31,7 +31,7 @@ class Window(Adw.ApplicationWindow):
         camera_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Ready · 2.0×"
         self.camera = CameraPage(settings, camera_node, camera_ctrls, camera_status.set_label)
         headphones_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Volume 63 %"
-        self.headphones = HeadphonesPage(headphones_status.set_label)
+        self.headphones = HeadphonesPage(settings, headphones_status.set_label)
         self.connect("close-request", lambda _w: self.headphones.stop())  # stops its poll; None lets the close go on
         self.pages = [
             ("Camera", "camera-web-symbolic", page("Camera", self.camera),

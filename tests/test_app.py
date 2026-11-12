@@ -379,7 +379,7 @@ class Replug(unittest.TestCase):
         stub.replug = service.Debounce(app.REPLUG_MS, lambda: app.Application.restore_saved(stub), timers.add,
                                        timers.remove)
         with mock.patch.dict(os.environ, XDG_CONFIG_HOME=tmp.name):
-            store.save({"version": 1, "camera": {"zoom_absolute": 250, "auto_exposure": 1}})
+            store.save(store.defaults() | {"camera": {"zoom_absolute": 250, "auto_exposure": 1}})
             before = store.path().read_bytes()
             self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)  # the replug
             with mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append(a)), \
@@ -509,9 +509,17 @@ class DongleReplug(unittest.TestCase):
         stub.dongle.poke.assert_not_called()
 
     def test_the_fix_runs_on_a_worker(self):
-        with mock.patch.object(app.threading, "Thread", Inline), \
+        threads = []
+
+        class Recorded(Inline):
+            def start(self):
+                threads.append(self)  # started, not run: the caller (the main loop) never runs amixer itself
+        with mock.patch.object(app.threading, "Thread", Recorded), \
                 mock.patch.object(app.headset, "fix_hw_volume") as fix:
             app.Application.fix_headset(mock.Mock())
+            fix.assert_not_called()
+            self.assertEqual(len(threads), 1)
+            threads[0].target()
         fix.assert_called_once_with()
 
 
