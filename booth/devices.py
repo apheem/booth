@@ -11,7 +11,7 @@ SND_BY_ID = "/dev/snd/by-id"  # ALSA control links; the PRO X dongle's: usb-Logi
 CARDS = "/proc/asound/cards"
 PRO_X = "PRO X Wireless Gaming Headset"  # the dongle's ALSA card name
 PRO_X_USB = "usb-Logitech_PRO_X_Wireless_Gaming_Headset-"  # in its by-id link and its PipeWire node names
-_CARD = re.compile(r"^\s*(\d+) \[.*\]: .* - (.*)$")
+_CARD = re.compile(r"^\s*\d+ \[(\S+)\s*\]: .* - (.*)$")
 
 
 def parse_udev(text):
@@ -69,10 +69,11 @@ def discover(run=_run, listdir=os.listdir):
 
 
 def find_card(cards, name):
-    """`/proc/asound/cards` text → the number of the card called `name`, or None."""
+    """`/proc/asound/cards` text → the ALSA id (in brackets, e.g. "Headset") of the card called `name`, or None. The id,
+    not the number: `amixer -c Headset` can't reach another card if the numbers shift between two commands."""
     for line in cards.splitlines():
         if (m := _CARD.match(line)) and m.group(2).strip() == name:
-            return int(m.group(1))
+            return m.group(1)
     return None
 
 
@@ -85,7 +86,7 @@ def _read(path):
 
 
 def headset_card(read=_read):
-    """The PRO X dongle's ALSA card number now, or None when it is unplugged."""
+    """The PRO X dongle's ALSA card id now, or None when it is unplugged."""
     return find_card(read(CARDS), PRO_X)
 
 

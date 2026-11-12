@@ -64,14 +64,23 @@ class HardwareFix(unittest.TestCase):
         headset.fix_hw_volume(run, lambda: card)
         return ran
 
-    def test_the_card_is_resolved_on_every_fix(self):
+    def test_the_card_is_resolved_on_every_fix_and_both_commands_use_its_alsa_id(self):
         low = CGET.replace(": values=64", ": values=41")
-        self.assertEqual(self.fix(1, low), [["amixer", "-c", "1", "cget", "name=PCM Playback Volume"],
-                                            ["amixer", "-c", "1", "cset", "name=PCM Playback Volume", "64"]])
-        self.assertEqual(self.fix(7, low)[1], ["amixer", "-c", "7", "cset", "name=PCM Playback Volume", "64"])
+        self.assertEqual(self.fix("Headset", low),
+                         [["amixer", "-c", "Headset", "cget", "name=PCM Playback Volume"],
+                          ["amixer", "-c", "Headset", "cset", "name=PCM Playback Volume", "64"]])
+        self.assertEqual(self.fix("Headset_1", low)[1],
+                         ["amixer", "-c", "Headset_1", "cset", "name=PCM Playback Volume", "64"])
+
+    def test_the_live_card_list_gives_the_id_to_amixer_never_the_number_resolved_once_for_both(self):
+        ran, cards = [], read("headset/cards.txt")
+        lists = iter([cards, cards.replace("[Headset  ", "[Headset_1")])  # a second resolution would see another id
+        card = lambda: devices.headset_card(lambda path: next(lists))  # noqa: E731
+        headset.fix_hw_volume(lambda *cmd: ran.append(list(cmd)) or CGET.replace(": values=64", ": values=41"), card)
+        self.assertEqual([cmd[2] for cmd in ran], ["Headset", "Headset"])
 
     def test_already_at_max_only_reads(self):
-        self.assertEqual(self.fix(1), [["amixer", "-c", "1", "cget", "name=PCM Playback Volume"]])
+        self.assertEqual(self.fix("Headset"), [["amixer", "-c", "Headset", "cget", "name=PCM Playback Volume"]])
 
     def test_no_dongle_runs_nothing(self):
         self.assertEqual(self.fix(None), [])
@@ -124,15 +133,21 @@ class UseForAllSound(unittest.TestCase):
         self.assertEqual(headset.default_cmd(dump(lambda o: default_sink(o, PRO_X)), True)[1], None)
 
     def test_off_puts_back_the_remembered_sink_by_its_id_of_now(self):
-        moved = dump(lambda o: node(o, SCARLETT).update(id=201))
+        moved = dump(lambda o: (node(o, SCARLETT).update(id=201), default_sink(o, PRO_X)))
         self.assertEqual(headset.default_cmd(moved, False, SCARLETT), (["wpctl", "set-default", "201"], None))
 
     def test_off_with_the_remembered_sink_gone_clears_the_configured_default(self):
-        gone = dump(lambda o: o.remove(node(o, SCARLETT)))
+        gone = dump(lambda o: (o.remove(node(o, SCARLETT)), default_sink(o, PRO_X)))
         self.assertEqual(headset.default_cmd(gone, False, SCARLETT), (["wpctl", "clear-default", "0"], None))
 
     def test_off_with_nothing_remembered_clears_the_configured_default(self):
-        self.assertEqual(headset.default_cmd(DUMP, False, None), (["wpctl", "clear-default", "0"], None))
+        self.assertEqual(headset.default_cmd(dump(lambda o: default_sink(o, PRO_X)), False, None),
+                         (["wpctl", "clear-default", "0"], None))
+
+    def test_off_never_moves_a_default_the_user_picked_elsewhere(self):
+        for previous in (SCARLETT, None):
+            self.assertEqual(headset.default_cmd(dump(lambda o: default_sink(o, SCARLETT)), False, previous),
+                             (None, None))
 
     def test_no_pro_x_sink_no_command(self):
         self.assertEqual(headset.default_cmd(dump(lambda o: o.remove(node(o, PRO_X))), True), (None, None))

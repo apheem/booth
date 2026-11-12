@@ -137,11 +137,12 @@ class Headset(unittest.TestCase):
     CARDS, DUMP = read("headset/cards.txt"), read("headset/pw-dump.json")
     SINK = "alsa_output.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.iec958-stereo"
 
-    def test_the_card_by_name(self):
-        self.assertEqual(devices.find_card(self.CARDS, devices.PRO_X), 1)
+    def test_the_card_by_name_gives_its_alsa_id_not_its_number(self):
+        self.assertEqual(devices.find_card(self.CARDS, devices.PRO_X), "Headset")
 
-    def test_a_new_card_number_after_a_replug(self):
-        self.assertEqual(devices.find_card(self.CARDS.replace(" 1 [Headset", " 7 [Headset"), devices.PRO_X), 7)
+    def test_a_new_id_after_a_replug(self):
+        cards = self.CARDS.replace(" 1 [Headset        ]", " 7 [Headset_1      ]")
+        self.assertEqual(devices.find_card(cards, devices.PRO_X), "Headset_1")
 
     def test_no_card(self):
         self.assertIsNone(devices.find_card(self.CARDS.replace(devices.PRO_X, "Other Headset"), devices.PRO_X))
@@ -150,9 +151,9 @@ class Headset(unittest.TestCase):
         self.assertIsNone(devices.find_card(self.CARDS.replace(devices.PRO_X, devices.PRO_X + " 2"), devices.PRO_X))
 
     def test_headset_card_reads_the_card_list_each_time(self):
-        lists = iter([self.CARDS, self.CARDS.replace(" 1 [Headset", " 3 [Headset"), ""])
+        lists = iter([self.CARDS, self.CARDS.replace(" 1 [Headset        ]", " 3 [Headset_1      ]"), ""])
         read_cards = lambda path: path == devices.CARDS and next(lists)  # noqa: E731
-        self.assertEqual([devices.headset_card(read_cards) for _ in range(3)], [1, 3, None])
+        self.assertEqual([devices.headset_card(read_cards) for _ in range(3)], ["Headset", "Headset_1", None])
 
     def test_sinks_by_node_name_with_ids_and_priorities_and_the_default(self):
         sinks, default = devices.parse_sinks(self.DUMP)

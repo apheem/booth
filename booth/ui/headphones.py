@@ -27,9 +27,9 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.scale.connect("value-changed", self.on_volume)
         volume = Adw.ActionRow(title="Volume")
         volume.add_suffix(self.scale)
-        self.default = Adw.SwitchRow(title="Use for all sound", subtitle="Play all sound through the headset")
-        self.default.connect("notify::active", self.on_default)
-        self.rows = [volume, self.default]
+        self.switch = Adw.SwitchRow(title="Use for all sound", subtitle="Play all sound through the headset")
+        self.switch.connect("notify::active", self.on_default)
+        self.rows = [volume, self.switch]
         for row in self.rows:
             self.group.add(row)
             row.set_sensitive(False)  # until the first poll finds the sink
@@ -63,7 +63,7 @@ class HeadphonesPage(Adw.PreferencesPage):
             self.group.set_description(None if state else "Not connected")
             if state:
                 self.scale.set_value(headset.percent(state["volume"]))
-                self.default.set_active(state["default"])
+                self.switch.set_active(state["default"])
             self.quiet = False
             self.status(headset.status(state))
         return GLib.SOURCE_REMOVE
@@ -81,12 +81,15 @@ class HeadphonesPage(Adw.PreferencesPage):
     def default(self, dump, on):
         # on the writer's thread, after any earlier switch write's remember() ran: read the remembered sink now
         cmd, replaced = headset.default_cmd(dump, on, self.settings["headphones"].get("previous_default"))
-        if replaced:
+        if replaced or (cmd and not on):  # off put the default back: nothing is left to remember
             GLib.idle_add(self.remember, replaced)
         return cmd
 
     def remember(self, name):
-        self.settings["headphones"]["previous_default"] = name
+        if name:
+            self.settings["headphones"]["previous_default"] = name
+        else:
+            self.settings["headphones"].pop("previous_default", None)
         store.save(self.settings)  # on the main loop, like the Camera page's saves of the same dict
 
     def spawn(self, make, done):

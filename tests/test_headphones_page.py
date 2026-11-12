@@ -1,11 +1,16 @@
 """The Headphones page's wiring: its writes and polls run on a worker and always report back to the main loop, even
 when the worker raises, so Writer.busy and the page's polling flag never stay stuck; "Use for all sound" keeps the
 sink it replaces in the settings, saved on the main loop."""
+import types
 import unittest
 from unittest import mock
 
+from gi.repository import GObject
+
+from booth import headset
 from booth.ui import headphones
 from tests.test_app import Inline
+from tests.test_headset import DUMP, PRO_X, SCARLETT, default_sink, dump
 
 
 class Boom(Exception):
@@ -55,8 +60,22 @@ class UseForAllSound(unittest.TestCase):
         self.assertEqual(idle, [(page.remember, ("scarlett",))])
 
     def test_nothing_to_remember_saves_nothing(self):
-        out, idle, _ = self.default((["wpctl", "clear-default", "0"], None), on=False)
-        self.assertEqual((out, idle), (["wpctl", "clear-default", "0"], []))
+        out, idle, _ = self.default((["wpctl", "set-default", "33"], None))
+        self.assertEqual((out, idle), (["wpctl", "set-default", "33"], []))
+
+    def test_off_forgets_the_remembered_sink_once_it_is_put_back(self):
+        out, idle, page = self.default((["wpctl", "set-default", "176"], None), on=False)
+        self.assertEqual((out, idle), (["wpctl", "set-default", "176"], [(page.remember, (None,))]))
+
+    def test_off_that_does_nothing_forgets_nothing(self):
+        self.assertEqual(self.default((None, None), on=False)[:2], (None, []))
+
+    def test_remember_none_drops_the_saved_sink(self):
+        page = mock.Mock(settings={"camera": {}, "headphones": {"previous_default": "scarlett"}})
+        with mock.patch.object(headphones.store, "save") as save:
+            headphones.HeadphonesPage.remember(page, None)
+        self.assertEqual(page.settings["headphones"], {})
+        save.assert_called_once_with(page.settings)
 
     def test_remember_saves_the_settings(self):
         page = mock.Mock(settings={"camera": {}, "headphones": {}})
@@ -64,6 +83,70 @@ class UseForAllSound(unittest.TestCase):
             headphones.HeadphonesPage.remember(page, "scarlett")
         self.assertEqual(page.settings["headphones"], {"previous_default": "scarlett"})
         save.assert_called_once_with(page.settings)
+
+
+class _W:
+    """A widget stand-in: GTK can't start without a display, so the page's rows are these."""
+    active = False
+
+    def __init__(self, *_args, **_kwargs):
+        self.handlers = {}
+
+    def connect(self, signal, handler):
+        self.handlers[signal] = handler
+
+    def get_active(self):
+        return self.active
+
+    def __getattr__(self, _name):  # set_hexpand, add_suffix, set_sensitive…
+        return lambda *_args: None
+
+
+# A real GObject with the page's own methods (a widget can't be made headless); __init__ is the page's own, run below.
+Page = type("HeadphonesStandIn", (GObject.Object,), {
+    **{k: v for k, v in vars(headphones.HeadphonesPage).items() if callable(v) and not k.startswith("__")},
+    "add": lambda self, _group: None, "poll": lambda self: True})
+
+
+class Click(unittest.TestCase):
+    """A click on "Use for all sound" through the page's real __init__, on_default, Writer and send to the wpctl
+    command it runs and the settings it saves."""
+
+    def click(self, on, pw_dump, settings):
+        ran, saved = [], []
+
+        def run(*cmd):
+            ran.append(list(cmd))
+            return pw_dump if cmd == ("pw-dump",) else ""
+        ns, send = types.SimpleNamespace, headset.send
+        page = Page()
+        with mock.patch.object(headphones, "super", lambda *a: ns(__init__=lambda: None), create=True), \
+                mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W)), \
+                mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0))), \
+                mock.patch.object(headphones.GLib, "timeout_add_seconds", lambda *a: 1), \
+                mock.patch.object(headphones.GLib, "idle_add", lambda f, *a: f(*a)), \
+                mock.patch.object(headphones.threading, "Thread", Inline), \
+                mock.patch.object(headphones.headset, "send", lambda make: send(make, run)), \
+                mock.patch.object(headphones.store, "save", saved.append):
+            headphones.HeadphonesPage.__init__(page, settings)
+            self.assertEqual([n for n in vars(page) if hasattr(headphones.HeadphonesPage, n)], [])  # none shadowed
+            switch = page.rows[1]
+            switch.active = on
+            switch.handlers["notify::active"](switch, None)
+        self.assertFalse(page.writer.busy)
+        return ran, saved
+
+    def test_on_makes_the_pro_x_the_default_and_saves_the_sink_it_replaced(self):
+        settings = {"headphones": {}}
+        ran, saved = self.click(True, DUMP, settings)
+        self.assertEqual(ran, [["pw-dump"], ["wpctl", "set-default", "33"]])
+        self.assertEqual((settings["headphones"], saved), ({"previous_default": SCARLETT}, [settings]))
+
+    def test_off_puts_the_saved_sink_back_and_forgets_it(self):
+        settings = {"headphones": {"previous_default": SCARLETT}}
+        ran, saved = self.click(False, dump(lambda o: default_sink(o, PRO_X)), settings)
+        self.assertEqual(ran, [["pw-dump"], ["wpctl", "set-default", "176"]])
+        self.assertEqual((settings["headphones"], saved), ({}, [settings]))
 
 
 if __name__ == "__main__":

@@ -40,10 +40,10 @@ def fix_cmd(card, ctrls):
 
 def fix_hw_volume(run=devices._run, card=devices.headset_card):
     """Read the dongle's hardware volume and set it to full when it isn't (nothing when unplugged) → the write or None."""
-    n = card()
-    if n is None:
+    card_id = card()
+    if card_id is None:
         return None
-    cmd = fix_cmd(n, parse_amixer(run("amixer", "-c", str(n), "cget", f"name={PCM}")))
+    cmd = fix_cmd(card_id, parse_amixer(run("amixer", "-c", card_id, "cget", f"name={PCM}")))
     if cmd:
         run(*cmd)
     return cmd
@@ -74,7 +74,7 @@ def default_cmd(dump, on, previous=None):
     """"Use for all sound" switched `on` → (make the PRO X the default sink, the default sink it replaces to remember by
     node name, or None when that is the PRO X itself). Off → (set the default back to `previous`, resolved now by its
     name; when it is gone or unknown, clear WirePlumber's configured default sink, setting 0 = Audio/Sink, so it picks
-    one by its own rules, None). Never a sink picked by priority here: that would be saved as the configured default.
+    one by its own rules, None); nothing when the default is no longer the PRO X (the user picked another one). Never a sink picked by priority here: that would be saved as the configured default.
     (None, None) when the PRO X sink is gone."""
     sinks, default = devices.parse_sinks(dump)
     name = devices.find_sink(sinks)
@@ -82,6 +82,8 @@ def default_cmd(dump, on, previous=None):
         return None, None
     if on:
         return ["wpctl", "set-default", str(sinks[name][0])], (default if default != name else None)
+    if default != name:
+        return None, None
     if previous in sinks:
         return ["wpctl", "set-default", str(sinks[previous][0])], None
     return ["wpctl", "clear-default", "0"], None
