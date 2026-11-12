@@ -16,11 +16,17 @@ SWITCH_SUBTITLE = "Play all sound through the headset"
 
 
 class HeadphonesPage(Adw.PreferencesPage):
-    def __init__(self, settings, status=lambda text: None):
+    def __init__(self, settings, status, monitor):
+        """`monitor`: the Application's HeadsetMonitor; the page follows its battery polls while it is open."""
         super().__init__()
         self.settings, self.status, self.quiet, self.polling = settings, status, False, False
+        self.monitor, self.state = monitor, None
         self.writer = headset.Writer(self.spawn)
         self.group = Adw.PreferencesGroup(title="PRO X Wireless")
+        self.battery = Adw.ActionRow(title="Battery")
+        self.group.add(self.battery)
+        monitor.listeners.append(self.on_headset)
+        self.on_headset()
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.scale.set_hexpand(True)
         self.scale.set_draw_value(True)
@@ -41,6 +47,15 @@ class HeadphonesPage(Adw.PreferencesPage):
     def stop(self):
         """The window closed: no more polls. Returns None, so close-request goes on."""
         GLib.source_remove(self.timer)
+        self.monitor.listeners.remove(self.on_headset)
+
+    def on_headset(self, _event=None):
+        """The service's battery poll changed something (or the page opened): the card and the sidebar."""
+        title, battery = headset.card(self.monitor)
+        self.group.set_title(title)
+        self.battery.set_subtitle(battery or "")
+        self.battery.set_visible(battery is not None)
+        self.status(headset.status(self.state, self.monitor))
 
     def poll(self):
         if not self.polling:  # a slow pw-dump never piles up threads
@@ -66,7 +81,8 @@ class HeadphonesPage(Adw.PreferencesPage):
                 self.scale.set_value(headset.percent(state["volume"]))
                 self.switch.set_active(state["default"])
             self.quiet = False
-            self.status(headset.status(state))
+            self.state = state
+            self.status(headset.status(state, self.monitor))
         return GLib.SOURCE_REMOVE
 
     def on_volume(self, scale):

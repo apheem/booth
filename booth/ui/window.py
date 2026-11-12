@@ -27,8 +27,8 @@ class Window(Adw.ApplicationWindow):
         self.set_size_request(360, 300)
         camera_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Ready · 2.0×"
         self.camera = CameraPage(settings, camera_node, camera_ctrls, camera_status.set_label)
-        headphones_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Volume 63 %"
-        self.headphones = HeadphonesPage(settings, headphones_status.set_label)
+        headphones_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "~70 % · Volume 63 %"
+        self.headphones = HeadphonesPage(settings, headphones_status.set_label, app.headset_monitor)
         self.connect("close-request", lambda _w: self.headphones.stop())  # stops its poll; None lets the close go on
         self.microphone = MicrophonePage(settings)
         self.connect("close-request", lambda _w: self.microphone.stop())

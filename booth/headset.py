@@ -3,10 +3,15 @@
 The dongle's ALSA `PCM Playback Volume` can sit below full after a replug and the IEC958 profile never raises it, so
 100 % is too quiet: Booth sets it to the control's maximum (0 dB) at start and whenever the dongle appears. The volume
 slider is wpctl's volume of the PRO X sink, never above 1.0 (100 %). The sink's id is resolved from pw-dump right
-before every command: PipeWire reuses ids after a replug."""
-import re
+before every command: PipeWire reuses ids after a replug.
 
-from booth import devices
+HeadsetMonitor follows the battery (booth.hidpp) for the service's 10 s poll: on/off, a smoothed estimate, and one
+low-battery warning per discharge."""
+import re
+import sys
+import traceback
+
+from booth import devices, hidpp
 
 PCM = "PCM Playback Volume"
 _NAME = re.compile(r"name='(.*)'")
@@ -99,9 +104,89 @@ def state(run=devices._run):
     return None if volume is None else {"volume": volume, "default": name == default}
 
 
-def status(state):
-    """The Headphones sidebar subtitle, e.g. "Volume 63 %"."""
-    return "Not connected" if state is None else f"Volume {round(state['volume'] * 100)} %"
+def status(state, monitor=None):
+    """The Headphones sidebar subtitle, e.g. "~70 % · Volume 63 %"; "Not connected" when the dongle's sink is gone."""
+    if state is None:
+        return "Not connected"
+    volume = f"Volume {round(state['volume'] * 100)} %"
+    if monitor is None or monitor.on is None:
+        return volume
+    return f"~{monitor.percent} % · {volume}" if monitor.on else f"Off · {volume}"
+
+
+def card(monitor):
+    """The Headphones status card → (title, battery line or None)."""
+    if monitor.on is None:  # before the first answer
+        return "PRO X Wireless", None
+    if not monitor.on:
+        return "PRO X Wireless — Off", None
+    return "PRO X Wireless — Connected", f"~{monitor.percent} % (est.)" + (", charging" if monitor.charging else "")
+
+
+SMOOTHING = 0.3  # each 10 s reading moves the voltage this far: a load spike barely shows, a real drop in ~a minute
+WARN_AT, REARM_ABOVE = 15, 30
+
+
+def warn(armed, percent, charging):
+    """The low-battery rule → (armed, warn now): once at or below WARN_AT %, then not again until above REARM_ABOVE %."""
+    if armed and percent <= WARN_AT and not charging:
+        return False, True
+    return armed or percent > REARM_ABOVE, False
+
+
+class HeadsetMonitor:
+    """The PRO X's on/off and battery, from the service's poll (every primary instance, window or not).
+
+    For subscribers (the Headphones page; the routing policy, #12): append a callable to `listeners`; it is called on
+    the main loop with "on", "off" or "battery" (level or charging changed) after the state below is updated:
+      on        True, False (no answer: off, or the dongle unplugged), or None before the first poll
+      percent   the smoothed estimate, 0..100, or None when off
+      charging  True while charging
+    `notify(percent)` is called once per discharge at <= WARN_AT %. `spawn(work, done)` runs work() off the main loop
+    and done(its result) back on it."""
+
+    def __init__(self, notify=lambda percent: None, spawn=None):
+        self.notify, self.spawn, self.listeners = notify, spawn, []
+        self.on, self.percent, self.charging, self.mv, self.armed, self.busy = None, None, False, None, True, False
+
+    def poll(self):
+        """A GLib timeout callback: ask the headset, unless the last ask hasn't answered yet."""
+        if not self.busy:
+            self.busy = True
+            self.spawn(hidpp.battery, self._done)
+        return True
+
+    def _done(self, reading):
+        self.busy = False
+        self.update(reading)
+
+    def update(self, reading):
+        """A battery reading, (mV, charging) or None for no answer → the new state and its events."""
+        events = []
+        if reading is None:
+            if self.on is not False:
+                self.on, self.percent, self.mv = False, None, None
+                events.append("off")
+        else:
+            mv, charging = reading
+            fresh = not self.on or charging != self.charging  # charging moves the voltage for real: no lag behind it
+            self.mv = mv if fresh else self.mv + SMOOTHING * (mv - self.mv)
+            percent = hidpp.estimate(round(self.mv))
+            if not self.on:
+                events.append("on")
+            if fresh or percent != self.percent:
+                events.append("battery")
+            self.on, self.percent, self.charging = True, percent, charging
+        for event in events:
+            for listener in list(self.listeners):
+                try:
+                    listener(event)
+                except Exception:  # one broken subscriber must not stop the others or the warning
+                    traceback.print_exc(file=sys.stderr)
+        if self.on:
+            self.armed, now = warn(self.armed, self.percent, self.charging)
+            if now:
+                self.notify(self.percent)
 
 
 def send(make, run=devices._run):

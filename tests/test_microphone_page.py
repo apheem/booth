@@ -291,28 +291,29 @@ class ScarlettGroup(unittest.TestCase):
 
 class WindowClose(unittest.TestCase):
     def test_closing_the_window_stops_the_microphone_pages_poll(self):
-        ns, win = types.SimpleNamespace, mock.Mock()
+        ns, win, booth = types.SimpleNamespace, mock.Mock(), mock.Mock()
         with mock.patch.object(ui_window, "super", lambda *a: ns(__init__=lambda **k: None), create=True), \
                 mock.patch.object(ui_window, "Adw"), mock.patch.object(ui_window, "Gtk"), \
                 mock.patch.object(ui_window, "CameraPage"), mock.patch.object(ui_window, "HeadphonesPage"), \
                 mock.patch.object(ui_window, "MicrophonePage") as mic:
-            ui_window.Window.__init__(win, None, {}, None, {})
+            ui_window.Window.__init__(win, booth, {}, None, {})
         for c in win.connect.call_args_list:
             if c.args[0] == "close-request":
                 c.args[1](win)
         mic.return_value.stop.assert_called_once_with()
 
     def test_closing_the_window_stops_the_headphones_pages_poll(self):
-        ns, win = types.SimpleNamespace, mock.Mock()
+        ns, win, booth = types.SimpleNamespace, mock.Mock(), mock.Mock()
         with mock.patch.object(ui_window, "super", lambda *a: ns(__init__=lambda **k: None), create=True), \
                 mock.patch.object(ui_window, "Adw"), mock.patch.object(ui_window, "Gtk"), \
                 mock.patch.object(ui_window, "CameraPage"), mock.patch.object(ui_window, "MicrophonePage"), \
                 mock.patch.object(ui_window, "HeadphonesPage") as hp:
-            ui_window.Window.__init__(win, None, {}, None, {})
+            ui_window.Window.__init__(win, booth, {}, None, {})
         for c in win.connect.call_args_list:
             if c.args[0] == "close-request":
                 c.args[1](win)
         hp.return_value.stop.assert_called_once_with()
+        self.assertIs(hp.call_args.args[2], booth.headset_monitor)  # the page follows the app's one battery poll
 
 
 class Worker(unittest.TestCase):
