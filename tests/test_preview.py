@@ -1,17 +1,36 @@
 """The Camera page's live preview, headless: the pipeline's elements, its state as the page is shown and left, the
 "in use" error, and one frame pulled into a texture with no window (an injected test source, never a camera)."""
+import gc
 import threading
 import time
 import unittest
+from unittest import mock
 
-from gi.repository import GLib
+from gi.repository import GLib, GObject
 
 from booth import preview
 from booth.preview import Gdk, Gst
 from tests.test_camera import XU, brio
 
 DEV = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_FAKESER1-video-index0"
-TEST_SOURCE = "videotestsrc is-live=true ! jpegenc"  # MJPEG like the BRIO's, so the rest of the pipeline is the real one
+TEST_SOURCE = "videotestsrc name=src is-live=true ! jpegenc"  # MJPEG like the BRIO's: the rest is the real pipeline
+
+
+def fake(_node):
+    return f"{TEST_SOURCE} ! {preview.TAIL}"
+
+
+# No test can reach a camera, even through a guard that regressed: v4l2src is gone from this process's registry.
+_v4l2 = Gst.Registry.get().find_feature("v4l2src", Gst.ElementFactory)
+if _v4l2 is not None:
+    Gst.Registry.get().remove_feature(_v4l2)
+
+
+def drain():
+    """Wait until the state-change worker has run every job queued so far."""
+    done = threading.Event()
+    preview.JOBS.put(done.set)
+    assert done.wait(5), "the worker is stuck"
 
 
 def until(check, seconds=5):
@@ -24,6 +43,7 @@ def until(check, seconds=5):
 
 
 def state(pipeline):
+    drain()  # its state change runs on the worker
     return pipeline.get_state(2 * Gst.SECOND)[1]
 
 
@@ -52,30 +72,34 @@ class Recorder:
 
 class Pipeline(unittest.TestCase):
     def test_streams_mjpeg_640x360_from_the_node_it_is_given(self):
-        p = preview.Preview(DEV, print, print).build()  # stays in NULL: the device is never opened
-        self.addCleanup(p.set_state, Gst.State.NULL)
-        elements = chain(p)
-        self.assertEqual([e.get_factory().get_name() for e in elements], ["v4l2src", "capsfilter", "jpegdec", "videoconvert", "capsfilter", "appsink"])
-        self.assertEqual(p.get_by_name("src").get_property("device"), DEV)
-        self.assertEqual(elements[1].get_property("caps").to_string(), "image/jpeg, width=(int)640, height=(int)360")
-        self.assertEqual(len(p.children), len(elements))  # nothing else in it: no tee, no filesink
+        self.assertEqual(preview.launch(DEV), f'v4l2src name=src device="{DEV}" ! {preview.TAIL}')
+        p = Gst.parse_launch(fake(DEV))  # the same tail behind a test source: the camera is never built
+        elements = chain(p)[2:]  # after videotestsrc ! jpegenc
+        self.assertEqual([e.get_factory().get_name() for e in elements], ["capsfilter", "jpegdec", "videoconvert", "capsfilter", "appsink"])
+        self.assertEqual(elements[0].get_property("caps").to_string(), "image/jpeg, width=(int)640, height=(int)360")
+        self.assertEqual(len(p.children), len(elements) + 2)  # nothing else in it: no tee, no filesink
 
     def test_the_appsink_keeps_one_buffer_and_drops_old_frames(self):
-        p = preview.Preview(DEV, print, print).build()
-        self.addCleanup(p.set_state, Gst.State.NULL)
-        sink = p.get_by_name("sink")
+        sink = Gst.parse_launch(fake(DEV)).get_by_name("sink")
         self.assertEqual((sink.get_property("max-buffers"), sink.get_property("drop")), (1, True))
 
     def test_no_camera_no_pipeline(self):
-        page = preview.Preview(None, print, print)
+        page = preview.Preview(None, print, print, launch=fake)
         page.start()
         self.assertIsNone(page.pipeline)
+
+    def test_tests_can_never_build_the_camera_source(self):
+        self.assertIsNone(Gst.ElementFactory.find("v4l2src"))
+        failures = []
+        preview.Preview(DEV, print, failures.append).start()  # the real launch(): no element, so nothing opens
+        self.assertEqual(failures, [preview.UNAVAILABLE])
 
 
 class Visibility(unittest.TestCase):
     def setUp(self):
         self.rec = Recorder()
-        self.preview = preview.Preview(DEV, self.rec.show, self.rec.failures.append, source=TEST_SOURCE)
+        self.preview = preview.Preview(DEV, self.rec.show, self.rec.failures.append, launch=fake)
+        self.addCleanup(drain)
         self.addCleanup(self.preview.stop)
 
     def test_one_frame_reaches_the_ui_as_a_texture_on_the_main_loop(self):
@@ -86,6 +110,27 @@ class Visibility(unittest.TestCase):
         self.assertEqual((texture.get_width(), texture.get_height()), (640, 360))
         self.assertIs(self.rec.threads[0], threading.main_thread())
 
+    def test_frames_keep_coming_after_the_first_is_shown(self):
+        self.preview.start()
+        self.assertTrue(until(lambda: len(self.rec.frames) >= 3), "the preview froze on its first frame")
+
+    def test_at_most_one_frame_waits_for_the_main_loop(self):
+        pulled, queued = [], []
+        on_sample = self.preview.on_sample
+        self.preview.on_sample = lambda sink: pulled.append(1) or on_sample(sink)
+        real_idle_add = GLib.idle_add
+        with mock.patch.object(preview.GLib, "idle_add",
+                               lambda f, *a: queued.append(f) if f == self.preview.deliver else real_idle_add(f, *a)):
+            self.preview.start()
+            self.assertTrue(until(lambda: len(pulled) >= 4), "no frames")  # the main loop never ran deliver()
+            self.assertEqual(len(queued), 1)
+
+    def test_a_second_start_keeps_the_one_pipeline(self):
+        self.preview.start()
+        first = self.preview.pipeline
+        self.preview.start()
+        self.assertIs(self.preview.pipeline, first)
+
     def test_shown_plays_and_left_releases_the_device(self):
         self.preview.start()
         playing = self.preview.pipeline
@@ -93,6 +138,27 @@ class Visibility(unittest.TestCase):
         self.preview.stop()
         self.assertIsNone(self.preview.pipeline)
         self.assertEqual(state(playing), Gst.State.NULL)
+
+    def test_left_removes_the_bus_watch(self):
+        self.preview.start()
+        p = self.preview.pipeline
+        self.preview.stop()
+        state(p)
+        p.get_bus().set_flushing(False)  # NULL flushed the bus: open it again, so only a watch could be missing
+        p.post_message(Gst.Message.new_error(p.get_by_name("sink"), error(Gst.ResourceError.BUSY), "debug"))
+        until(lambda: self.rec.failures, 0.3)
+        self.assertEqual(self.rec.failures, [])
+
+    def test_a_stopped_pipeline_is_freed(self):
+        freed = []
+        self.preview.start()
+        self.assertTrue(until(lambda: self.rec.frames), "no frame")  # the sample handler has run
+        self.preview.pipeline.weak_ref(lambda: freed.append(1))
+        self.preview.stop()
+        drain()
+        until(lambda: False, 0.1)  # any frame still queued for the main loop
+        gc.collect()
+        self.assertEqual(freed, [1])
 
     def test_a_frame_pulled_before_stop_is_never_shown(self):
         self.preview.start()
@@ -128,6 +194,119 @@ class Visibility(unittest.TestCase):
         p.post_message(Gst.Message.new_error(p.get_by_name("sink"), error(Gst.ResourceError.FAILED), "debug"))
         until(lambda: len(self.rec.failures) > 1, 0.3)
         self.assertEqual(self.rec.failures, [preview.IN_USE])
+
+
+class StateChanges(unittest.TestCase):
+    """set_state() runs on the one worker, in order: a stalled camera never blocks the main loop, and a stop wins."""
+
+    def setUp(self):
+        self.calls, self.busy, self.overlap, self.gate = [], [], [], threading.Event()
+        self.preview = preview.Preview(DEV, print, print, launch=fake)
+        self.preview.set_state = self.set_state
+        self.addCleanup(drain)
+        self.addCleanup(self.gate.set)
+
+    def set_state(self, p, state):  # a camera that takes its time to open
+        self.overlap.append(len(self.busy))
+        self.busy.append(1)
+        self.calls.append((state, threading.current_thread() is threading.main_thread()))
+        if state == Gst.State.PLAYING:
+            self.gate.wait(5)
+        self.busy.pop()
+        return Gst.StateChangeReturn.SUCCESS
+
+    def test_a_stop_while_starting_ends_in_null_after_the_start(self):
+        self.preview.start()
+        self.assertTrue(until(lambda: self.calls), "the start never ran")
+        self.preview.stop()  # returns at once: the start is still blocked on the camera
+        until(lambda: len(self.calls) > 1, 0.3)
+        self.assertEqual(self.calls, [(Gst.State.PLAYING, False)])  # the stop waits for it: never two at once
+        self.gate.set()
+        drain()
+        self.assertEqual(self.calls, [(Gst.State.PLAYING, False), (Gst.State.NULL, False)])
+        self.assertEqual(self.overlap, [0, 0])  # never two at once
+
+    def test_a_stop_before_the_start_ran_never_opens_the_camera(self):
+        hold = threading.Event()
+        preview.JOBS.put(lambda: hold.wait(5))  # the worker is busy elsewhere
+        self.preview.start()
+        self.preview.stop()
+        hold.set()
+        drain()
+        self.assertEqual(self.calls, [(Gst.State.NULL, False)])
+
+    def test_a_failed_start_says_why(self):
+        failures = []
+        self.preview.failed = failures.append
+        self.preview.set_state = lambda p, s: Gst.StateChangeReturn.FAILURE if s == Gst.State.PLAYING else None
+        self.preview.start()
+        self.assertTrue(until(lambda: failures), "a failed start said nothing")
+        self.assertEqual(failures, [preview.UNAVAILABLE])
+        self.assertIsNone(self.preview.pipeline)
+
+
+class Shown(unittest.TestCase):
+    """The page's preview runs only while it is shown and its window is not minimised: wired on a stub, no window."""
+
+    def test_wanted(self):
+        self.assertEqual([preview.wanted(m, s) for m in (True, False) for s in (False, True)], [True, False, False, False])
+
+    def page(self):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from booth.ui.camera import CameraPage
+
+        class Root(GObject.Object):  # the window: only its `suspended` matters here
+            suspended = GObject.Property(type=bool, default=False)
+
+            def is_suspended(self):
+                return self.suspended
+
+        page, shown = mock.Mock(live=False), []
+        page.get_root.return_value = Root()
+        page.preview_shown = shown.append
+        page.preview_update = lambda *a: CameraPage.preview_update(page, *a)
+        return CameraPage, page, shown
+
+    def test_minimised_stops_and_restored_starts_again(self):
+        CameraPage, page, shown = self.page()
+        root = page.get_root()
+        page.get_mapped.return_value = True
+        CameraPage.preview_mapped(page, page)
+        root.props.suspended = True  # minimised: GTK 4.14 keeps the page mapped
+        root.props.suspended = False
+        root.notify("suspended")  # nothing changed: the running preview is left alone
+        self.assertEqual(shown, [True, False, True])
+
+    def test_left_stops_and_stops_watching_the_window(self):
+        CameraPage, page, shown = self.page()
+        root = page.get_root()
+        page.get_mapped.return_value = True
+        CameraPage.preview_mapped(page, page)
+        page.get_mapped.return_value = False
+        CameraPage.preview_unmapped(page, page)
+        self.assertFalse(root.handler_is_connected(page.suspend_watch))  # no handler left on the window
+        root.props.suspended = True
+        root.props.suspended = False
+        self.assertEqual(shown, [True, False])
+
+    def test_a_replug_restarts_a_shown_preview_that_gave_up(self):
+        CameraPage = self.page()[0]
+        for live, pipeline, restarted in ((True, None, [True]), (False, None, []), (True, object(), [])):
+            page, shown = mock.Mock(live=live, ctrls={}), []
+            page.setter.reapply.return_value = []
+            page.preview.pipeline, page.preview_shown = pipeline, shown.append
+            CameraPage.reapply(page)
+            self.assertEqual(shown, restarted, (live, pipeline))
+
+    def test_unplugged_says_disconnected_not_that_the_controls_work(self):
+        self.assertEqual(preview.notice(preview.UNAVAILABLE, False)[0], preview.DISCONNECTED)
+        self.assertNotIn("still work", preview.notice(preview.UNAVAILABLE, False)[1])
+        self.assertEqual(preview.notice(preview.IN_USE, True), (preview.IN_USE, "The controls below still work"))
+        CameraPage, page = self.page()[0], mock.Mock(node=DEV)  # no such by-id link here: unplugged
+        CameraPage.preview_failed(page, preview.UNAVAILABLE)
+        page.problem.set_title.assert_called_once_with(preview.DISCONNECTED)
 
 
 class Problem(unittest.TestCase):

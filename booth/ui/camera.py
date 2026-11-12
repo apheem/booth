@@ -1,5 +1,6 @@
 """The Camera page: a live preview on top, then every standard BRIO control grouped Framing / Image / Focus, ranges from
 the camera itself. The rules (which rows are insensitive, what to send, the defaults, the order) live in booth.camera; this only wires."""
+import os
 import threading
 
 from gi.repository import Adw, GLib, Gtk
@@ -46,8 +47,7 @@ class CameraPage(Adw.PreferencesPage):
 
     def preview_group(self):
         self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.COVER)
-        self.problem = Adw.StatusPage(icon_name="camera-disabled-symbolic", css_classes=["compact"],
-                                      description="The controls below still work")
+        self.problem = Adw.StatusPage(icon_name="camera-disabled-symbolic", css_classes=["compact"])
         self.stack = Gtk.Stack()
         self.stack.add_child(self.picture)
         self.stack.add_child(self.problem)
@@ -58,11 +58,27 @@ class CameraPage(Adw.PreferencesPage):
         group = Adw.PreferencesGroup()
         group.add(Gtk.AspectFrame(ratio=16 / 9, obey_child=False, child=box))
         self.preview = preview.Preview(self.node, self.picture.set_paintable, self.preview_failed)
-        # mapped = this page is the one shown and the window is on screen: leaving it, hiding or closing the window
-        # unmaps it and releases the camera. A background Booth with no window never builds a page.
-        self.connect("map", lambda _p: self.preview_shown(True))
-        self.connect("unmap", lambda _p: self.preview_shown(False))
+        # mapped = this page is the one shown in a window on screen; leaving it, hiding or closing the window unmaps it.
+        # A minimised window stays mapped, so its `suspended` is watched too. A background Booth never builds a page.
+        self.live, self.root = False, None
+        self.connect("map", self.preview_mapped)
+        self.connect("unmap", self.preview_unmapped)
         return group
+
+    def preview_mapped(self, _page):
+        self.root = self.get_root()
+        self.suspend_watch = self.root.connect("notify::suspended", self.preview_update)
+        self.preview_update()
+
+    def preview_unmapped(self, _page):
+        self.root.disconnect(self.suspend_watch)
+        self.preview_update()
+
+    def preview_update(self, *_):
+        on = preview.wanted(self.get_mapped(), self.root.is_suspended())
+        if on != self.live:
+            self.live = on
+            self.preview_shown(on)
 
     def preview_shown(self, on):
         self.picture.set_paintable(None)  # no stale frame when it comes back
@@ -73,7 +89,9 @@ class CameraPage(Adw.PreferencesPage):
             self.preview.stop()
 
     def preview_failed(self, text):
-        self.problem.set_title(text)
+        title, description = preview.notice(text, os.path.exists(self.node))  # the by-id link goes when it's unplugged
+        self.problem.set_title(title)
+        self.problem.set_description(description)
         self.stack.set_visible_child(self.problem)
 
     def add_row(self, add, name):
@@ -145,6 +163,8 @@ class CameraPage(Adw.PreferencesPage):
         self.values.update(writes)  # a refused one goes back to the camera's value, as for any write
         self.show(writes)
         self.refresh()
+        if self.live and self.preview.pipeline is None:  # the camera is back while the page is shown: retry
+            self.preview_shown(True)
 
     def show(self, names):
         """Move the widgets of `names` to self.values without sending anything."""

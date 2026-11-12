@@ -2,6 +2,9 @@
 appsink (one buffer, old frames dropped) → a Gdk.MemoryTexture handed to the page on the main loop. No widgets here, and
 no frame ever goes anywhere but memory. The page starts it while it is on screen and stops it otherwise, so the camera
 is held only while someone is looking."""
+import queue
+import threading
+
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -11,11 +14,38 @@ from gi.repository import Gdk, GLib, Gst  # noqa: E402
 from booth import camera  # noqa: E402
 
 Gst.init(None)
-SOURCE = "v4l2src name=src"  # its device is set from the node discovered by model: never a fixed /dev/videoN
 TAIL = ("image/jpeg,width=640,height=360 ! jpegdec ! videoconvert ! video/x-raw,format=RGBx"
         " ! appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true")
 IN_USE = "Camera in use by another app"
 UNAVAILABLE = "Preview unavailable"
+DISCONNECTED = "Camera disconnected"
+JOBS = queue.Queue()  # every pipeline's state changes, in order, on one worker: never two at once, never on the main loop
+
+
+def work():
+    while True:
+        JOBS.get()()  # the job (and the pipeline it holds) is released as soon as it returns
+
+
+threading.Thread(target=work, daemon=True, name="preview-state").start()
+
+
+def launch(node):
+    """The camera's pipeline: v4l2src on the color node discovered by model (never a fixed /dev/videoN)."""
+    return f'v4l2src name=src device="{node}" ! {TAIL}'
+
+
+def wanted(mapped, suspended):
+    """Should the preview run. mapped: its page is the visible one in a shown window; suspended: that window is
+    minimised (GTK 4.14 keeps a minimised window's widgets mapped, so mapped alone would keep the camera on)."""
+    return mapped and not suspended
+
+
+def notice(text, plugged):
+    """The problem page's title and description. Unplugged, the controls don't work either: say so."""
+    if not plugged:
+        return DISCONNECTED, "Plug it back in: the preview comes back by itself"
+    return text, "The controls below still work"
 
 
 def problem(err):
@@ -45,44 +75,54 @@ def texture(sample):
 
 class Preview:
     """start() / stop() from the main loop. show(texture) and failed(text) are called on the main loop only.
-    `source` replaces the camera (tests inject an MJPEG test source)."""
+    `launch(node)` gives the pipeline's description (tests inject a test source: never a camera)."""
 
-    def __init__(self, node, show, failed, source=None):
-        self.node, self.show, self.failed, self.source = node, show, failed, source
+    def __init__(self, node, show, failed, launch=launch):
+        self.node, self.show, self.failed, self.launch = node, show, failed, launch
         self.pipeline, self.pending = None, False
 
-    def build(self):
-        p = Gst.parse_launch(f"{self.source or SOURCE} ! {TAIL}")
-        if self.source is None:
-            p.get_by_name("src").set_property("device", self.node)
-        return p
-
     def start(self):
-        if self.pipeline is not None or (self.node is None and self.source is None):
+        if self.pipeline is not None or self.node is None:
             return
         try:
-            p = self.build()
+            p = Gst.parse_launch(self.launch(self.node))
         except GLib.Error:  # a GStreamer plugin missing
             self.failed(UNAVAILABLE)
             return
-        p.get_by_name("sink").connect("new-sample", self.on_sample, p)
+        p.get_by_name("sink").connect("new-sample", self.on_sample)  # no `p` as user data: that cycle never dies
         bus = p.get_bus()
-        bus.add_signal_watch()  # errors arrive on the main loop, even one posted while set_state() runs
+        bus.add_signal_watch()  # errors arrive on the main loop, even one posted while the worker changes state
         bus.connect("message::error", self.on_error)
         self.pipeline = p
-        p.set_state(Gst.State.PLAYING)
+        JOBS.put(lambda: self.change(p, Gst.State.PLAYING))
 
     def stop(self):
         p, self.pipeline = self.pipeline, None
         if p is not None:
-            p.get_bus().remove_signal_watch()  # else each page visit leaves a watch on the main loop
-            p.set_state(Gst.State.NULL)  # closes the device, and flushes the bus: v4l2src's follow-up error is dropped
+            p.get_bus().remove_signal_watch()  # else each page visit leaves a watch; v4l2src's follow-up error is dropped
+            JOBS.put(lambda: self.change(p, Gst.State.NULL))  # closes the device, after any start still running
 
-    def on_sample(self, sink, pipeline):  # the streaming thread: no widgets, no texture, only a hand-off
+    def change(self, p, state):  # the worker: opening or closing a stalled or unplugged camera can block for seconds
+        if state == Gst.State.PLAYING and p is not self.pipeline:
+            return  # stopped before its start ran: the device is never opened
+        if self.set_state(p, state) == Gst.StateChangeReturn.FAILURE and state == Gst.State.PLAYING:
+            GLib.idle_add(self.start_failed, p)
+
+    def set_state(self, p, state):
+        return p.set_state(state)
+
+    def start_failed(self, p):  # the main loop: say why, if the bus watch hasn't already
+        if p is self.pipeline:
+            msg = p.get_bus().pop_filtered(Gst.MessageType.ERROR)
+            self.stop()
+            self.failed(problem(msg.parse_error()[0]) if msg else UNAVAILABLE)
+        return GLib.SOURCE_REMOVE
+
+    def on_sample(self, sink):  # the streaming thread: no widgets, no texture, only a hand-off
         sample = sink.emit("pull-sample")
         if sample is not None and not self.pending:  # one frame queued at most: a busy main loop skips frames
             self.pending = True
-            GLib.idle_add(self.deliver, pipeline, sample)
+            GLib.idle_add(self.deliver, sink.get_parent(), sample)
         return Gst.FlowReturn.OK
 
     def deliver(self, pipeline, sample):
