@@ -14,7 +14,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from booth import camera, devices, service, store  # noqa: E402
+from booth import camera, devices, headset, service, store  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
 APP_ID = "io.github.apheem.Booth"
@@ -57,6 +57,7 @@ class Application(Adw.Application):
         super().__init__(application_id=APP_ID)
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
+        self.snd_monitor, self.dongle = None, None
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
         self.run_in_background = Gio.SimpleAction.new_stateful("run-in-background", None, GLib.Variant.new_boolean(False))
@@ -94,6 +95,13 @@ class Application(Adw.Application):
         self.replug = service.Debounce(REPLUG_MS, self.restore_saved, GLib.timeout_add, GLib.source_remove)
         self.monitor = Gio.File.new_for_path(devices.BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
         self.monitor.connect("changed", self.on_by_id)
+        # the PRO X dongle's hardware volume goes to full now and whenever it appears; the debounce also lets udev's
+        # own mixer restore (alsactl, on card add) finish first
+        self.dongle = service.Debounce(REPLUG_MS, self.fix_headset, GLib.timeout_add, GLib.source_remove)
+        self.snd_monitor = Gio.File.new_for_path(devices.SND_BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES,
+                                                                                       None)
+        self.snd_monitor.connect("changed", self.on_snd_by_id)
+        self.fix_headset()
         if self.background:
             self.hold()
             self.held = True
@@ -104,6 +112,14 @@ class Application(Adw.Application):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file
         if devices.replugged(entry.get_basename(), event.value_nick):
             self.replug.poke()
+
+    def on_snd_by_id(self, _monitor, file, other, event):
+        entry = other if event == Gio.FileMonitorEvent.RENAMED else file  # as in on_by_id
+        if devices.dongle_appeared(entry.get_basename(), event.value_nick):
+            self.dongle.poke()
+
+    def fix_headset(self):
+        threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
 
     def restore_saved(self):
         # one writer: the page queues it behind its own writes, even a closed one's whose last write isn't saved yet
