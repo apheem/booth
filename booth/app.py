@@ -40,14 +40,14 @@ def restore_alone(app, closed):
         if page := camera_page(app.window) or (app.closed_page if app.closed_page is not closed else None):
             GLib.idle_add(page.reapply)
             return
-        restore_camera(store.load())
+        restore_camera(app.settings)
 
 
 def restore_camera(settings):
     """Re-apply the saved camera controls to the BRIO, if it is plugged in. Returns its node or None."""
     with RESTORING:
         dev = devices.discover()["camera"]
-        for cmd in camera.restore(dev, settings["camera"]):
+        for cmd in camera.restore(dev, dict(settings["camera"])):  # a copy: a page's save may change it meanwhile
             print(f"Booth: the camera refused {cmd[-1]}", file=sys.stderr)
     return dev
 
@@ -55,7 +55,7 @@ def restore_camera(settings):
 class Application(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
-        self.window, self.starting, self.closed_page = None, False, None
+        self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
@@ -77,7 +77,8 @@ class Application(Adw.Application):
 
     def do_activate(self):
         if self.monitor is None:  # the primary instance's first activate
-            self.watch()
+            self.settings = store.load()  # once: every window, page, Setter and restore shares this dict, so a save
+            self.watch()  # never drops another writer's value
             if self.background:
                 return
         if self.window is not None:
@@ -85,8 +86,7 @@ class Application(Adw.Application):
         elif not self.starting:  # the camera can block for seconds per query: restore and read it off the main loop
             self.starting = True
             self.hold()  # no window yet: keeps the app alive until show_window()
-            settings = store.load()
-            threading.Thread(target=lambda: self.start(settings), daemon=True).start()
+            threading.Thread(target=lambda: self.start(self.settings), daemon=True).start()
 
     def watch(self):
         """Restore the camera on every replug. The background instance is held, so it lives with no window, and restores
@@ -100,7 +100,9 @@ class Application(Adw.Application):
             self.restore_saved()
 
     def on_by_id(self, _monitor, file, other, event):
-        if devices.replugged((other or file).get_basename(), event.value_nick):
+        # the entry now in by-id: RENAMED's new name is `other`; MOVED_IN's `other` is its old path, outside the folder
+        entry = other if event == Gio.FileMonitorEvent.RENAMED else file
+        if devices.replugged(entry.get_basename(), event.value_nick):
             self.replug.poke()
 
     def restore_saved(self):

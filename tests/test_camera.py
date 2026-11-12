@@ -505,6 +505,25 @@ class SetterTest(unittest.TestCase):
         self.assertEqual(self.settings["camera"]["zoom_absolute"], 350)
         self.assertEqual(self.saved[-1]["zoom_absolute"], 350)
 
+    def test_a_replug_restore_takes_the_newest_queued_value_over_an_older_one_behind_another_control(self):
+        self.settings["camera"]["zoom_absolute"] = 150  # saved before the replug
+        self.setter.set([("pan_absolute", 0)])  # in flight
+        for batch in ([("zoom_absolute", 300)], [("brightness", 5)], [("zoom_absolute", 350)]):  # queued, oldest first
+            self.setter.set(batch)
+        self.assertEqual(self.setter.reapply(brio()), [("zoom_absolute", 350)])
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds[-1], zoom(350))
+        self.assertEqual(self.settings["camera"]["zoom_absolute"], 350)
+
+    def test_a_write_refused_on_replug_still_lets_every_later_write_go_out(self):
+        self.settings["camera"].update({"fov": 1, "zoom_absolute": 250, "brightness": 140})
+        self.assertEqual(self.setter.reapply(brio()), [("fov", 1), ("zoom_absolute", 250), ("brightness", 140)])
+        self.assertEqual(self.spawn.finish(False), ["fov"])  # the BRIO refused the FoV after the replug
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [camera.set_cmd(DEV, "fov", 1), zoom(250), cmd("brightness", 140)])
+
     def test_a_replug_restore_writes_the_saved_values_never_what_the_camera_reads_back(self):
         # The page read the camera between the replug and the restore: it took the power-on defaults (zoom 100, AF on).
         self.settings["camera"].update({"zoom_absolute": 250, AF: 0, FOCUS: 40})

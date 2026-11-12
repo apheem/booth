@@ -3,8 +3,8 @@
 One window for a desk setup: a Logitech BRIO camera, a Focusrite Scarlett microphone interface and a Logitech PRO X
 headset. GNOME / libadwaita, Python, nothing to compile. GPL-3.0.
 
-This first version has the app shell and a **Zoom** slider for the BRIO; the Microphone and Headphones pages are
-placeholders.
+The **Camera** page has every BRIO control (framing, image, focus, field of view and LED), resettable and saved; a
+background service re-applies them at login and on replug. The Microphone and Headphones pages are placeholders.
 
 ## Requirements
 
