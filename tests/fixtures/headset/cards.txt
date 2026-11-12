@@ -1,0 +1,14 @@
+ 0 [NVidia         ]: HDA-Intel - HDA NVidia
+                      HDA NVidia at 0xde080000 irq 192
+ 1 [Headset        ]: USB-Audio - PRO X Wireless Gaming Headset
+                      Logitech PRO X Wireless Gaming Headset at usb-0000:13:00.0-5, full speed
+ 2 [Generic_1      ]: HDA-Intel - HD-Audio Generic
+                      HD-Audio Generic at 0xdef88000 irq 194
+ 3 [Generic        ]: HDA-Intel - HD-Audio Generic
+                      HD-Audio Generic at 0xdef80000 irq 195
+ 4 [BRIO           ]: USB-Audio - Logitech BRIO
+                      Logitech BRIO at usb-0000:13:00.0-2, super speed
+ 5 [Audio          ]: USB-Audio - USB Audio
+                      Generic USB Audio at usb-0000:11:00.0-12, high speed
+ 6 [Gen            ]: USB-Audio - Scarlett Solo 4th Gen
+                      Focusrite Scarlett Solo 4th Gen at usb-0000:13:00.0-6, high speed

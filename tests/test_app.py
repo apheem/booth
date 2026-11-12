@@ -280,13 +280,18 @@ class BackgroundLaunch(unittest.TestCase):
 
     def watch(self, background):
         stub = mock.Mock(held=False, background=background)
-        with mock.patch.object(app.Gio.File, "new_for_path") as new_for_path:
+        folders = {path: mock.Mock(name=path) for path in ("/dev/v4l/by-id", "/dev/snd/by-id")}
+        with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get):
             app.Application.watch(stub)
-        new_for_path.assert_called_once_with("/dev/v4l/by-id")
-        monitor = new_for_path.return_value.monitor_directory.return_value
+        monitor = folders["/dev/v4l/by-id"].monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
         self.assertIsInstance(stub.replug, service.Debounce)
+        dongle = folders["/dev/snd/by-id"].monitor_directory.return_value  # the PRO X dongle's ALSA control link
+        self.assertIs(stub.snd_monitor, dongle)
+        dongle.connect.assert_called_once_with("changed", stub.on_snd_by_id)
+        self.assertIsInstance(stub.dongle, service.Debounce)
+        stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
         return stub
 
     def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
@@ -470,6 +475,39 @@ class Replug(unittest.TestCase):
         self.event(stub, DEV.replace("index0", "index2"), None, Gio.FileMonitorEvent.CREATED)
         self.event(stub, DEV, None, Gio.FileMonitorEvent.DELETED)
         stub.replug.poke.assert_not_called()
+
+
+class DongleReplug(unittest.TestCase):
+    """The PRO X dongle's hardware volume is set to full whenever it appears in /dev/snd/by-id."""
+    DONGLE = "/dev/snd/by-id/usb-Logitech_PRO_X_Wireless_Gaming_Headset-00"
+
+    def event(self, stub, file, other, event):
+        app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(file), other and Gio.File.new_for_path(other), event)
+
+    def test_a_burst_of_dongle_events_fixes_once_after_the_last(self):
+        clock, fixes, stub = Clock(), [], mock.Mock()
+        stub.dongle = service.Debounce(app.REPLUG_MS, lambda: fixes.append(clock.now), clock.add, clock.remove)
+        for _ in range(5):
+            self.event(stub, self.DONGLE, None, Gio.FileMonitorEvent.CREATED)
+            self.event(stub, "/dev/snd/by-id/.#tmp", self.DONGLE, Gio.FileMonitorEvent.RENAMED)
+            self.event(stub, self.DONGLE, "/dev/snd/.tmp", Gio.FileMonitorEvent.MOVED_IN)
+            self.event(stub, self.DONGLE, None, Gio.FileMonitorEvent.DELETED)
+            clock.advance(100)
+        clock.advance(10_000)
+        self.assertEqual(fixes, [400 + app.REPLUG_MS])
+
+    def test_another_cards_link_or_an_unplug_fixes_nothing(self):
+        stub = mock.Mock()
+        self.event(stub, "/dev/snd/by-id/usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00", None,
+                   Gio.FileMonitorEvent.CREATED)
+        self.event(stub, self.DONGLE, None, Gio.FileMonitorEvent.DELETED)
+        stub.dongle.poke.assert_not_called()
+
+    def test_the_fix_runs_on_a_worker(self):
+        with mock.patch.object(app.threading, "Thread", Inline), \
+                mock.patch.object(app.headset, "fix_hw_volume") as fix:
+            app.Application.fix_headset(mock.Mock())
+        fix.assert_called_once_with()
 
 
 class RunInBackgroundSwitch(unittest.TestCase):
