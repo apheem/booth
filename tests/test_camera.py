@@ -306,11 +306,14 @@ class SetterTest(unittest.TestCase):
             raise OSError(28, "No space left on device")
 
         self.setter.save = save
-        self.setter.set([("zoom_absolute", 250)])
+        self.setter.set([(AF, 0), (FOCUS, 40)])
         with self.assertRaises(OSError):  # surfaced to the page, which says so
             self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [cmd(AF, 0), cmd(FOCUS, 40)])  # the camera took the auto-off: go on
+        with self.assertRaises(OSError):
+            self.spawn.finish(True)
         self.setter.set([("zoom_absolute", 300)])
-        self.assertEqual(self.spawn.cmds, [zoom(250), zoom(300)])
+        self.assertEqual(self.spawn.cmds[-1], zoom(300))
 
     def test_the_manual_value_waits_for_its_auto_off(self):
         self.setter.set([(AF, 0), (FOCUS, 40)])
@@ -338,9 +341,9 @@ class SetterTest(unittest.TestCase):
 
     def test_batches_for_other_controls_do_not_collapse(self):
         self.setter.set([("zoom_absolute", 200)])
+        self.setter.set([])  # nothing to send (a held manual value) must not stall the queue
         self.setter.set([("pan_absolute", 0)])
         self.setter.set([("tilt_absolute", 0)])
-        self.setter.set([])
         for _ in range(3):
             self.spawn.finish(True)
         self.assertEqual(self.spawn.cmds, [zoom(200), cmd("pan_absolute", 0), cmd("tilt_absolute", 0)])
