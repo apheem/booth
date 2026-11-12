@@ -66,9 +66,24 @@ RestartSec=5
 WantedBy=graphical-session.target
 EOF
 mv "$units/booth.service.new" "$units/booth.service"
+# A running Booth owns its bus name, so the restarted unit's --background would find it and exit 0 with the old code
+# still running: ask it to quit (app.quit; "not running" errors ignored) and wait up to 5 s for the name to go.
+gdbus call --session --dest io.github.apheem.Booth --object-path /io/github/apheem/Booth \
+  --method org.gtk.Actions.Activate quit '[]' '{}' >/dev/null 2>&1 || true
+owned() {
+  gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner io.github.apheem.Booth 2>/dev/null | grep -q true
+}
+stale= n=0
+while owned; do
+  [ $n -lt 10 ] || { stale=1; break; }
+  sleep 0.5
+  n=$((n + 1))
+done
 # restart, not start: a re-install must run the new copy.
 if ! { systemctl --user daemon-reload && systemctl --user enable booth.service && systemctl --user restart booth.service; }
 then
   echo "install.sh: couldn't start booth.service; from your desktop session run: systemctl --user enable --now booth.service" >&2
 fi
 echo "Booth installed to $dest/booth; run it with: $bin/booth"
+[ -z "$stale" ] || echo "Booth is still running the old version — close it (or log out and in) to finish." >&2

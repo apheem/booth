@@ -16,6 +16,22 @@ def tree(root):
     return sorted(str(p.relative_to(root)) for p in root.rglob("*") if "__pycache__" not in p.parts)
 
 
+STUB = """#!/bin/sh
+echo "${0##*/} $*" >> "$STUB_LOG"
+case ${0##*/} in systemctl) exit "${SYSTEMCTL_RC:-0}" ;; gdbus) [ "${GDBUS_RC:-0}" = 0 ] || exit "$GDBUS_RC" ;; esac
+case $* in *NameHasOwner*)
+  if [ "$(grep -c NameHasOwner "$STUB_LOG")" -le "${OWNED_POLLS:-0}" ]; then echo "(true,)"; else echo "(false,)"; fi ;;
+esac
+"""
+QUIT = (f"gdbus call --session --dest {APP_ID} --object-path /io/github/apheem/Booth"
+        " --method org.gtk.Actions.Activate quit [] {}")
+OWNER = ("gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus"
+         f" --method org.freedesktop.DBus.NameHasOwner {APP_ID}")
+UNIT_CALLS = ["systemctl --user daemon-reload", "systemctl --user enable booth.service",
+              "systemctl --user restart booth.service"]
+STALE = "Booth is still running the old version"
+
+
 class Install(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -24,13 +40,15 @@ class Install(unittest.TestCase):
         self.home.mkdir()
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
         self.env["HOME"] = str(self.home)
-        # A stub systemctl first on PATH records its argv: an install test never reaches the real user manager.
+        # Stub systemctl, gdbus and sleep first on PATH record their argv in one log: an install test never reaches the
+        # real user manager or session bus. Booth's bus name reads as owned for the first OWNED_POLLS queries.
         stubs = Path(tmp.name) / "stubs"
         stubs.mkdir()
-        self.calls = Path(tmp.name) / "systemctl.log"
-        (stubs / "systemctl").write_text('#!/bin/sh\necho "$*" >> "$SYSTEMCTL_LOG"\nexit "${SYSTEMCTL_RC:-0}"\n')
-        (stubs / "systemctl").chmod(0o755)
-        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", SYSTEMCTL_LOG=str(self.calls))
+        self.calls = Path(tmp.name) / "stubs.log"
+        for name in ("systemctl", "gdbus", "sleep"):
+            (stubs / name).write_text(STUB)
+            (stubs / name).chmod(0o755)
+        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", STUB_LOG=str(self.calls))
         self.app = self.home / ".local/share/booth/booth"
         self.launcher = self.home / ".local/bin/booth"
         self.desktop = self.home / f".local/share/applications/{APP_ID}.desktop"
@@ -79,9 +97,9 @@ class Install(unittest.TestCase):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         # restart, not start: a re-install must run the new copy (start leaves a running old one as it is).
-        self.assertEqual(self.calls.read_text().splitlines(),
-                         ["--user daemon-reload", "--user enable booth.service", "--user restart booth.service"])
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + UNIT_CALLS)
         self.assertNotIn("couldn't start", r.stderr)
+        self.assertNotIn(STALE, r.stdout + r.stderr)
         unit = self.unit.read_text().splitlines()
         self.assertIn(f'ExecStart=/bin/sh "{self.launcher}" --background', unit)
         self.assertIn("Restart=on-failure", unit)
@@ -90,6 +108,32 @@ class Install(unittest.TestCase):
         self.assertIn("WantedBy=graphical-session.target", unit)  # GTK needs the session's display
         self.assertIn("After=graphical-session.target", unit)
         self.assertNotIn(str(REPO), self.unit.read_text())
+
+    def test_a_running_booth_is_asked_to_quit_and_waited_for_before_the_restart(self):
+        # Else the restarted unit's --background finds it, exits 0 and the old code keeps running.
+        self.env["OWNED_POLLS"] = "3"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(),
+                         [QUIT] + [OWNER, "sleep 0.5"] * 3 + [OWNER] + UNIT_CALLS)
+        self.assertNotIn(STALE, r.stdout + r.stderr)
+
+    def test_a_booth_that_wont_quit_is_waited_for_at_most_5_s_then_named(self):
+        self.env["OWNED_POLLS"] = "99"  # an old copy with no app.quit
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls.count("sleep 0.5"), 10)
+        self.assertEqual(len(calls), 1 + 11 + 10 + 3)
+        self.assertEqual(calls[-3:], UNIT_CALLS)
+        self.assertIn(STALE + " — close it (or log out and in) to finish.", r.stderr)
+
+    def test_with_no_session_bus_the_restart_still_runs(self):
+        self.env["GDBUS_RC"] = "1"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + UNIT_CALLS)
+        self.assertNotIn(STALE, r.stdout + r.stderr)
 
     def test_the_unit_follows_xdg_config_home_unless_relative(self):
         self.env["XDG_CONFIG_HOME"] = str(self.home / "cfg")

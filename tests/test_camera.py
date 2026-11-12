@@ -505,6 +505,13 @@ class PageQuietTest(unittest.TestCase):
         CameraPage.changed(page, "zoom_absolute", 250)  # the user moving it still sends
         self.assertEqual(sent, [[("zoom_absolute", 250)]])
 
+    def test_a_replug_reapplies_the_values_the_page_shows(self):
+        from booth.ui.camera import CameraPage
+
+        page = mock.Mock(values={"zoom_absolute": 300}, ctrls=brio())
+        CameraPage.reapply(page)
+        page.setter.reapply.assert_called_once_with(page.ctrls, page.values)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ from booth.ui.window import Window  # noqa: E402
 
 APP_ID = "io.github.apheem.Booth"
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
-RESTORING = threading.Lock()  # the startup, replug and window-open restores never interleave their writes
+RESTORING = threading.RLock()  # the startup, replug and window-open restores never interleave their writes
 
 
 def restore_camera(settings):
@@ -41,6 +41,9 @@ class Application(Adw.Application):
         self.run_in_background = Gio.SimpleAction.new_stateful("run-in-background", None, GLib.Variant.new_boolean(False))
         self.run_in_background.connect("change-state", self.on_background)
         self.add_action(self.run_in_background)
+        quit_ = Gio.SimpleAction.new("quit", None)  # install.sh's way to stop a running copy: quit() ignores a hold
+        quit_.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_)
 
     def do_handle_local_options(self, options):
         if options.contains("background"):
@@ -89,9 +92,10 @@ class Application(Adw.Application):
     def start(self, settings):
         node, ctrls, enabled = None, {}, False
         try:
-            # a held instance keeps the camera restored itself; another restore here could race a replug's
-            node = devices.discover()["camera"] if self.held else restore_camera(settings)
-            ctrls = camera.read_ctrls(node) if node else {}  # the Camera page's model, read after the restore
+            with RESTORING:  # the page's first read comes after any restore already running (login's, a replug's)
+                # a held instance keeps the camera restored itself; another restore here could race a replug's
+                node = devices.discover()["camera"] if self.held else restore_camera(settings)
+                ctrls = camera.read_ctrls(node) if node else {}  # the Camera page's model, read after the restore
             enabled = service.run(service.IS_ENABLED)
         finally:
             GLib.idle_add(self.show_window, settings, node, ctrls, enabled)

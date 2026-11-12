@@ -117,6 +117,24 @@ class LaunchOffTheMainLoop(unittest.TestCase):
         stub.watch.assert_not_called()
         self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, DEV, {"zoom_absolute": {}}, False))])
 
+    def test_the_first_read_waits_for_a_restore_already_running(self):
+        # At login the background instance's restore may still be writing when the window opens: read after it.
+        for held in (True, False):
+            stub, idle = mock.Mock(held=held), []
+            with mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append(a)), \
+                    mock.patch.object(app.devices, "discover", return_value={"camera": DEV}) as discover, \
+                    mock.patch.object(camera, "restore", return_value=[]), \
+                    mock.patch.object(app.service, "run", return_value=False), \
+                    mock.patch.object(camera, "read_ctrls", return_value={"zoom_absolute": {}}):
+                with app.RESTORING:  # the other restore
+                    worker = threading.Thread(target=app.Application.start, args=(stub, {"camera": {}}), daemon=True)
+                    worker.start()
+                    worker.join(0.3)
+                    discover.assert_not_called()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), held)
+            self.assertEqual(idle, [({"camera": {}}, DEV, {"zoom_absolute": {}}, False)])
+
     def test_a_crash_in_the_worker_still_opens_the_window(self):
         threads, idle = [], []
         stub = mock.Mock(window=None, starting=False, background=False, held=False)
@@ -363,6 +381,15 @@ class RunInBackgroundSwitch(unittest.TestCase):
         stub.action.set_state.assert_not_called()
         stub.release.assert_not_called()
         self.assertIn("booth.service", err)
+
+
+class QuitAction(unittest.TestCase):
+    def test_app_quit_quits_even_a_held_app(self):  # install.sh asks a running Booth to quit before it restarts the unit
+        booth = app.Application()
+        booth.hold()
+        with mock.patch.object(booth, "quit") as quit_:
+            booth.lookup_action("quit").activate(None)
+        quit_.assert_called_once_with()  # GApplication.quit ignores the hold count; release() would not
 
 
 class MenuWiring(unittest.TestCase):
