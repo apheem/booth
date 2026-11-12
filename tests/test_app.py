@@ -56,6 +56,7 @@ class RestoreAtLaunch(unittest.TestCase):
         log, first_in, go = [], threading.Event(), threading.Event()
 
         def restore(dev, saved):
+            saved = next(iter(saved))
             log.append(("in", saved))
             if saved == "a":
                 first_in.set()
@@ -65,10 +66,10 @@ class RestoreAtLaunch(unittest.TestCase):
 
         with mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
                 mock.patch.object(camera, "restore", restore):
-            a = threading.Thread(target=app.restore_camera, args=({"camera": "a"},))
+            a = threading.Thread(target=app.restore_camera, args=({"camera": {"a": 1}},))
             a.start()
             self.assertTrue(first_in.wait(5))
-            b = threading.Thread(target=app.restore_camera, args=({"camera": "b"},))
+            b = threading.Thread(target=app.restore_camera, args=({"camera": {"b": 1}},))
             b.start()
             b.join(0.3)
             self.assertEqual(log, [("in", "a")])
@@ -81,11 +82,10 @@ class RestoreAtLaunch(unittest.TestCase):
 class LaunchOffTheMainLoop(unittest.TestCase):
     def test_restore_and_the_first_read_run_on_a_worker_then_the_window_opens(self):
         threads, idle = [], []
-        stub = mock.Mock(window=None, starting=False, background=False, held=False)
+        stub = mock.Mock(window=None, starting=False, background=False, held=False, settings={"version": 1, "camera": {}})
         stub.start = lambda settings: app.Application.start(stub, settings)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
-                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
                 mock.patch.object(app.service, "run", return_value=True) as is_enabled, \
                 mock.patch.object(app, "restore_camera", return_value=DEV) as restore, \
                 mock.patch.object(camera, "read_ctrls", return_value={"zoom_absolute": {}}) as read_ctrls:
@@ -104,11 +104,10 @@ class LaunchOffTheMainLoop(unittest.TestCase):
 
     def test_the_background_instance_opens_its_window_without_restoring_again(self):
         threads, idle = [], []
-        stub = mock.Mock(window=None, starting=False, background=True, held=True, monitor=mock.Mock())
+        stub = mock.Mock(window=None, starting=False, background=True, held=True, monitor=mock.Mock(), settings={"version": 1, "camera": {}})
         stub.start = lambda settings: app.Application.start(stub, settings)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
-                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
                 mock.patch.object(app.service, "run", return_value=False), \
                 mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
                 mock.patch.object(app, "restore_camera") as restore, \
@@ -139,11 +138,10 @@ class LaunchOffTheMainLoop(unittest.TestCase):
 
     def test_a_crash_in_the_worker_still_opens_the_window(self):
         threads, idle = [], []
-        stub = mock.Mock(window=None, starting=False, background=False, held=False)
+        stub = mock.Mock(window=None, starting=False, background=False, held=False, settings={"version": 1, "camera": {}})
         stub.start = lambda settings: app.Application.start(stub, settings)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
-                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
                 mock.patch.object(app, "restore_camera", side_effect=RuntimeError("boom")):
             app.Application.do_activate(stub)
             self.assertRaises(RuntimeError, threads[0])
@@ -158,6 +156,42 @@ class LaunchOffTheMainLoop(unittest.TestCase):
         window.assert_not_called()
         stub.hold.assert_not_called()
         self.assertEqual(threads, [])
+
+    def test_a_reopened_window_never_drops_a_value_the_closed_one_saved_after(self):
+        # A held Booth: window 1 closes with zoom 300 on the camera (saved later, on the main loop), the window opens
+        # again, and the user changes brightness. The last save must keep zoom 300.
+        from tests.test_camera import FakeSpawn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        spawn = FakeSpawn()
+        stub = mock.Mock(window=None, starting=False, background=False, held=True, monitor=None, closed_page=None)
+        stub.watch = lambda: setattr(stub, "monitor", mock.Mock())
+        stub.start = lambda settings: app.Application.start(stub, settings)
+        stub.show_window = lambda *a: app.Application.show_window(stub, *a)
+
+        def window(_app, settings, node, ctrls):  # the Camera page's Setter, as CameraPage builds it
+            return mock.Mock(camera=mock.Mock(ctrls=ctrls, setter=camera.Setter(settings, node, spawn, store.save, {})))
+
+        with mock.patch.dict(os.environ, XDG_CONFIG_HOME=tmp.name), \
+                mock.patch.object(app.threading, "Thread", Inline), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: f(*a)), \
+                mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
+                mock.patch.object(app.service, "run", return_value=True), \
+                mock.patch.object(camera, "read_ctrls", return_value=camera.parse_ctrls(read("brio/ctrls-index0.txt"))), \
+                mock.patch.object(app, "Window", window):
+            store.save({"version": 1, "camera": {"zoom_absolute": 150}})
+            app.Application.do_activate(stub)
+            p1 = stub.window.camera
+            p1.setter.set([("zoom_absolute", 300)])  # on the camera
+            app.Application.on_close(stub, stub.window)
+            app.Application.do_activate(stub)  # opened again
+            p2 = stub.window.camera
+            spawn.finish(True)  # window 1's write is done and saved
+            self.assertEqual(store.load()["camera"], {"zoom_absolute": 300})
+            p2.setter.set([("brightness", 10)])
+            spawn.finish(True)
+            self.assertEqual(store.load()["camera"], {"zoom_absolute": 300, "brightness": 10})
 
     def test_a_window_that_fails_to_build_releases_the_app_and_prints_why(self):
         stub, err = mock.Mock(window=None, starting=True), io.StringIO()
@@ -228,8 +262,10 @@ class BackgroundLaunch(unittest.TestCase):
     def test_the_background_activate_watches_and_opens_no_window(self):
         threads, stub = [], mock.Mock(background=True, monitor=None, window=None, starting=False)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.store, "load", return_value={"version": 1, "camera": {}}), \
                 mock.patch.object(app, "Window") as window:
             app.Application.do_activate(stub)
+        self.assertEqual(stub.settings, {"version": 1, "camera": {}})  # loaded once, for the whole process
         stub.watch.assert_called_once_with()
         window.assert_not_called()
         self.assertEqual(threads, [])
@@ -273,7 +309,7 @@ class Replug(unittest.TestCase):
         app.Application.on_by_id(stub, None, Gio.File.new_for_path(file), other and Gio.File.new_for_path(other), event)
 
     def test_ten_fast_replugs_restore_the_current_saved_state_once_auto_modes_first(self):
-        timers, ran, stub = Timers(), [], mock.Mock(window=None, closed_page=None)
+        timers, ran, stub = Timers(), [], mock.Mock(window=None, closed_page=None, settings=self.SAVED)
         stub.restore_saved = lambda: app.Application.restore_saved(stub)
         stub.replug = service.Debounce(app.REPLUG_MS, stub.restore_saved, timers.add, timers.remove)
 
@@ -290,10 +326,9 @@ class Replug(unittest.TestCase):
                 self.event(stub, "/dev/v4l/by-id", None, Gio.FileMonitorEvent.CREATED)  # the folder came back
                 self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)  # udev's link
                 self.event(stub, DEV, None, Gio.FileMonitorEvent.DELETED)  # an unplug restores nothing
-            load.assert_not_called()
             self.assertEqual(ran, [])
             timers.fire()
-        load.assert_called_once_with()  # read when the restore runs, so it is the saved state as it is then
+        load.assert_not_called()  # the app's one settings dict: every page save is in it already
         self.assertEqual(ran, ["--set-ctrl=auto_exposure=1", "--set-ctrl=zoom_absolute=250",
                                "--set-ctrl=exposure_time_absolute=300"])
         self.assertEqual(timers.pending, {})
@@ -301,6 +336,11 @@ class Replug(unittest.TestCase):
     def test_udevs_rename_alone_restores(self):  # another camera keeps by-id present: no folder event comes
         stub = mock.Mock()
         self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)
+        stub.replug.poke.assert_called_once_with()
+
+    def test_a_color_node_moved_into_by_id_restores(self):  # Gio's MOVED_IN: `other` is the old path, outside the folder
+        stub = mock.Mock()
+        self.event(stub, DEV, "/dev/v4l/.tmp-link", Gio.FileMonitorEvent.MOVED_IN)
         stub.replug.poke.assert_called_once_with()
 
     def test_a_burst_inside_the_debounce_window_restores_once(self):
@@ -414,12 +454,12 @@ class Replug(unittest.TestCase):
 
     def test_with_no_window_or_no_camera_on_the_page_a_worker_restores(self):
         idle_page = mock.Mock(setter=mock.Mock(batch=[], queue=[]))  # a closed page with every write saved
-        for stub in (mock.Mock(window=None, closed_page=idle_page), mock.Mock(closed_page=None)):
+        for stub in (mock.Mock(window=None, closed_page=idle_page, settings=self.SAVED),
+                     mock.Mock(closed_page=None, settings=self.SAVED)):
             if stub.window:
                 stub.window.camera.ctrls = {}  # the page opened while the BRIO was unplugged: it can't write
             with mock.patch.object(app.threading, "Thread", Inline), \
-                    mock.patch.object(app, "restore_camera") as restore, \
-                    mock.patch.object(app.store, "load", return_value=self.SAVED):
+                    mock.patch.object(app, "restore_camera") as restore:
                 app.Application.restore_saved(stub)
             restore.assert_called_once_with(self.SAVED)
             if stub.window:
