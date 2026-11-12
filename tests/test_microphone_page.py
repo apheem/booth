@@ -9,6 +9,7 @@ from gi.repository import GObject
 
 from booth import scarlett
 from booth.ui import microphone
+from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_app import Inline
 from tests.test_headset import DUMP
@@ -79,7 +80,13 @@ class _W:
     def add_response(self, rid, _label):
         self.responses.append(rid)
 
-    def __getattr__(self, _name):  # add, set_default_response, set_response_appearance…
+    def set_default_response(self, rid):
+        self.default_response = rid
+
+    def set_close_response(self, rid):
+        self.close_response = rid
+
+    def __getattr__(self, _name):  # add, set_response_appearance…
         return lambda *_args: None
 
 
@@ -155,6 +162,17 @@ class ScarlettGroup(unittest.TestCase):
         self.assertEqual(self.ran, [])
         self.assertFalse(self.page.phantom.active)
 
+    def test_the_dialogs_default_and_close_are_cancel_and_only_on_writes(self):
+        self.show(state())
+        self.click(self.page.phantom, True)
+        d = self.dialogs[0]
+        self.assertEqual((d.default_response, d.close_response), ("cancel", "cancel"))
+        d.emit("response", d.close_response)  # Escape or the window's close
+        d.emit("response", d.default_response)  # Enter
+        self.assertEqual((self.ran, self.page.phantom.active), ([], False))
+        d.emit("response", "on")
+        self.assertEqual(self.ran, [self.cset(scarlett.PHANTOM, "on")])
+
     def test_48v_off_is_written_without_asking(self):
         self.show(state(**{scarlett.PHANTOM: True}))
         self.click(self.page.phantom, False)
@@ -211,6 +229,66 @@ class ScarlettGroup(unittest.TestCase):
         page = Page()
         microphone.MicrophonePage.__init__(page, {"microphone": {"input": "Instrument"}})
         self.assertEqual(page.input.selected, 1)
+
+
+    def real_poll(self, read):
+        """The page's own poll() over a stand-in scarlett.read; returns the main-loop queue its show() lands on."""
+        idle = []
+        for patch in (mock.patch.object(microphone.scarlett, "read", read),
+                      mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: idle.append((f, a)))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.page.poll = types.MethodType(microphone.MicrophonePage.poll, self.page)
+        return idle
+
+    def test_an_overlapping_poll_is_refused_and_the_next_one_after_show_runs(self):
+        reads = []
+        idle = self.real_poll(lambda choice: reads.append(choice) or state(**{scarlett.DIRECT: True}))
+        self.page.poll()
+        self.page.poll()  # the first one's read hasn't been shown yet
+        self.assertEqual(reads, ["XLR"])
+        f, a = idle.pop()
+        f(*a)
+        self.assertTrue(self.page.direct.active)
+        self.page.poll()  # consecutive polls both run
+        self.assertEqual(reads, ["XLR", "XLR"])
+        self.assertEqual(len(idle), 1)
+
+    def test_a_poll_that_read_before_a_write_landed_is_not_shown(self):
+        self.show(state())
+        since = self.page.writer.writes
+        self.select(self.page.air, 2)  # the write lands after the poll read Air = 1
+        self.page.show(state(), since)
+        self.assertEqual(self.page.air.selected, 2)
+        self.assertFalse(self.page.polling)
+        self.page.show(state(), self.page.writer.writes)  # the next poll shows it
+        self.assertEqual(self.page.air.selected, 1)
+
+    def test_changing_the_input_polls_again(self):
+        reads = []
+        self.real_poll(lambda choice: reads.append(choice))
+        self.select(self.page.input, 1)
+        self.assertEqual(reads, ["Instrument"])
+
+    def test_stop_removes_the_poll_timer(self):
+        removed = []
+        with mock.patch.object(microphone.GLib, "source_remove", removed.append):
+            self.page.stop()
+        self.assertEqual(removed, [self.page.timer])
+
+
+class WindowClose(unittest.TestCase):
+    def test_closing_the_window_stops_the_microphone_pages_poll(self):
+        ns, win = types.SimpleNamespace, mock.Mock()
+        with mock.patch.object(ui_window, "super", lambda *a: ns(__init__=lambda **k: None), create=True), \
+                mock.patch.object(ui_window, "Adw"), mock.patch.object(ui_window, "Gtk"), \
+                mock.patch.object(ui_window, "CameraPage"), mock.patch.object(ui_window, "HeadphonesPage"), \
+                mock.patch.object(ui_window, "MicrophonePage") as mic:
+            ui_window.Window.__init__(win, None, {}, None, {})
+        for c in win.connect.call_args_list:
+            if c.args[0] == "close-request":
+                c.args[1](win)
+        mic.return_value.stop.assert_called_once_with()
 
 
 class Worker(unittest.TestCase):
