@@ -91,8 +91,10 @@ def kind(name, ctrl):
 
 
 def choices(ctrl):
-    """A menu's [(value, label)], "Disabled" shown as "Off"."""
-    return [(v, "Off" if label == "Disabled" else label) for v, label in sorted(ctrl["menu"].items())]
+    """A menu's [(value, label)], "Disabled" shown as "Off", plus the camera's value or default when the menu lacks it
+    (shown as itself, never as item 0)."""
+    extra = {v: f"Unknown ({v})" for v in (ctrl.get("value"), ctrl.get("default")) if v is not None}
+    return [(v, "Off" if label == "Disabled" else label) for v, label in sorted((extra | ctrl["menu"]).items())]
 
 
 def held(values):
@@ -107,8 +109,9 @@ def insensitive(ctrls, values):
 
 
 def ordered(values):
-    """{name: value} as [(name, value)], auto modes first, so a manual value is set once its auto mode is off."""
-    return sorted(values.items(), key=lambda kv: kv[0] not in AUTOS)
+    """{name: value} as [(name, value)], auto modes first, so a manual value is set once its auto mode is off; then FoV,
+    which may reset zoom and pan on the BRIO."""
+    return sorted(values.items(), key=lambda kv: (kv[0] not in AUTOS, kv[0] != "fov"))
 
 
 def defaults(ctrls, names):
@@ -158,7 +161,11 @@ def status(ctrls, values):
 
 def restore_cmds(device, ctrls, saved):
     """Commands that re-apply saved {name: value} controls this camera has, each clamped to its live range: auto modes
-    first, and no manual value whose auto mode stays on (the driver would refuse it)."""
+    first, and no manual value whose auto mode stays on (the driver would refuse it). A saved menu value the menu lacks
+    is not sent, except the LED's, which falls back to Auto: Booth never turns the LED off unless the user picked Off."""
+    saved = {n: v if "menu" not in ctrls.get(n, {}) or v in ctrls[n]["menu"] else xu.DEFAULTS.get(n)
+             for n, v in saved.items()}
+    saved = {n: v for n, v in saved.items() if v is not None}
     hold = held({n: c["value"] for n, c in ctrls.items() if "value" in c} | saved)
     return [set_cmd(device, name, clamp(ctrls[name], value)) for name, value in ordered(saved)
             if name in ctrls and name not in hold]

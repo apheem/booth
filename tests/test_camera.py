@@ -116,11 +116,26 @@ class SetCommands(unittest.TestCase):
         self.assertEqual(camera.set_cmd(DEV, "led_mode", 0), [camera.XU_CMD, "-d", DEV, "--set-ctrl=led_mode=0"])
 
     def test_restore_reapplies_fov_and_led_with_the_others(self):
-        saved = {"fov": 9, "led_mode": 0, "zoom_absolute": 250}
+        saved = {"fov": 1, "led_mode": 0, "zoom_absolute": 250}
         self.assertEqual(camera.restore_cmds(DEV, brio(), saved),
-                         [camera.set_cmd(DEV, "fov", 2), camera.set_cmd(DEV, "led_mode", 0),
+                         [camera.set_cmd(DEV, "fov", 1), camera.set_cmd(DEV, "led_mode", 0),
                           camera.set_cmd(DEV, "zoom_absolute", 250)])
         self.assertEqual(camera.restore_cmds(DEV, self.ctrls, saved), [camera.set_cmd(DEV, "zoom_absolute", 250)])
+
+    def test_restore_a_saved_value_outside_the_menu(self):
+        # LED: Auto, never Off unless the user picked Off; FoV and other menus: the camera is left as it is
+        for bad in (-1, 4, 99):
+            saved = {"led_mode": bad, "fov": bad, "power_line_frequency": bad}
+            self.assertEqual(camera.restore_cmds(DEV, brio(), saved), [camera.set_cmd(DEV, "led_mode", 3)])
+        self.assertEqual(camera.restore_cmds(DEV, brio(), {"led_mode": 0, "fov": 2}),
+                         [camera.set_cmd(DEV, "fov", 2), camera.set_cmd(DEV, "led_mode", 0)])
+
+    def test_restore_sets_fov_before_zoom_pan_and_tilt(self):  # a FoV change on the BRIO may reset zoom and pan
+        saved = {"zoom_absolute": 250, "pan_absolute": 3600, "tilt_absolute": -3600, "fov": 1,
+                 "white_balance_automatic": 1}
+        self.assertEqual([cmd[-1] for cmd in camera.restore_cmds(DEV, brio(), saved)],
+                         ["--set-ctrl=white_balance_automatic=1", "--set-ctrl=fov=1", "--set-ctrl=zoom_absolute=250",
+                          "--set-ctrl=pan_absolute=3600", "--set-ctrl=tilt_absolute=-3600"])
 
 
 class Model(unittest.TestCase):
@@ -149,6 +164,9 @@ class Model(unittest.TestCase):
     def test_fov_and_led_rows(self):
         ctrls = brio()
         self.assertEqual(camera.choices(ctrls["fov"]), [(0, "90°"), (1, "78°"), (2, "65°")])
+        ctrls["led_mode"].update(value=4, default=5)  # bytes the menu lacks show as themselves, never as item 0 "Off"
+        self.assertEqual(camera.choices(ctrls["led_mode"]),
+                         [(0, "Off"), (1, "On"), (2, "Blink"), (3, "Auto"), (4, "Unknown (4)"), (5, "Unknown (5)")])
         self.assertEqual((camera.kind("fov", ctrls["fov"]), camera.kind("led_mode", ctrls["led_mode"])),
                          ("combo", "combo"))
         framing = camera.defaults(ctrls, camera.GROUPS[0][1] + camera.GROUPS[0][2])
@@ -271,6 +289,15 @@ class Commands(unittest.TestCase):
         for refusal in (mock.Mock(return_value=False), mock.Mock(side_effect=OSError(32, "Broken pipe"))):
             with mock.patch.object(xu, "write", refusal):
                 self.assertIs(camera.run(camera.set_cmd(DEV, "led_mode", 0)), False)
+
+    def test_read_ctrls_when_the_node_cannot_be_opened(self):  # unplugged between discovery and page open
+        out = subprocess.CompletedProcess([], 0, stdout=read("brio/ctrls-index0.txt"))
+        with mock.patch("booth.camera.subprocess.run", return_value=out), \
+                mock.patch.object(xu, "descriptors", return_value=b""), \
+                mock.patch.object(xu.os, "open", side_effect=FileNotFoundError(2, "No such file or directory")):
+            ctrls = camera.read_ctrls(DEV)
+        self.assertIn("zoom_absolute", ctrls)
+        self.assertNotIn("fov", ctrls)
 
     def test_read_ctrls_unreadable_camera(self):
         with mock.patch("booth.camera.subprocess.run", side_effect=subprocess.TimeoutExpired("v4l2-ctl", 5)):

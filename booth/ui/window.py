@@ -15,12 +15,12 @@ def page(title, child):
 
 
 class Window(Adw.ApplicationWindow):
-    def __init__(self, app, settings, camera_node):
+    def __init__(self, app, settings, camera_node, camera_ctrls):
         super().__init__(application=app, title="Booth", default_width=860, default_height=560)
         self.set_size_request(360, 300)
         camera_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Ready · 2.0×"
         self.pages = [
-            ("Camera", "camera-web-symbolic", page("Camera", CameraPage(settings, camera_node, camera_status.set_label)),
+            ("Camera", "camera-web-symbolic", page("Camera", CameraPage(settings, camera_node, camera_ctrls, camera_status.set_label)),
              camera_status),
             ("Microphone", "audio-input-microphone-symbolic",
              page("Microphone", placeholder("Microphone", "audio-input-microphone-symbolic")), None),

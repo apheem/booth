@@ -1,5 +1,6 @@
 """The BRIO's extension-unit controls: descriptor parsing, payloads, and the read/write paths over a fake ioctl."""
 import ctypes
+import struct
 import unittest
 import uuid
 from unittest import mock
@@ -84,6 +85,24 @@ class Payloads(unittest.TestCase):
             self.assertEqual((ctypes.sizeof(xu.Query), xu.CTRL_QUERY), (16, 0xC0107521))
         self.assertEqual((xu.SET_CUR, xu.GET_CUR, xu.GET_DEF), (0x01, 0x81, 0x87))
 
+    @unittest.skipUnless(ctypes.sizeof(ctypes.c_void_p) == 8, "struct offsets pinned for 64-bit")
+    def test_the_query_struct_the_kernel_gets_and_the_bytes_it_fills(self):
+        seen = {}
+
+        def kernel(fd, request, arg):  # the real fcntl.ioctl's place: read the struct, fill the buffer it points at
+            raw = bytes(arg)
+            unit, selector, query, size, ptr = struct.unpack("<BBBxH2xQ", raw)
+            seen.update(fd=fd, request=request, len=len(raw), fields=(unit, selector, query, size),
+                        sent=ctypes.string_at(ptr, 5))
+            ctypes.memmove(ptr, bytes.fromhex("0103010002"), 5)
+            return 0
+
+        with mock.patch.object(xu.fcntl, "ioctl", kernel):
+            got = xu.ioctl(7, 11, 9, xu.GET_CUR, bytes.fromhex("0000000005"))
+        self.assertEqual(got, bytes.fromhex("0103010002"))  # what the kernel wrote, not what was sent
+        self.assertEqual(seen, {"fd": 7, "request": xu.CTRL_QUERY, "len": 16, "fields": (11, 9, xu.GET_CUR, 5),
+                                "sent": bytes.fromhex("0000000005")})
+
 
 class FakeCamera:
     """The XU side of a BRIO: {(unit, selector): payload}; GET_DEF is all zeros, like the BRIO's LED."""
@@ -140,7 +159,18 @@ class ReadWrite(unittest.TestCase):
             self.assertTrue(xu.write(DEV, "fov", 1))
             xu.os.open.assert_called_with(DEV, xu.os.O_RDWR)
         self.assertEqual(cam.cur, {(10, 5): b"\x01", (11, 9): bytes.fromhex("0100010002")})
-        self.assertEqual([c[2] for c in cam.calls], [xu.GET_CUR, xu.SET_CUR] * 2)
+        # the LED's other bytes are read first; FoV's 1-byte payload is all value: no GET_CUR to wait on
+        self.assertEqual([c[2] for c in cam.calls], [xu.GET_CUR, xu.SET_CUR, xu.SET_CUR])
+
+    def test_write_closes_the_node_on_success_and_on_refusal(self):
+        cam = FakeCamera({(10, 5): b"\x02"})
+        a, b = self.live(cam)
+        with a, b:
+            self.assertTrue(xu.write(DEV, "fov", 1))
+            xu.os.close.assert_called_once_with(7)
+            cam.cur.clear()  # the camera refuses now: the OSError still closes the node
+            self.assertRaises(OSError, xu.write, DEV, "fov", 0)
+            self.assertEqual(xu.os.close.call_args_list, [mock.call(7)] * 2)
 
     def test_write_to_a_camera_without_the_control(self):
         a, b = self.live(FakeCamera({}))
@@ -151,7 +181,15 @@ class ReadWrite(unittest.TestCase):
         a, b = self.live(FakeCamera({(10, 5): b"\x00"}))
         with a, b:
             self.assertEqual(xu.read(DEV)["fov"]["value"], 0)
+            xu.os.open.assert_called_once_with(DEV, xu.os.O_RDWR)
             xu.os.close.assert_called_once_with(7)
+
+    def test_read_a_node_that_cannot_be_opened(self):  # unplugged between discovery and page open
+        a, b = self.live(FakeCamera({(10, 5): b"\x00"}))
+        with a, b:
+            xu.os.open.side_effect = FileNotFoundError(2, "No such file or directory")
+            self.assertEqual(xu.read(DEV), {})
+            xu.os.close.assert_not_called()
 
     def test_read_an_unplugged_camera(self):
         with mock.patch.object(xu, "descriptors", side_effect=FileNotFoundError):

@@ -113,7 +113,8 @@ def write(node, name, value):
     _, selector, size, _ = CONTROLS[name]
     fd = os.open(node, os.O_RDWR)
     try:
-        ioctl(fd, unit, selector, SET_CUR, encode(name, ioctl(fd, unit, selector, GET_CUR, bytes(size)), value))
+        current = ioctl(fd, unit, selector, GET_CUR, bytes(size)) if size > 1 else bytes(size)  # 1 byte: all value
+        ioctl(fd, unit, selector, SET_CUR, encode(name, current, value))
     finally:
         os.close(fd)
     return True
