@@ -5,7 +5,6 @@ trust boundary: a plugin may be loaded only from the path it returns, which hold
     python3 -m booth.plugins [folder]    fetch what's missing or refused, then print each file's verdict
 """
 import ctypes
-import glob
 import hashlib
 import os
 import shutil
@@ -14,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 # The pins. Each was hashed from the download and cross-checked against what upstream publishes (see PR #14's body).
@@ -22,6 +22,7 @@ MANIFEST = {
     "sc4m_1916.so": "e4a56d8a48e8a51a1ef710338a7b0f4feaa3c4736f9470b16c4bf0ff41684674",
     "fast_lookahead_limiter_1913.so": "e64806aee4f2f6a3c1c511e2e61082d57224ec3c87409da1e4195ee63f828674",
 }
+SWH_VERSION = "0.4.17-3build1"  # the swh-plugins version the two SWH pins above were hashed from
 RNNOISE_URL = "https://github.com/werman/noise-suppression-for-voice/releases/download/v1.10/linux-rnnoise.zip"
 RNNOISE_MEMBER = "linux-rnnoise/ladspa/librnnoise_ladspa.so"
 SWH_FILES = ("sc4m_1916.so", "fast_lookahead_limiter_1913.so")  # from the Ubuntu archive's swh-plugins, not installed
@@ -68,9 +69,9 @@ def _rnnoise(stage):
 
 
 def _swh(stage):
-    subprocess.run(["apt-get", "download", "swh-plugins"], cwd=stage, check=True, stdin=subprocess.DEVNULL,
-                   timeout=600)
-    deb, = glob.glob(str(stage / "*.deb"))
+    subprocess.run(["apt-get", "download", f"swh-plugins={SWH_VERSION}"], cwd=stage, check=True,
+                   stdin=subprocess.DEVNULL, timeout=600)
+    deb, = stage.glob("*.deb")
     subprocess.run(["dpkg-deb", "-x", deb, stage / "deb"], check=True, stdin=subprocess.DEVNULL, timeout=600)
     for name in SWH_FILES:
         shutil.copyfile(stage / "deb/usr/lib/ladspa" / name, stage / name, follow_symlinks=False)
@@ -79,7 +80,8 @@ def _swh(stage):
 def fetch(where=None, manifest=MANIFEST):
     """Download each missing or refused file, place only what verifies, and return what failed (empty: all good)."""
     where = Path(where or folder())
-    sources = [("RNNoise", _rnnoise, ["librnnoise_ladspa.so"]), ("SWH plugins", _swh, list(SWH_FILES))]
+    sources = [("RNNoise", _rnnoise, ["librnnoise_ladspa.so"]),
+               (f"SWH plugins {SWH_VERSION}", _swh, list(SWH_FILES))]
     failed = []
     for what, download, names in sources:
         names = [n for n in names if n in manifest]
@@ -104,7 +106,8 @@ def fetch(where=None, manifest=MANIFEST):
                     continue
                 where.mkdir(exist_ok=True)
                 os.replace(stage / name, where / name)
-        except (OSError, subprocess.SubprocessError, zipfile.BadZipFile, KeyError, ValueError) as e:
+        except (OSError, subprocess.SubprocessError, zipfile.BadZipFile, zlib.error, KeyError,
+                ValueError) as e:
             failed.append(f"{what}: download failed ({e})")
         finally:
             shutil.rmtree(stage, ignore_errors=True)

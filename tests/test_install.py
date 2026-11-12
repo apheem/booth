@@ -240,7 +240,7 @@ class Install(unittest.TestCase):
         self.assertIn("curl -fsSL --proto =https -o", self.fetches.read_text())
         self.assertIn("apt-get download swh-plugins", self.fetches.read_text())
         self.assertIn("booth.plugins: RNNoise: download failed", r.stderr)
-        self.assertIn("booth.plugins: SWH plugins: download failed", r.stderr)
+        self.assertIn("booth.plugins: SWH plugins 0.4.17-3build1: download failed", r.stderr)
         self.assertIn("install.sh: some voice plugins couldn't be fetched or verified (above)", r.stderr)
         self.assertIn("librnnoise_ladspa.so: refused (missing)", r.stdout)
         self.assertFalse((self.app.parent / "plugins").exists())  # nothing unverified was placed

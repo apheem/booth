@@ -30,7 +30,7 @@ exit "${APT_RC:-0}"
 """
 DPKG = """#!/bin/sh
 echo "dpkg-deb $*" >> "$STUB_LOG"
-mkdir -p "$3/usr/lib/ladspa" && cp "$STUB_DIR"/ladspa/* "$3/usr/lib/ladspa/"
+mkdir -p "$3/usr/lib/ladspa" && cp -P "$STUB_DIR"/ladspa/* "$3/usr/lib/ladspa/"
 exit "${DPKG_RC:-0}"
 """
 
@@ -166,7 +166,7 @@ class Fetch(unittest.TestCase):
         self.assertTrue(calls[0].endswith(plugins.RNNOISE_URL), calls[0])
         self.assertEqual(plugins.RNNOISE_URL, "https://github.com/werman/noise-suppression-for-voice/releases/"
                                               "download/v1.10/linux-rnnoise.zip")
-        self.assertEqual(calls[1], "apt-get download swh-plugins")
+        self.assertEqual(calls[1], "apt-get download swh-plugins=0.4.17-3build1")  # pinned, not apt's latest
         self.assertRegex(calls[2], r"^dpkg-deb -x \S+/swh-plugins_0.4.17-3build1_amd64.deb \S+$")
         self.assertEqual(len(calls), 3)
 
@@ -202,6 +202,7 @@ class Fetch(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertIn(SC4M, failed[0])
         self.assertIn("sha256", failed[0])
+        self.assertIn("0.4.17-3build1", failed[0])  # names the version the pins were taken from
         self.assertFalse((self.folder / SC4M).exists())
         self.assertEqual(self.verified(), sorted([RNNOISE, LIMITER]))
 
@@ -210,6 +211,35 @@ class Fetch(unittest.TestCase):
         (self.folder / LIMITER).write_bytes(b"swapped")
         self.assertEqual(self.fetch(), [])
         self.assertEqual((self.folder / LIMITER).read_bytes(), FAKE[LIMITER])
+
+    def test_a_corrupt_zip_fails_rnnoise_alone(self):
+        data = b"\0" * 400000
+        zip_ = Path(self.env["STUB_DIR"]) / "linux-rnnoise.zip"
+        with zipfile.ZipFile(zip_, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(plugins.RNNOISE_MEMBER, data)
+        raw = bytearray(zip_.read_bytes())
+        raw[30 + len(plugins.RNNOISE_MEMBER)] ^= 0xFF  # the directory is intact, the deflate stream isn't
+        zip_.write_bytes(bytes(raw))
+        failed = plugins.fetch(self.folder, {**FAKE_MANIFEST, RNNOISE: hashlib.sha256(data).hexdigest()})
+        self.assertEqual(len(failed), 1)
+        self.assertIn("RNNoise: download failed", failed[0])
+        self.assertEqual(self.verified(), sorted([SC4M, LIMITER]))  # the SWH fetch still ran
+
+    def test_glob_characters_in_the_data_path_are_literal(self):
+        self.folder = self.dir / "a[1]" / "plugins"
+        self.assertEqual(self.fetch(), [])
+        self.assertEqual(self.verified(), sorted(FAKE))
+
+    def test_a_symlink_in_the_deb_is_never_placed(self):
+        src = Path(self.env["STUB_DIR"])
+        (src / "elsewhere.so").write_bytes(FAKE[SC4M])  # the pinned bytes, but reached through a link
+        (src / "ladspa" / SC4M).unlink()
+        (src / "ladspa" / SC4M).symlink_to(src / "elsewhere.so")
+        failed = self.fetch()
+        self.assertEqual(len(failed), 1)
+        self.assertIn(SC4M, failed[0])
+        self.assertFalse(os.path.lexists(self.folder / SC4M))
+        self.assertEqual(self.verified(), sorted([RNNOISE, LIMITER]))
 
     def test_with_no_network_nothing_is_written(self):
         os.environ.update(CURL_RC="6", APT_RC="100")
@@ -236,11 +266,13 @@ typedef struct {
   unsigned long count; const int *descs; const char * const *names; const Hint *hints;
   void *data, *f[8];
 } Desc;
-static const int descs[] = {0x5, 0x9, 0xA, 0x6};
-static const char * const names[] = {"Threshold (dB)", "Input", "Output", "latency"};
-static const Hint hints[] = {{0x3, -30.0f, 0.0f}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-static const Desc d = {4242, "fake_mono", 0, "Fake mono", "m", "c", 4, descs, names, hints, NULL, {0}};
-const Desc *ladspa_descriptor(unsigned long i) { return i == 0 ? &d : NULL; }
+static const int descs[] = {0x5, 0x9, 0xA, 0x6, 0x5};
+static const char * const names[] = {"Threshold (dB)", "Input", "Output", "latency", "Mix"};
+static const Hint hints[] = {{0x3, -30.0f, 0.0f}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0x2, 0, 1.0f}};
+static const Desc d = {4242, "fake_mono", 0, "Fake mono", "m", "c", 5, descs, names, hints, NULL, {0}};
+static const Desc d2 = {4243, "fake_stereo", 0, "Fake stereo", "m", "c", 1, descs + 1, names + 1, hints + 1,
+                        NULL, {0}};  /* a second descriptor, like RNNoise's mono + stereo */
+const Desc *ladspa_descriptor(unsigned long i) { return i == 0 ? &d : i == 1 ? &d2 : NULL; }
 """
 
 
@@ -258,7 +290,10 @@ class Ports(unittest.TestCase):
                      "lower": -30.0, "upper": 0.0},
                     {"index": 1, "name": "Input", "type": "audio", "direction": "input"},
                     {"index": 2, "name": "Output", "type": "audio", "direction": "output"},
-                    {"index": 3, "name": "latency", "type": "control", "direction": "output"}]}])
+                    {"index": 3, "name": "latency", "type": "control", "direction": "output"},
+                    {"index": 4, "name": "Mix", "type": "control", "direction": "input", "upper": 1.0}]},
+                {"label": "fake_stereo", "id": 4243, "name": "Fake stereo", "ports": [
+                    {"index": 0, "name": "Input", "type": "audio", "direction": "input"}]}])
             data = so.read_bytes()
             so.unlink()  # a new file: rewriting the loaded one in place would crash this process
             so.write_bytes(data + b"\0")  # never loaded unless it verifies
