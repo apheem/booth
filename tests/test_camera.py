@@ -49,10 +49,10 @@ class ParseControls(unittest.TestCase):
         self.assertFalse(self.ctrls["brightness"]["inactive"])
 
     def test_disabled_control_is_left_out_with_its_menu(self):
-        text = ("           led1_mode 0x0a046d05 (menu)   : min=0 max=3 default=0 value=0 flags=disabled\n"
-                "\t\t\t\t0: Off\n"
-                "power_line_frequency 0x00980918 (menu)   : min=0 max=2 default=2 value=0 (Disabled)\n"
-                "\t\t\t\t0: Disabled\n")
+        text = ("power_line_frequency 0x00980918 (menu)   : min=0 max=2 default=2 value=0 (Disabled)\n"
+                "\t\t\t\t0: Disabled\n"
+                "           led1_mode 0x0a046d05 (menu)   : min=0 max=3 default=0 value=0 flags=disabled\n"
+                "\t\t\t\t3: Auto\n")
         self.assertEqual(camera.parse_ctrls(text),
                          {"power_line_frequency": {"type": "menu", "inactive": False, "min": 0, "max": 2,
                                                    "default": 2, "value": 0, "menu": {0: "Disabled"}}})
