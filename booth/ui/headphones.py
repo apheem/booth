@@ -12,6 +12,7 @@ from gi.repository import Adw, GLib, Gtk
 from booth import headset, store
 
 POLL_S = 2
+SWITCH_SUBTITLE = "Play all sound through the headset"
 
 
 class HeadphonesPage(Adw.PreferencesPage):
@@ -27,7 +28,7 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.scale.connect("value-changed", self.on_volume)
         volume = Adw.ActionRow(title="Volume")
         volume.add_suffix(self.scale)
-        self.switch = Adw.SwitchRow(title="Use for all sound", subtitle="Play all sound through the headset")
+        self.switch = Adw.SwitchRow(title="Use for all sound", subtitle=SWITCH_SUBTITLE)
         self.switch.connect("notify::active", self.on_default)
         self.rows = [volume, self.switch]
         for row in self.rows:
@@ -90,7 +91,11 @@ class HeadphonesPage(Adw.PreferencesPage):
             self.settings["headphones"]["previous_default"] = name
         else:
             self.settings["headphones"].pop("previous_default", None)
-        store.save(self.settings)  # on the main loop, like the Camera page's saves of the same dict
+        try:  # on the main loop, like the Camera page's saves of the same dict
+            store.save(self.settings)
+            self.switch.set_subtitle(SWITCH_SUBTITLE)
+        except OSError as e:  # disk full, read-only: set, but the user must know it won't last
+            self.switch.set_subtitle(f"Set, but not saved: {e.strerror or e}")
 
     def spawn(self, make, done):
         threading.Thread(target=lambda: self.write(make, done), daemon=True).start()

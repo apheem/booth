@@ -16,7 +16,7 @@ POLL_S = 2
 class MicrophonePage(Adw.PreferencesPage):
     def __init__(self, settings):
         super().__init__()
-        self.settings, self.quiet, self.polling, self.items = settings, False, False, {}
+        self.settings, self.quiet, self.polling, self.items, self.unsaved = settings, False, False, {}, ""
         self.writer = headset.Writer(self.spawn)
         self.group = Adw.PreferencesGroup(title="Scarlett Solo")
         self.input = Adw.ComboRow(title="Input", model=Gtk.StringList.new(list(scarlett.INPUTS)))
@@ -81,7 +81,7 @@ class MicrophonePage(Adw.PreferencesPage):
                     row.set_selected(v)
             self.firmware.set_subtitle(scarlett.text(ctrls, scarlett.FIRMWARE))
             self.sync.set_subtitle(scarlett.text(ctrls, scarlett.SYNC))
-            self.input.set_subtitle(scarlett.describe(state["mic"]) if state else "")
+            self.input.set_subtitle(self.unsaved or (scarlett.describe(state["mic"]) if state else ""))
             self.quiet = False
         return GLib.SOURCE_REMOVE
 
@@ -127,7 +127,12 @@ class MicrophonePage(Adw.PreferencesPage):
 
     def on_input(self, row, _param):
         self.settings["microphone"]["input"] = list(scarlett.INPUTS)[row.get_selected()]
-        store.save(self.settings)  # on the main loop, like the other pages' saves of the same dict
+        try:  # on the main loop, like the other pages' saves of the same dict
+            store.save(self.settings)
+            self.unsaved = ""
+        except OSError as e:  # disk full, read-only: set, but the user must know it won't last
+            self.unsaved = f"Set, but not saved: {e.strerror or e}"
+            self.input.set_subtitle(self.unsaved)
         self.poll()  # the subtitle shows the new input's channel
 
     def spawn(self, make, done):
