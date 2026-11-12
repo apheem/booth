@@ -13,7 +13,7 @@ VERSION = 1
 
 
 def defaults():
-    # camera: {v4l2 control name: value}, re-applied to the camera at startup.
+    # camera: {control name: value}, v4l2 names plus the extension units' "fov" and "led_mode"; re-applied at startup.
     return {"version": VERSION, "camera": {}}
 
 
