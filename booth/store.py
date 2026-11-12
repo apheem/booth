@@ -26,7 +26,8 @@ def load(file=None):
     file = Path(file or path())
     try:
         data = json.loads(file.read_text())
-        if not isinstance(data, dict) or not isinstance(data.get("camera", {}), dict):
+        camera = data.get("camera", {}) if isinstance(data, dict) else None
+        if not isinstance(camera, dict) or not all(isinstance(v, int) for v in camera.values()):
             raise ValueError("not a settings object")
     except FileNotFoundError:
         return defaults()

@@ -41,13 +41,13 @@ def _run(*cmd):
         return ""
 
 
-def discover():
+def discover(run=_run, listdir=os.listdir):
     """The live devices record. The camera is its stable by-id path, or None when unplugged."""
     try:
-        # index0 sorts first, so the IR node (index2) is only format-queried if the color node is missing.
-        paths = sorted(os.path.join(BY_ID, name) for name in os.listdir(BY_ID) if "-video-index" in name)
+        # Only a camera's index0 (the BRIO's color node) is ever queried: any query on index2 opens the IR node.
+        paths = sorted(os.path.join(BY_ID, name) for name in listdir(BY_ID) if name.endswith("-video-index0"))
     except OSError:
         paths = []
-    camera = find_camera(paths, lambda p: _run("udevadm", "info", "--query=property", "--name", p),
-                         lambda p: _run("v4l2-ctl", "-d", p, "--list-formats"))
+    camera = find_camera(paths, lambda p: run("udevadm", "info", "--query=property", "--name", p),
+                         lambda p: run("v4l2-ctl", "-d", p, "--list-formats"))
     return {"camera": camera}

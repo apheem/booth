@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from booth import devices
@@ -59,6 +60,43 @@ class FindCamera(unittest.TestCase):
     def test_other_vendor_is_ignored(self):
         host = FakeHost(udev_edit={0: [("ID_VENDOR_ID=046d", "ID_VENDOR_ID=1234")]})
         self.assertIsNone(host.find())
+
+
+class Discover(unittest.TestCase):
+    """discover() against a fake by-id folder and a fake command runner that records every node it was asked about."""
+
+    def discover(self, formats_index0=None):
+        nodes = brio_nodes()
+        asked = []
+
+        def run(*cmd):
+            path = next(a for a in cmd if a.startswith(devices.BY_ID))
+            asked.append(nodes[path])
+            if cmd[0] == "udevadm":
+                return read(f"brio/udev-index{nodes[path]}.txt")
+            if nodes[path] == 0 and formats_index0 is not None:
+                return formats_index0
+            return read(f"brio/formats-index{nodes[path]}.txt")
+
+        # Listed IR-first, so only the code (never the folder's order) keeps the other nodes unqueried.
+        names = [os.path.basename(p) for p in sorted(nodes, key=lambda p: -nodes[p])]
+        found = devices.discover(run=run, listdir=lambda _d: names)["camera"]
+        return (nodes[found] if found else None), asked
+
+    def test_finds_the_color_node_asking_only_about_it(self):
+        self.assertEqual(self.discover(), (0, [0, 0]))
+
+    def test_color_query_failing_never_reaches_the_ir_node(self):
+        # A timeout or unplug makes index0's format query return nothing: the IR node must still never be opened.
+        found, asked = self.discover(formats_index0="")
+        self.assertIsNone(found)
+        self.assertEqual(set(asked), {0})
+
+    def test_no_by_id_folder(self):
+        def gone(_d):
+            raise FileNotFoundError
+
+        self.assertEqual(devices.discover(run=lambda *c: self.fail(c), listdir=gone), {"camera": None})
 
 
 class Parsers(unittest.TestCase):

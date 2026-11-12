@@ -71,6 +71,20 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Usage", r.stdout)
 
+    def test_launcher_ignores_a_booth_package_in_the_cwd(self):
+        # From a repo or worktree root, `python3 -m booth` would import that checkout's booth/ before the install.
+        self.assertEqual(self.install().returncode, 0)
+        decoy = self.home / "checkout"
+        (decoy / "booth").mkdir(parents=True)
+        (decoy / "booth" / "__init__.py").write_text("")
+        (decoy / "booth" / "__main__.py").write_text("import sys\nprint('DECOY')\nsys.exit(7)\n")
+        env = {k: v for k, v in self.env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "PYTHONPATH")}
+        r = subprocess.run([str(self.launcher), "--help"], env=env, cwd=decoy, capture_output=True, text=True,
+                           timeout=60)
+        self.assertNotIn("DECOY", r.stdout)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Usage", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

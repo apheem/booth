@@ -19,7 +19,7 @@ mv "$dest/booth.new" "$dest/booth"
 cat > "$bin/booth.new" <<EOF
 #!/bin/sh
 export PYTHONPATH="$dest\${PYTHONPATH:+:\$PYTHONPATH}"
-exec python3 -m booth "\$@"
+exec python3 -P -m booth "\$@"
 EOF
 chmod 755 "$bin/booth.new"
 mv "$bin/booth.new" "$bin/booth"

@@ -1,4 +1,6 @@
 """The Booth application: a single-instance libadwaita app. Logic lives in the pure modules; this file only wires."""
+import sys
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -14,9 +16,8 @@ APP_ID = "io.github.apheem.Booth"
 def restore_camera(settings):
     """Re-apply the saved camera controls to the BRIO, if it is plugged in. Returns its node or None."""
     dev = devices.discover()["camera"]
-    if dev:
-        for cmd in camera.restore_cmds(dev, camera.read_ctrls(dev), settings["camera"]):
-            camera.run(cmd)
+    for cmd in camera.restore(dev, settings["camera"]):
+        print(f"Booth: the camera refused {cmd[-1]}", file=sys.stderr)
     return dev
 
 

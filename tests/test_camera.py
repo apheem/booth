@@ -1,4 +1,6 @@
+import subprocess
 import unittest
+from unittest import mock
 
 from booth import camera
 from tests.fixture import read
@@ -61,6 +63,93 @@ class SetCommands(unittest.TestCase):
 
     def test_restore_nothing_saved(self):
         self.assertEqual(camera.restore_cmds(DEV, self.ctrls, {}), [])
+
+
+class Commands(unittest.TestCase):
+    def test_run_reports_the_exit_status(self):
+        self.assertIs(camera.run(["true"]), True)
+        self.assertIs(camera.run(["false"]), False)
+        self.assertIs(camera.run(["/nonexistent/v4l2-ctl"]), False)
+
+    def test_read_ctrls_asks_for_controls_with_menus(self):
+        out = subprocess.CompletedProcess([], 0, stdout=read("brio/ctrls-index0.txt"))
+        with mock.patch("booth.camera.subprocess.run", return_value=out) as run:
+            ctrls = camera.read_ctrls(DEV)
+        self.assertEqual(run.call_args.args[0], ["v4l2-ctl", "-d", DEV, "--list-ctrls-menus"])
+        self.assertEqual(ctrls["power_line_frequency"]["menu"], {0: "Disabled", 1: "50 Hz", 2: "60 Hz"})
+
+    def test_read_ctrls_unreadable_camera(self):
+        with mock.patch("booth.camera.subprocess.run", side_effect=subprocess.TimeoutExpired("v4l2-ctl", 5)):
+            self.assertEqual(camera.read_ctrls(DEV), {})
+
+
+class Restore(unittest.TestCase):
+    """camera.restore: what Booth re-applies at launch."""
+
+    def restore(self, device, saved, accept=True):
+        ran = []
+
+        def run(cmd):
+            ran.append(cmd)
+            return accept
+
+        with mock.patch.object(camera, "read_ctrls", return_value=camera.parse_ctrls(read("brio/ctrls-index0.txt"))), \
+                mock.patch.object(camera, "run", run):
+            return camera.restore(device, saved), ran
+
+    def test_applies_saved_controls_clamped(self):
+        failed, ran = self.restore(DEV, {"zoom_absolute": 900})
+        self.assertEqual(ran, [["v4l2-ctl", "-d", DEV, "--set-ctrl=zoom_absolute=500"]])
+        self.assertEqual(failed, [])
+
+    def test_reports_what_the_camera_refused(self):
+        failed, _ = self.restore(DEV, {"zoom_absolute": 250}, accept=False)
+        self.assertEqual(failed, [["v4l2-ctl", "-d", DEV, "--set-ctrl=zoom_absolute=250"]])
+
+    def test_no_camera_runs_nothing(self):
+        self.assertEqual(self.restore(None, {"zoom_absolute": 250}), ([], []))
+
+
+class FakeSpawn:
+    """Holds each spawned command until the test finishes it, like a v4l2-ctl still running on its thread."""
+
+    def __init__(self):
+        self.cmds, self.done = [], []
+
+    def __call__(self, cmd, done):
+        self.cmds.append(cmd[-1])
+        self.done.append(done)
+
+    def finish(self, ok):
+        self.done.pop(0)(ok)
+
+
+class SetterTest(unittest.TestCase):
+    def setUp(self):
+        self.settings = {"version": 1, "camera": {}}
+        self.saved = []
+        self.spawn = FakeSpawn()
+        self.setter = camera.Setter(self.settings, DEV, "zoom_absolute", self.spawn,
+                                    lambda s: self.saved.append(dict(s["camera"])))
+
+    def test_one_set_in_flight_and_the_last_value_wins(self):
+        for v in (200, 300, 400):
+            self.setter.set(v)
+        self.assertEqual(self.spawn.cmds, ["--set-ctrl=zoom_absolute=200"])
+        self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, ["--set-ctrl=zoom_absolute=200", "--set-ctrl=zoom_absolute=400"])
+        self.spawn.finish(True)
+        self.assertEqual(self.spawn.done, [])
+        self.assertEqual(self.saved, [{"zoom_absolute": 200}, {"zoom_absolute": 400}])
+        self.assertEqual(self.settings["camera"], {"zoom_absolute": 400})
+
+    def test_a_refused_value_is_not_saved(self):
+        self.setter.set(250)
+        self.spawn.finish(False)
+        self.assertEqual((self.saved, self.settings["camera"]), ([], {}))
+        self.setter.set(260)  # a failure doesn't wedge the setter
+        self.spawn.finish(True)
+        self.assertEqual(self.saved, [{"zoom_absolute": 260}])
 
 
 if __name__ == "__main__":

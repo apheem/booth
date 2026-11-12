@@ -56,3 +56,37 @@ def run(cmd):
         return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def restore(device, saved):
+    """Re-apply the saved {name: value} controls at launch (nothing when the camera is unplugged) → the refused commands."""
+    if not device:
+        return []
+    return [cmd for cmd in restore_cmds(device, read_ctrls(device), saved) if not run(cmd)]
+
+
+class Setter:
+    """Sets one control off the main loop and saves it. At most one set is in flight; values asked for meanwhile
+    collapse to the newest, so the last value asked for is the one applied. Only a value the camera took is saved.
+    `spawn(cmd, done)` runs `cmd` elsewhere and calls `done(ok)` back on the main loop; `save(settings)` persists."""
+
+    def __init__(self, settings, device, name, spawn, save):
+        self.settings, self.device, self.name, self.spawn, self.save = settings, device, name, spawn, save
+        self.pending, self.busy = None, False
+
+    def set(self, value):
+        self.pending = value
+        if not self.busy:
+            self._next()
+
+    def _next(self):
+        value, self.pending = self.pending, None
+        self.busy = value is not None
+        if self.busy:
+            self.spawn(set_cmd(self.device, self.name, value), lambda ok: self._done(value, ok))
+
+    def _done(self, value, ok):
+        if ok:
+            self.settings["camera"][self.name] = value
+            self.save(self.settings)
+        self._next()

@@ -1,4 +1,6 @@
 """The Camera page: a Zoom slider whose range comes from the camera itself."""
+import threading
+
 from gi.repository import Adw, GLib, Gtk
 
 from booth import camera, store
@@ -9,7 +11,7 @@ ZOOM = "zoom_absolute"
 class CameraPage(Adw.PreferencesPage):
     def __init__(self, settings, node):
         super().__init__()
-        self.settings, self.node, self.pending = settings, node, None
+        self.settings, self.node = settings, node
         group = Adw.PreferencesGroup(title="Camera")
         self.add(group)
         self.zoom = camera.read_ctrls(node).get(ZOOM) if node else None
@@ -25,19 +27,19 @@ class CameraPage(Adw.PreferencesPage):
         # BRIO zoom units: the minimum is 1× (100..500 → 1×..5×).
         scale.set_format_value_func(lambda _s, v: f"{v / (z['min'] or 100):.1f}×")
         scale.connect("value-changed", self.on_zoom)
-        row = Adw.ActionRow(title="Zoom")
-        row.add_suffix(scale)
-        group.add(row)
+        self.row = Adw.ActionRow(title="Zoom")
+        self.row.add_suffix(scale)
+        group.add(self.row)
+        self.setter = camera.Setter(settings, node, ZOOM, self.spawn, store.save)
 
     def on_zoom(self, scale):
-        # Coalesce a drag into one v4l2-ctl call and one save every 50 ms.
-        if self.pending is None:
-            GLib.timeout_add(50, self.apply)
-        self.pending = camera.clamp(self.zoom, scale.get_value())
+        self.setter.set(camera.clamp(self.zoom, scale.get_value()))
 
-    def apply(self):
-        value, self.pending = self.pending, None
-        if camera.run(camera.set_cmd(self.node, ZOOM, value)):
-            self.settings["camera"][ZOOM] = value
-            store.save(self.settings)
+    def spawn(self, cmd, done):
+        # v4l2-ctl can block for seconds on a stalled or unplugged camera: never on the main loop.
+        threading.Thread(target=lambda: GLib.idle_add(self.finished, camera.run(cmd), done), daemon=True).start()
+
+    def finished(self, ok, done):
+        self.row.set_subtitle("" if ok else "The camera did not take this zoom")
+        done(ok)
         return GLib.SOURCE_REMOVE
