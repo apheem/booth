@@ -1,0 +1,290 @@
+{
+ "librnnoise_ladspa.so": [
+  {
+   "label": "noise_suppressor_mono",
+   "id": 9354877,
+   "name": "Noise Suppressor for Voice (Mono)",
+   "ports": [
+    {
+     "index": 0,
+     "name": "Input",
+     "type": "audio",
+     "direction": "input"
+    },
+    {
+     "index": 1,
+     "name": "Output",
+     "type": "audio",
+     "direction": "output"
+    },
+    {
+     "index": 2,
+     "name": "VAD Threshold (%)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 99.0
+    },
+    {
+     "index": 3,
+     "name": "VAD Grace Period (ms)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 1000.0
+    },
+    {
+     "index": 4,
+     "name": "Retroactive VAD Grace (ms)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 200.0
+    },
+    {
+     "index": 5,
+     "name": "Placeholder",
+     "type": "control",
+     "direction": "input"
+    },
+    {
+     "index": 6,
+     "name": "Placeholder",
+     "type": "control",
+     "direction": "input"
+    }
+   ]
+  },
+  {
+   "label": "noise_suppressor_stereo",
+   "id": 9354877,
+   "name": "Noise Suppressor for Voice (Stereo)",
+   "ports": [
+    {
+     "index": 0,
+     "name": "Input (L)",
+     "type": "audio",
+     "direction": "input"
+    },
+    {
+     "index": 1,
+     "name": "Input (R)",
+     "type": "audio",
+     "direction": "input"
+    },
+    {
+     "index": 2,
+     "name": "Output (L)",
+     "type": "audio",
+     "direction": "output"
+    },
+    {
+     "index": 3,
+     "name": "Output (R)",
+     "type": "audio",
+     "direction": "output"
+    },
+    {
+     "index": 4,
+     "name": "VAD Threshold (%)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 99.0
+    },
+    {
+     "index": 5,
+     "name": "VAD Grace Period (ms)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 1000.0
+    },
+    {
+     "index": 6,
+     "name": "Retroactive VAD Grace (ms)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 200.0
+    },
+    {
+     "index": 7,
+     "name": "Placeholder",
+     "type": "control",
+     "direction": "input"
+    },
+    {
+     "index": 8,
+     "name": "Placeholder",
+     "type": "control",
+     "direction": "input"
+    }
+   ]
+  }
+ ],
+ "sc4m_1916.so": [
+  {
+   "label": "sc4m",
+   "id": 1916,
+   "name": "SC4 mono",
+   "ports": [
+    {
+     "index": 0,
+     "name": "RMS/peak",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 1.0
+    },
+    {
+     "index": 1,
+     "name": "Attack time (ms)",
+     "type": "control",
+     "direction": "input",
+     "lower": 1.5,
+     "upper": 400.0
+    },
+    {
+     "index": 2,
+     "name": "Release time (ms)",
+     "type": "control",
+     "direction": "input",
+     "lower": 2.0,
+     "upper": 800.0
+    },
+    {
+     "index": 3,
+     "name": "Threshold level (dB)",
+     "type": "control",
+     "direction": "input",
+     "lower": -30.0,
+     "upper": 0.0
+    },
+    {
+     "index": 4,
+     "name": "Ratio (1:n)",
+     "type": "control",
+     "direction": "input",
+     "lower": 1.0,
+     "upper": 20.0
+    },
+    {
+     "index": 5,
+     "name": "Knee radius (dB)",
+     "type": "control",
+     "direction": "input",
+     "lower": 1.0,
+     "upper": 10.0
+    },
+    {
+     "index": 6,
+     "name": "Makeup gain (dB)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.0,
+     "upper": 24.0
+    },
+    {
+     "index": 7,
+     "name": "Amplitude (dB)",
+     "type": "control",
+     "direction": "output",
+     "lower": -40.0,
+     "upper": 12.0
+    },
+    {
+     "index": 8,
+     "name": "Gain reduction (dB)",
+     "type": "control",
+     "direction": "output",
+     "lower": -24.0,
+     "upper": 0.0
+    },
+    {
+     "index": 9,
+     "name": "Input",
+     "type": "audio",
+     "direction": "input"
+    },
+    {
+     "index": 10,
+     "name": "Output",
+     "type": "audio",
+     "direction": "output"
+    }
+   ]
+  }
+ ],
+ "fast_lookahead_limiter_1913.so": [
+  {
+   "label": "fastLookaheadLimiter",
+   "id": 1913,
+   "name": "Fast Lookahead limiter",
+   "ports": [
+    {
+     "index": 0,
+     "name": "Input gain (dB)",
+     "type": "control",
+     "direction": "input",
+     "lower": -20.0,
+     "upper": 20.0
+    },
+    {
+     "index": 1,
+     "name": "Limit (dB)",
+     "type": "control",
+     "direction": "input",
+     "lower": -20.0,
+     "upper": 0.0
+    },
+    {
+     "index": 2,
+     "name": "Release time (s)",
+     "type": "control",
+     "direction": "input",
+     "lower": 0.009999999776482582,
+     "upper": 2.0
+    },
+    {
+     "index": 3,
+     "name": "Attenuation (dB)",
+     "type": "control",
+     "direction": "output",
+     "lower": 0.0,
+     "upper": 70.0
+    },
+    {
+     "index": 4,
+     "name": "Input 1",
+     "type": "audio",
+     "direction": "input"
+    },
+    {
+     "index": 5,
+     "name": "Input 2",
+     "type": "audio",
+     "direction": "input"
+    },
+    {
+     "index": 6,
+     "name": "Output 1",
+     "type": "audio",
+     "direction": "output"
+    },
+    {
+     "index": 7,
+     "name": "Output 2",
+     "type": "audio",
+     "direction": "output"
+    },
+    {
+     "index": 8,
+     "name": "latency",
+     "type": "control",
+     "direction": "output"
+    }
+   ]
+  }
+ ]
+}

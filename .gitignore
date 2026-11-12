@@ -1,1 +1,8 @@
 __pycache__/
+# third-party plugin binaries and their downloads are never committed
+*.so
+*.so.*
+*.deb
+*.zip
+*.tar
+*.tar.*
