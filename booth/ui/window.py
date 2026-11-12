@@ -2,10 +2,8 @@
 from gi.repository import Adw, Gio, Gtk
 
 from booth.ui.camera import CameraPage
-
-
-def placeholder(title, icon):
-    return Adw.StatusPage(title=title, description="Coming soon", icon_name=icon)
+from booth.ui.headphones import HeadphonesPage
+from booth.ui.microphone import MicrophonePage
 
 
 def main_menu():
@@ -29,13 +27,17 @@ class Window(Adw.ApplicationWindow):
         self.set_size_request(360, 300)
         camera_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Ready · 2.0×"
         self.camera = CameraPage(settings, camera_node, camera_ctrls, camera_status.set_label)
+        headphones_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "Volume 63 %"
+        self.headphones = HeadphonesPage(settings, headphones_status.set_label)
+        self.connect("close-request", lambda _w: self.headphones.stop())  # stops its poll; None lets the close go on
+        self.microphone = MicrophonePage(settings)
+        self.connect("close-request", lambda _w: self.microphone.stop())
         self.pages = [
             ("Camera", "camera-web-symbolic", page("Camera", self.camera),
              camera_status),
             ("Microphone", "audio-input-microphone-symbolic",
-             page("Microphone", placeholder("Microphone", "audio-input-microphone-symbolic")), None),
-            ("Headphones", "audio-headphones-symbolic",
-             page("Headphones", placeholder("Headphones", "audio-headphones-symbolic")), None),
+             page("Microphone", self.microphone), None),
+            ("Headphones", "audio-headphones-symbolic", page("Headphones", self.headphones), headphones_status),
         ]
 
         sidebar = Gtk.ListBox(css_classes=["navigation-sidebar"])

@@ -132,5 +132,60 @@ class Replugged(unittest.TestCase):
             self.assertFalse(devices.replugged(name, event), (name, event))
 
 
+class Headset(unittest.TestCase):
+    """The PRO X: its ALSA card by name (/proc/asound/cards) and its PipeWire sink by node name (pw-dump), both live."""
+    CARDS, DUMP = read("headset/cards.txt"), read("headset/pw-dump.json")
+    SINK = "alsa_output.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.iec958-stereo"
+
+    def test_the_card_by_name_gives_its_alsa_id_not_its_number(self):
+        self.assertEqual(devices.find_card(self.CARDS, devices.PRO_X), "Headset")
+
+    def test_a_new_id_after_a_replug(self):
+        cards = self.CARDS.replace(" 1 [Headset        ]", " 7 [Headset_1      ]")
+        self.assertEqual(devices.find_card(cards, devices.PRO_X), "Headset_1")
+
+    def test_no_card(self):
+        self.assertIsNone(devices.find_card(self.CARDS.replace(devices.PRO_X, "Other Headset"), devices.PRO_X))
+        self.assertIsNone(devices.find_card("", devices.PRO_X))
+        # the name exactly: a longer one that holds it is another card
+        self.assertIsNone(devices.find_card(self.CARDS.replace(devices.PRO_X, devices.PRO_X + " 2"), devices.PRO_X))
+
+    def test_headset_card_reads_the_card_list_each_time(self):
+        lists = iter([self.CARDS, self.CARDS.replace(" 1 [Headset        ]", " 3 [Headset_1      ]"), ""])
+        read_cards = lambda path: path == devices.CARDS and next(lists)  # noqa: E731
+        self.assertEqual([devices.headset_card(read_cards) for _ in range(3)], ["Headset", "Headset_1", None])
+
+    def test_sinks_by_node_name_with_ids_and_priorities_and_the_default(self):
+        sinks, default = devices.parse_sinks(self.DUMP)
+        self.assertEqual(sinks[self.SINK], (33, 1008))
+        self.assertEqual(sinks[default], (176, 1009))
+        self.assertIn("Scarlett", default)
+        self.assertEqual(len(sinks), 3)  # sinks only: no source, no mono-fallback mic
+
+    def test_the_pro_x_sink(self):
+        sinks, _ = devices.parse_sinks(self.DUMP)
+        self.assertEqual(devices.find_sink(sinks), self.SINK)
+        self.assertIsNone(devices.find_sink({n: v for n, v in sinks.items() if n != self.SINK}))
+
+    def test_no_pipewire(self):
+        self.assertEqual(devices.parse_sinks(""), ({}, None))
+        self.assertEqual(devices.parse_sinks("{}"), ({}, None))
+
+
+class DongleAppeared(unittest.TestCase):
+    """/dev/snd/by-id events: the dongle's control link appearing (its card number is new on every replug)."""
+    DONGLE = "usb-Logitech_PRO_X_Wireless_Gaming_Headset-00"
+
+    def test_the_dongle_link_or_the_folder_appearing(self):
+        for name, event in [(self.DONGLE, "created"), (self.DONGLE, "renamed"), (self.DONGLE, "moved-in"),
+                            ("by-id", "created")]:
+            self.assertTrue(devices.dongle_appeared(name, event), (name, event))
+
+    def test_other_events_are_not(self):
+        for name, event in [(self.DONGLE, "deleted"), (self.DONGLE, "changes-done-hint"), ("by-id", "deleted"),
+                            (f"usb-Focusrite_Scarlett_Solo_4th_Gen_{FAKE_SERIAL}-00", "created")]:
+            self.assertFalse(devices.dongle_appeared(name, event), (name, event))
+
+
 if __name__ == "__main__":
     unittest.main()
