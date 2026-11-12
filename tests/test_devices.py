@@ -146,6 +146,8 @@ class Headset(unittest.TestCase):
     def test_no_card(self):
         self.assertIsNone(devices.find_card(self.CARDS.replace(devices.PRO_X, "Other Headset"), devices.PRO_X))
         self.assertIsNone(devices.find_card("", devices.PRO_X))
+        # the name exactly: a longer one that holds it is another card
+        self.assertIsNone(devices.find_card(self.CARDS.replace(devices.PRO_X, devices.PRO_X + " 2"), devices.PRO_X))
 
     def test_headset_card_reads_the_card_list_each_time(self):
         lists = iter([self.CARDS, self.CARDS.replace(" 1 [Headset", " 3 [Headset"), ""])

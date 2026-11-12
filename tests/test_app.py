@@ -496,6 +496,11 @@ class DongleReplug(unittest.TestCase):
         clock.advance(10_000)
         self.assertEqual(fixes, [400 + app.REPLUG_MS])
 
+    def test_udevs_rename_alone_fixes(self):  # the link is made under a temp name, then renamed: `other` is the new name
+        stub = mock.Mock()
+        self.event(stub, "/dev/snd/by-id/.#tmp", self.DONGLE, Gio.FileMonitorEvent.RENAMED)
+        stub.dongle.poke.assert_called_once_with()
+
     def test_another_cards_link_or_an_unplug_fixes_nothing(self):
         stub = mock.Mock()
         self.event(stub, "/dev/snd/by-id/usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00", None,
