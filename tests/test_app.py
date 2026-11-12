@@ -2,13 +2,15 @@
 --background it lives with no window and re-applies them at login and on every replug."""
 import contextlib
 import io
+import os
+import tempfile
 import threading
 import unittest
 from unittest import mock
 
 from gi.repository import Gio, GLib
 
-from booth import app, camera, service
+from booth import app, camera, service, store
 from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_service import Clock, Timers
@@ -176,6 +178,20 @@ class LaunchOffTheMainLoop(unittest.TestCase):
         self.assertIs(app.Application.on_close(stub, stub.window), False)  # False: the window does close
         self.assertIsNone(stub.window)  # so the next activate builds a new one instead of presenting a dead one
 
+    def test_with_the_unit_enabled_a_window_instance_holds_itself(self):
+        # Opened from the app grid with booth.service enabled but not running: "Run in Background" shows ON, so closing
+        # the window must leave Booth running, as the switch turned on does.
+        for enabled in (False, True):
+            stub = mock.Mock(window=None, starting=True, held=False)
+            with mock.patch.object(app, "Window"):
+                app.Application.show_window(stub, {"camera": {}}, None, {}, enabled)
+            self.assertIs(stub.held, enabled)
+            self.assertEqual(stub.hold.call_count, int(enabled))
+        stub = mock.Mock(window=None, starting=True, held=True)  # the background instance: held already
+        with mock.patch.object(app, "Window"):
+            app.Application.show_window(stub, {"camera": {}}, None, {}, True)
+        stub.hold.assert_not_called()
+
 
 def options(background):
     opts = GLib.VariantDict.new(None)
@@ -304,6 +320,58 @@ class Replug(unittest.TestCase):
             app.Application.restore_saved(stub)
         stub.window.camera.reapply.assert_called_once_with()  # one writer: no thread races the page's Setter
         thread.assert_not_called()
+
+    def test_a_held_instance_whose_window_opened_after_a_replug_restores_the_saved_values(self):
+        # The BRIO came back at its power-on defaults (zoom 100, auto exposure on); the window opened and read them
+        # before the debounced restore fired. The restore must write the saved values and leave the file as it was.
+        from booth.ui.camera import CameraPage
+        from tests.test_camera import FakeSpawn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        timers, idle, spawn = Timers(), [], FakeSpawn()
+        stub = mock.Mock(held=True)
+        stub.replug = service.Debounce(app.REPLUG_MS, lambda: app.Application.restore_saved(stub), timers.add,
+                                       timers.remove)
+        with mock.patch.dict(os.environ, XDG_CONFIG_HOME=tmp.name):
+            store.save({"version": 1, "camera": {"zoom_absolute": 250, "auto_exposure": 1}})
+            before = store.path().read_bytes()
+            self.event(stub, "/dev/v4l/by-id/.#tmp", DEV, Gio.FileMonitorEvent.RENAMED)  # the replug
+            with mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append(a)), \
+                    mock.patch.object(app.devices, "discover", return_value={"camera": DEV}), \
+                    mock.patch.object(app.service, "run", return_value=True), \
+                    mock.patch.object(camera, "read_ctrls", return_value=camera.parse_ctrls(read("brio/ctrls-index0.txt"))):
+                app.Application.start(stub, store.load())  # the window opens: it reads the defaults
+            settings, node, ctrls, _ = idle[0]
+            page = mock.Mock(ctrls=ctrls, values={n: c["value"] for n, c in ctrls.items() if "value" in c})
+            page.setter = camera.Setter(settings, node, spawn, store.save, page.values)
+            page.reapply = lambda: CameraPage.reapply(page)
+            stub.window.camera = page
+            timers.fire()  # the debounce
+            while spawn.done:
+                spawn.finish(True)
+            self.assertEqual([c[-1] for c in spawn.cmds],
+                             ["--set-ctrl=auto_exposure=1", "--set-ctrl=zoom_absolute=250"])
+            self.assertEqual(store.path().read_bytes(), before)
+        self.assertEqual((page.values["zoom_absolute"], page.values["auto_exposure"]), (250, 1))  # the page shows them
+
+    def test_a_worker_restore_waits_for_a_write_in_flight_then_goes_through_a_page_that_opened(self):
+        threads, idle, stub = [], [], mock.Mock(window=None)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()):
+            app.Application.restore_saved(stub)
+        with mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append(f)), \
+                mock.patch.object(app, "restore_camera") as restore, \
+                mock.patch.object(app.store, "load", return_value=self.SAVED) as load:
+            with app.RESTORING:  # the page's write of zoom 300 is on the camera
+                worker = threading.Thread(target=threads[0], daemon=True)
+                worker.start()
+                worker.join(0.3)
+                load.assert_not_called()  # the saved values are read once that write is done, not before
+                stub.window = mock.Mock()
+                stub.window.camera.ctrls = {camera.ZOOM: {}}  # and the window opened meanwhile
+            worker.join(5)
+        restore.assert_not_called()  # no second writer: the page's Setter restores, behind its own writes
+        self.assertEqual(idle, [stub.window.camera.reapply])
 
     def test_with_no_window_or_no_camera_on_the_page_a_worker_restores(self):
         for stub in (mock.Mock(window=None), mock.Mock()):

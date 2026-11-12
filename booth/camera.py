@@ -2,6 +2,7 @@
 commands that set them."""
 import re
 import subprocess
+import threading
 
 from booth import xu
 
@@ -188,15 +189,20 @@ def read_ctrls(device):
     return parse_ctrls(out) | xu.read(device)
 
 
+WRITING = threading.RLock()  # one camera write at a time; a restore holds it for its whole batch (app.RESTORING)
+
+
 def run(cmd):
-    """Run one set command; False when it failed (the camera was unplugged or refused the value)."""
-    try:
-        if cmd[0] == XU_CMD:
-            name, _, value = cmd[3].removeprefix("--set-ctrl=").partition("=")
-            return xu.write(cmd[2], name, int(value))
-        return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+    """Run one set command, never while another thread's write or restore is on the camera; False when it failed (the
+    camera was unplugged or refused the value)."""
+    with WRITING:
+        try:
+            if cmd[0] == XU_CMD:
+                name, _, value = cmd[3].removeprefix("--set-ctrl=").partition("=")
+                return xu.write(cmd[2], name, int(value))
+            return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
 
 
 def restore(device, saved):
@@ -230,12 +236,17 @@ class Setter:
         if not self.batch:
             self._next()
 
-    def reapply(self, ctrls, wanted):
-        """Queue the saved controls again (a replug reset the camera) at their newest `wanted` value, so a write still
-        queued or in flight is never followed by an older one. One write each, like a launch restore: a refusal skips
-        only itself."""
-        for write in restore_writes(ctrls, {n: wanted.get(n, v) for n, v in self.settings["camera"].items()}):
+    def reapply(self, ctrls):
+        """Queue the saved controls again (a replug reset the camera) → the writes. Each goes at its saved value, or at
+        a newer one still queued or in flight (not saved yet), so it never lands after that newer one; never at a value
+        merely read from the camera. One write each, like a launch restore: a refusal skips only itself."""
+        wanted = {}
+        for batch in [self.batch] + self.queue:  # oldest first: the newest value of each control wins
+            wanted.update(batch)
+        writes = restore_writes(ctrls, {n: wanted.get(n, v) for n, v in self.settings["camera"].items()})
+        for write in writes:
             self.set([write])
+        return writes
 
     def _next(self):
         if not self.batch and self.queue:

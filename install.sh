@@ -48,6 +48,8 @@ config=${XDG_CONFIG_HOME:-}
 case $config in /*) ;; *) config=$HOME/.config ;; esac
 units=$config/systemd/user
 mkdir -p "$units"
+first=  # the first install enables the unit; a re-install keeps what the "Run in background" switch chose
+[ -e "$units/booth.service" ] || first=1
 # Unit-file quoting: in a quoted word \ and " take a backslash, % is doubled and $ too. The executable is /bin/sh
 # because systemd refuses an executable path with those characters; an argument may hold anything.
 unit_arg=$(printf '%s' "$bin/booth" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
@@ -80,10 +82,15 @@ while owned; do
   sleep 0.5
   n=$((n + 1))
 done
-# restart, not start: a re-install must run the new copy.
-if ! { systemctl --user daemon-reload && systemctl --user enable booth.service && systemctl --user restart booth.service; }
-then
+state=new
+[ -n "$first" ] || state=$(systemctl --user is-enabled booth.service 2>/dev/null) || true
+# restart, not start: a re-install must run the new copy. Switched off (disabled, or unknown): load the new unit only.
+if [ "$state" != new ] && [ "$state" != enabled ]; then
+  systemctl --user daemon-reload || true
+elif ! { systemctl --user daemon-reload && { [ "$state" = enabled ] || systemctl --user enable booth.service; } &&
+         systemctl --user restart booth.service; }; then
   echo "install.sh: couldn't start booth.service; from your desktop session run: systemctl --user enable --now booth.service" >&2
 fi
 echo "Booth installed to $dest/booth; run it with: $bin/booth"
-[ -z "$stale" ] || echo "Booth is still running the old version — close it (or log out and in) to finish." >&2
+[ -z "$stale" ] ||
+  echo "Booth is still running the old version — close Booth, then run: systemctl --user restart booth.service (or log out and in)." >&2

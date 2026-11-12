@@ -18,6 +18,7 @@ def tree(root):
 
 STUB = """#!/bin/sh
 echo "${0##*/} $*" >> "$STUB_LOG"
+case $* in *is-enabled*) echo "${UNIT_STATE:-enabled}"; [ "${UNIT_STATE:-enabled}" = enabled ] || exit 1 ;; esac
 case ${0##*/} in systemctl) exit "${SYSTEMCTL_RC:-0}" ;; gdbus) [ "${GDBUS_RC:-0}" = 0 ] || exit "$GDBUS_RC" ;; esac
 case $* in *NameHasOwner*)
   if [ "$(grep -c NameHasOwner "$STUB_LOG")" -le "${OWNED_POLLS:-0}" ]; then echo "(true,)"; else echo "(false,)"; fi ;;
@@ -126,7 +127,28 @@ class Install(unittest.TestCase):
         self.assertEqual(calls.count("sleep 0.5"), 10)
         self.assertEqual(len(calls), 1 + 11 + 10 + 3)
         self.assertEqual(calls[-3:], UNIT_CALLS)
-        self.assertIn(STALE + " — close it (or log out and in) to finish.", r.stderr)
+        # nothing starts the new copy until it's gone: say how to start it then
+        self.assertIn(STALE + " — close Booth, then run: systemctl --user restart booth.service (or log out and in).",
+                      r.stderr)
+
+    def test_a_reinstall_keeps_the_service_switched_off(self):
+        self.assertEqual(self.install().returncode, 0)  # the first install enables it
+        self.env["UNIT_STATE"] = "disabled"  # then "Run in background" was switched off
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls[2:], ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload"])
+        self.assertNotIn("couldn't start", r.stderr)
+
+    def test_a_reinstall_restarts_an_enabled_service_without_enabling_it_again(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines()[2:],
+                         ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload",
+                          "systemctl --user restart booth.service"])
 
     def test_with_no_session_bus_the_restart_still_runs(self):
         self.env["GDBUS_RC"] = "1"
@@ -161,6 +183,7 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(tree(self.app), tree(REPO / "booth"))
         self.assertEqual(list(self.app.parent.iterdir()), [self.app])
+        self.assertEqual(os.listdir(self.unit.parent), ["booth.service"])  # no staged booth.service.new left behind
 
     def test_relative_xdg_data_home_is_ignored(self):
         self.env["XDG_DATA_HOME"] = "rel/share"  # invalid per the XDG spec: must not install relative to the cwd

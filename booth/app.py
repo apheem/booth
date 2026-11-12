@@ -19,7 +19,22 @@ from booth.ui.window import Window  # noqa: E402
 
 APP_ID = "io.github.apheem.Booth"
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
-RESTORING = threading.RLock()  # the startup, replug and window-open restores never interleave their writes
+RESTORING = camera.WRITING  # the startup, replug and window-open restores and the page's writes never interleave
+
+
+def camera_page(window):
+    """The open window's Camera page when it found the BRIO (its Setter is then the one camera writer), else None."""
+    page = window.camera if window is not None else None
+    return page if page is not None and camera.ZOOM in page.ctrls else None
+
+
+def restore_alone(app):
+    """A replug restore with no Camera page to do it, on a worker."""
+    with RESTORING:  # after any page write in flight, so the saved values are read as that write left them
+        if page := camera_page(app.window):  # the window opened meanwhile: its Setter restores, behind its writes
+            GLib.idle_add(page.reapply)
+            return
+        restore_camera(store.load())
 
 
 def restore_camera(settings):
@@ -83,11 +98,10 @@ class Application(Adw.Application):
             self.replug.poke()
 
     def restore_saved(self):
-        page = self.window.camera if self.window is not None else None
-        if page is not None and camera.ZOOM in page.ctrls:  # one writer: the page queues it behind its own writes
+        if page := camera_page(self.window):  # one writer: the page queues it behind its own writes
             page.reapply()
             return
-        threading.Thread(target=lambda: restore_camera(store.load()), daemon=True).start()
+        threading.Thread(target=lambda: restore_alone(self), daemon=True).start()
 
     def start(self, settings):
         node, ctrls, enabled = None, {}, False
@@ -103,6 +117,9 @@ class Application(Adw.Application):
     def show_window(self, settings, node, ctrls, enabled):
         try:
             self.run_in_background.set_state(GLib.Variant.new_boolean(enabled))
+            if enabled and not self.held:  # the switch shows ON: hold, as turning it on does (the unit isn't running)
+                self.hold()
+                self.held = True
             self.window = Window(self, settings, node, ctrls)
             self.window.connect("close-request", self.on_close)
             self.window.present()

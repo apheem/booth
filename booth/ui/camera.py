@@ -107,8 +107,10 @@ class CameraPage(Adw.PreferencesPage):
         self.refresh()
 
     def reapply(self):
-        """A replug reset the camera: send the saved controls again, at the values the page shows, behind its writes."""
-        self.setter.reapply(self.ctrls, self.values)
+        """A replug reset the camera: send the saved controls again behind the page's writes, and show them."""
+        writes = dict(self.setter.reapply(self.ctrls))
+        self.values.update(writes)  # a refused one goes back to the camera's value, as for any write
+        self.show(writes)
         self.refresh()
 
     def show(self, names):
