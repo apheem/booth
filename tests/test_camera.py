@@ -253,16 +253,23 @@ class FakeSpawn:
     def __init__(self):
         self.cmds, self.done = [], []
 
-    def __call__(self, cmd, done):
+    def __call__(self, name, cmd, done):
         self.cmds.append(cmd)
         self.done.append(done)
 
     def finish(self, ok):
-        self.done.pop(0)(ok)
+        return self.done.pop(0)(ok)
+
+
+def cmd(name, v):
+    return ["v4l2-ctl", "-d", DEV, f"--set-ctrl={name}={v}"]
 
 
 def zoom(v):
-    return ["v4l2-ctl", "-d", DEV, f"--set-ctrl=zoom_absolute={v}"]
+    return cmd("zoom_absolute", v)
+
+
+AF, FOCUS = "focus_automatic_continuous", "focus_absolute"
 
 
 class SetterTest(unittest.TestCase):
@@ -270,12 +277,12 @@ class SetterTest(unittest.TestCase):
         self.settings = {"version": 1, "camera": {}}
         self.saved = []
         self.spawn = FakeSpawn()
-        self.setter = camera.Setter(self.settings, DEV, "zoom_absolute", self.spawn,
-                                    lambda s: self.saved.append(dict(s["camera"])))
+        self.setter = camera.Setter(self.settings, DEV, self.spawn, lambda s: self.saved.append(dict(s["camera"])),
+                                    {"zoom_absolute": 100, AF: 1, FOCUS: 0})
 
     def test_one_set_in_flight_and_the_last_value_wins(self):
         for v in (200, 300, 400):
-            self.setter.set(v)
+            self.setter.set([("zoom_absolute", v)])
         self.assertEqual(self.spawn.cmds, [zoom(200)])
         self.spawn.finish(True)
         self.assertEqual(self.spawn.cmds, [zoom(200), zoom(400)])
@@ -283,13 +290,15 @@ class SetterTest(unittest.TestCase):
         self.assertEqual(self.spawn.done, [])
         self.assertEqual(self.saved, [{"zoom_absolute": 200}, {"zoom_absolute": 400}])
         self.assertEqual(self.settings["camera"], {"zoom_absolute": 400})
+        self.assertEqual(self.setter.taken["zoom_absolute"], 400)
 
     def test_a_refused_value_is_not_saved(self):
-        self.setter.set(250)
-        self.spawn.finish(False)
+        self.setter.set([("zoom_absolute", 250)])
+        self.assertEqual(self.spawn.finish(False), ["zoom_absolute"])  # the page goes back to the camera's value
         self.assertEqual((self.saved, self.settings["camera"]), ([], {}))
-        self.setter.set(260)  # a failure doesn't wedge the setter
-        self.spawn.finish(True)
+        self.assertEqual(self.setter.taken["zoom_absolute"], 100)
+        self.setter.set([("zoom_absolute", 260)])  # a failure doesn't wedge the setter
+        self.assertEqual(self.spawn.finish(True), [])
         self.assertEqual(self.saved, [{"zoom_absolute": 260}])
 
     def test_a_failed_save_does_not_wedge_the_setter(self):
@@ -297,11 +306,45 @@ class SetterTest(unittest.TestCase):
             raise OSError(28, "No space left on device")
 
         self.setter.save = save
-        self.setter.set(250)
+        self.setter.set([("zoom_absolute", 250)])
         with self.assertRaises(OSError):  # surfaced to the page, which says so
             self.spawn.finish(True)
-        self.setter.set(300)
+        self.setter.set([("zoom_absolute", 300)])
         self.assertEqual(self.spawn.cmds, [zoom(250), zoom(300)])
+
+    def test_the_manual_value_waits_for_its_auto_off(self):
+        self.setter.set([(AF, 0), (FOCUS, 40)])
+        self.assertEqual(self.spawn.cmds, [cmd(AF, 0)])  # nothing races the auto-off
+        self.setter.set([("zoom_absolute", 200)])
+        self.assertEqual(self.spawn.cmds, [cmd(AF, 0)])  # nor another control's write
+        self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [cmd(AF, 0), cmd(FOCUS, 40)])
+        self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds[-1], zoom(200))
+        self.assertEqual(self.settings["camera"], {AF: 0, FOCUS: 40})
+
+    def test_a_refused_auto_off_stops_its_batch(self):
+        self.setter.set([(AF, 0), (FOCUS, 40)])
+        self.setter.set([("zoom_absolute", 200)])
+        self.assertEqual(self.spawn.finish(False), [AF, FOCUS])  # both go back to what the camera has
+        self.assertEqual(self.spawn.cmds, [cmd(AF, 0), zoom(200)])  # the manual value is never sent
+        self.assertEqual((self.saved, self.setter.taken[AF], self.setter.taken[FOCUS]), ([], 1, 0))
+
+    def test_a_refused_value_asked_for_again_is_not_reverted(self):
+        self.setter.set([("zoom_absolute", 200)])
+        self.setter.set([("zoom_absolute", 300)])
+        self.assertEqual(self.spawn.finish(False), [])  # 300 is still coming: the page keeps showing it
+        self.assertEqual(self.spawn.cmds, [zoom(200), zoom(300)])
+
+    def test_batches_for_other_controls_do_not_collapse(self):
+        self.setter.set([("zoom_absolute", 200)])
+        self.setter.set([("pan_absolute", 0)])
+        self.setter.set([("tilt_absolute", 0)])
+        self.setter.set([])
+        for _ in range(3):
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [zoom(200), cmd("pan_absolute", 0), cmd("tilt_absolute", 0)])
+        self.assertEqual(self.spawn.done, [])
 
 
 if __name__ == "__main__":

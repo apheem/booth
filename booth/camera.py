@@ -168,29 +168,46 @@ def restore(device, saved):
 
 
 class Setter:
-    """Sets one control off the main loop and saves it. At most one set is in flight; values asked for meanwhile
-    collapse to the newest, so the last value asked for is the one applied. Only a value the camera took is saved.
-    `spawn(cmd, done)` runs `cmd` elsewhere and calls `done(ok)` back on the main loop; `save(settings)` persists."""
+    """Sets camera controls off the main loop, one write at a time through one `spawn`, and saves each value the camera
+    took (kept in `taken`). `set(writes)` queues an ordered batch [(name, value)]: a write starts only after the one
+    before it finished ok, and at the first refusal the rest of its batch is not sent, so a manual value never races
+    its auto-off. A queued batch for the same controls as the newest one collapses to the newest values (a drag sends
+    the last value asked for). `spawn(name, cmd, done)` runs `cmd` elsewhere and calls `done(ok)` back on the main
+    loop; `done` returns the names the camera did not take (refused or not sent, and not queued again), whose page
+    value should go back to `taken`. `save(settings)` persists; its OSError is raised, after the next write started."""
 
-    def __init__(self, settings, device, name, spawn, save):
-        self.settings, self.device, self.name, self.spawn, self.save = settings, device, name, spawn, save
-        self.pending, self.busy = None, False
+    def __init__(self, settings, device, spawn, save, taken):
+        self.settings, self.device, self.spawn, self.save = settings, device, spawn, save
+        self.taken, self.batch, self.queue = dict(taken), [], []
 
-    def set(self, value):
-        self.pending = value
-        if not self.busy:
+    def set(self, writes):
+        writes = list(writes)
+        if not writes:
+            return
+        if self.queue and [n for n, _ in self.queue[-1]] == [n for n, _ in writes]:
+            self.queue[-1] = writes
+        else:
+            self.queue.append(writes)
+        if not self.batch:
             self._next()
 
     def _next(self):
-        value, self.pending = self.pending, None
-        self.busy = value is not None
-        if self.busy:
-            self.spawn(set_cmd(self.device, self.name, value), lambda ok: self._done(value, ok))
+        if not self.batch and self.queue:
+            self.batch = self.queue.pop(0)
+        if self.batch:
+            name, value = self.batch[0]
+            self.spawn(name, set_cmd(self.device, name, value), self._done)
 
-    def _done(self, value, ok):
+    def _done(self, ok):
+        (name, value), *rest = self.batch
+        self.batch = rest if ok else []
+        queued = {n for batch in self.queue for n, _ in batch}
+        missed = [] if ok else [n for n, _ in [(name, value)] + rest if n not in queued]
         try:
             if ok:
-                self.settings["camera"][self.name] = value
-                self.save(self.settings)  # an OSError (disk full, read-only) is raised to the page, after _next
+                self.taken[name] = value
+                self.settings["camera"][name] = value
+                self.save(self.settings)
         finally:
             self._next()
+        return missed

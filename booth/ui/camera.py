@@ -17,7 +17,8 @@ class CameraPage(Adw.PreferencesPage):
         self.settings, self.node, self.status = settings, node, status
         self.ctrls = camera.read_ctrls(node) if node else {}
         self.values = {n: c["value"] for n, c in self.ctrls.items() if "value" in c}
-        self.rows, self.widgets, self.setters, self.errors = {}, {}, {}, {}
+        self.rows, self.widgets, self.errors, self.quiet = {}, {}, {}, False
+        self.setter = camera.Setter(settings, node, self.spawn, store.save, self.values)
         if camera.ZOOM not in self.ctrls:
             group = Adw.PreferencesGroup(title="Camera")
             group.add(Adw.ActionRow(title="BRIO not found", subtitle="Plug in the camera and reopen Booth"))
@@ -73,7 +74,6 @@ class CameraPage(Adw.PreferencesPage):
             row = Adw.ActionRow(title=title)
             row.add_suffix(scale)
             self.widgets[name] = scale.set_value
-        self.setters[name] = camera.Setter(self.settings, self.node, name, self.spawn(name), store.save)
         self.rows[name] = row
         add(row)
 
@@ -90,20 +90,32 @@ class CameraPage(Adw.PreferencesPage):
         row.add_suffix(center)
         for c in axes:
             self.widgets[c] = lambda v, c=c: self.changed(c, v)
-            self.setters[c] = camera.Setter(self.settings, self.node, c, self.spawn(c), store.save)
             self.rows[c] = row
         return row
 
     def changed(self, name, value):
+        if self.quiet:  # the page itself is moving the widget (a reset, a revert): nothing to send
+            return
         self.values[name] = value
-        for n, v in camera.changes(self.values, name):
-            self.setters[n].set(v)
+        self.setter.set(camera.changes(self.values, name))
         self.refresh()
 
     def reset(self, names):
-        for name, value in camera.defaults(self.ctrls, names):  # auto modes first
-            if name in self.widgets:
-                self.widgets[name](value)
+        writes = camera.defaults(self.ctrls, names)  # auto modes first, sent as one ordered batch
+        self.values.update(writes)
+        self.show(dict(writes))
+        self.setter.set([(n, v) for n, v in writes if n not in camera.held(self.values)])
+        self.refresh()
+
+    def show(self, names):
+        """Move the widgets of `names` to self.values without sending anything."""
+        self.quiet = True
+        try:
+            for name in names:
+                if name in self.widgets:
+                    self.widgets[name](self.values[name])
+        finally:
+            self.quiet = False
 
     def refresh(self):
         off = camera.insensitive(self.ctrls, self.values)
@@ -113,19 +125,19 @@ class CameraPage(Adw.PreferencesPage):
             row.set_subtitle(self.errors.get(row) or hint)
         self.status(camera.status(self.ctrls, self.values))
 
-    def spawn(self, name):
-        def go(cmd, done):
-            # v4l2-ctl can block for seconds on a stalled or unplugged camera: never on the main loop.
-            threading.Thread(target=lambda: GLib.idle_add(self.finished, name, camera.run(cmd), done),
-                             daemon=True).start()
-        return go
+    def spawn(self, name, cmd, done):
+        # v4l2-ctl can block for seconds on a stalled or unplugged camera: never on the main loop.
+        threading.Thread(target=lambda: GLib.idle_add(self.finished, name, camera.run(cmd), done), daemon=True).start()
 
     def finished(self, name, ok, done):
-        row = self.rows[name]
+        row, missed = self.rows[name], []
         self.errors[row] = None if ok else "The camera did not take this value"
         try:
-            done(ok)
+            missed = done(ok)
         except Exception as e:  # OSError (disk full, read-only) or anything else json.dump raises
             self.errors[row] = f"Set, but not saved: {getattr(e, 'strerror', None) or e}"
+        for n in missed:  # back to what the camera has, so held()/insensitive() decide from the camera
+            self.values[n] = self.setter.taken[n]
+        self.show(missed)
         self.refresh()
         return GLib.SOURCE_REMOVE
