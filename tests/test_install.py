@@ -1,6 +1,7 @@
 """install.sh runs against a throwaway HOME only, never the real home folder."""
 import filecmp
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -81,13 +82,35 @@ class Install(unittest.TestCase):
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(tree(self.app), tree(REPO / "booth"))
         self.assertFalse((self.home / "rel").exists())
-        self.assertIn(f'PYTHONPATH="{self.home}/.local/share/booth', self.launcher.read_text())
+        self.assertIn(f"PYTHONPATH='{self.home}/.local/share/booth", self.launcher.read_text())
 
     def test_launcher_runs_the_installed_copy(self):
         self.assertEqual(self.install().returncode, 0)
         env = {k: v for k, v in self.env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "PYTHONPATH")}
         # --help is answered before any window or display is touched.
         r = subprocess.run([str(self.launcher), "--help"], env=env, cwd=self.home, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Usage", r.stdout)
+
+    def test_a_home_with_shell_and_desktop_entry_specials(self):
+        import gi
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+        self.home = self.home.rename(self.home.parent / "my \"home\" $HOME `x` back\\slash 100%d 'q'")
+        self.env["HOME"] = str(self.home)
+        launcher = self.home / ".local/bin/booth"
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        kf = GLib.KeyFile()
+        kf.load_from_file(str(self.home / f".local/share/applications/{APP_ID}.desktop"), GLib.KeyFileFlags.NONE)
+        exec_ = kf.get_string("Desktop Entry", "Exec")
+        # The spec: in a quoted argument " ` $ \ each take a backslash; %% is a literal %, any other % a field code.
+        self.assertRegex(exec_, r'^"(?:[^"`$\\]|\\["`$\\])*"$')
+        exec_ = re.sub("%(.)", lambda m: "%" if m[1] == "%" else "<field code>", exec_)
+        self.assertEqual(GLib.shell_parse_argv(exec_)[1], [str(launcher)])
+        env = {k: v for k, v in self.env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "PYTHONPATH")}
+        r = subprocess.run([str(launcher), "--help"], env=env, cwd=self.home, capture_output=True, text=True,
                            timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Usage", r.stdout)

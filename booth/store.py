@@ -27,13 +27,20 @@ def path():
 def load(file=None):
     file = Path(file or path())
     try:
-        data = json.loads(file.read_text())
+        raw = file.read_bytes()
+    except FileNotFoundError:
+        return defaults()
+    except IsADirectoryError:
+        raw = b""  # a folder where the file goes: moved aside below, so the next save can write the file
+    except OSError:  # EIO, EACCES, EMFILE…: the file may well be fine, so it stays exactly where it is
+        return defaults()
+    try:
+        data = json.loads(raw.decode())
         camera = data.get("camera", {}) if isinstance(data, dict) else None
         if not isinstance(camera, dict) or not all(isinstance(v, int) for v in camera.values()):
             raise ValueError("not a settings object")
-    except FileNotFoundError:
-        return defaults()
-    except (ValueError, RecursionError, OSError):  # bad JSON or UTF-8, wrong shape, nested too deep, a dir, unreadable
+        json.dumps(data, indent=2)  # as save() writes it: nested too deep to save would fail every save after
+    except (ValueError, RecursionError):  # bad JSON or UTF-8, wrong shape, nested too deep
         try:
             os.replace(file, f"{file}.corrupt-{time.time_ns()}")
         except OSError:

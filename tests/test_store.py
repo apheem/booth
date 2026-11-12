@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import tempfile
@@ -95,10 +96,34 @@ class Store(unittest.TestCase):
     def test_unreadable_and_unrenamable_file_loads_defaults(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text('{"camera": {}}')
-        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")), \
+        with mock.patch.object(Path, "open", side_effect=PermissionError(13, "denied")), \
                 mock.patch("booth.store.os.replace", side_effect=PermissionError(13, "denied")):
             self.assertEqual(store.load(self.path), store.defaults())
         self.assertTrue(self.path.exists())
+
+    def test_a_read_error_leaves_the_file_exactly_where_it_is(self):
+        # EIO, EACCES (a root-owned file, a dotfiles symlink to an unreadable target), EMFILE: the file may be fine.
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('{"version": 1, "camera": {"zoom_absolute": 300}}')
+        for code in (errno.EIO, errno.EACCES, errno.EMFILE):
+            with mock.patch.object(Path, "open", side_effect=OSError(code, os.strerror(code))):
+                self.assertEqual(store.load(self.path), store.defaults(), code)
+            self.assertEqual(os.listdir(self.path.parent), ["settings.json"], code)
+            self.assertEqual(self.path.read_text(), '{"version": 1, "camera": {"zoom_absolute": 300}}', code)
+
+    def test_nested_too_deep_to_save_counts_as_corrupt(self):
+        # Loads fine, but save's json.dump(indent=2) would raise RecursionError on every save after it.
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('{"version": 1, "camera": {}, "x": ' + "[" * 1500 + "]" * 1500 + "}")
+        self.assertEqual(store.load(self.path), store.defaults())
+        self.assertFalse(self.path.exists())
+        store.save(store.defaults(), self.path)
+
+    def test_invalid_utf8_counts_as_corrupt(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(b'{"camera": {"zoom\xff": 1}}')
+        self.assertEqual(store.load(self.path), store.defaults())
+        self.assertFalse(self.path.exists())
 
     def test_missing_keys_take_defaults(self):
         self.path.parent.mkdir(parents=True)

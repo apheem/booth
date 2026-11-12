@@ -43,6 +43,6 @@ class CameraPage(Adw.PreferencesPage):
         self.row.set_subtitle("" if ok else "The camera did not take this zoom")
         try:
             done(ok)
-        except OSError as e:
-            self.row.set_subtitle(f"Zoom set, but not saved: {e.strerror or e}")
+        except Exception as e:  # OSError (disk full, read-only) or anything else json.dump raises
+            self.row.set_subtitle(f"Zoom set, but not saved: {getattr(e, 'strerror', None) or e}")
         return GLib.SOURCE_REMOVE

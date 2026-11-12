@@ -17,9 +17,11 @@ find "$dest/booth.new" -name __pycache__ -prune -exec rm -rf {} +
 rm -rf "$dest/booth"
 mv "$dest/booth.new" "$dest/booth"
 
+# Single-quoted in the launcher, each ' as '\'', so any HOME (" $ ` \ ') reaches python3 unchanged.
+dest_q=$(printf '%s' "$dest" | sed "s/'/'\\\\''/g")
 cat > "$bin/booth.new" <<EOF
 #!/bin/sh
-export PYTHONPATH="$dest\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH='$dest_q'"\${PYTHONPATH:+:\$PYTHONPATH}"
 exec python3 -P -m booth "\$@"
 EOF
 chmod 755 "$bin/booth.new"
