@@ -1,0 +1,369 @@
+numid=4,iface=CARD,name='Firmware Version'
+  ; type=INTEGER,access=r-------,values=1,min=0,max=0,step=0
+  : values=2188
+numid=5,iface=CARD,name='Minimum Firmware Version'
+  ; type=INTEGER,access=r-------,values=1,min=0,max=0,step=0
+  : values=2115
+numid=3,iface=CARD,name='USB Internal Validity'
+  ; type=BOOLEAN,access=r-------,values=1
+  : values=on
+numid=18,iface=MIXER,name='PCM 01 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=9
+numid=19,iface=MIXER,name='PCM 02 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=10
+numid=20,iface=MIXER,name='PCM 03 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=5
+numid=21,iface=MIXER,name='PCM 04 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=6
+numid=9,iface=MIXER,name='PCM Input Capture Switch'
+  ; type=ENUMERATED,access=rw------,values=1,items=2
+  ; Item #0 'Direct'
+  ; Item #1 'Mixer'
+  : values=0
+numid=16,iface=MIXER,name='DSP Input 1 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=1
+numid=17,iface=MIXER,name='DSP Input 2 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=2
+numid=6,iface=MIXER,name='Line In 1 Level Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=2
+  ; Item #0 'Line'
+  ; Item #1 'Inst'
+  : values=0
+numid=7,iface=MIXER,name='Line In 2 Air Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=3
+  ; Item #0 'Off'
+  ; Item #1 'Presence'
+  ; Item #2 'Presence + Drive'
+  : values=1
+numid=8,iface=MIXER,name='Line In 2 Phantom Power Capture Switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+numid=10,iface=MIXER,name='Analogue Output 01 Playback Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=3
+numid=11,iface=MIXER,name='Analogue Output 02 Playback Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=4
+numid=48,iface=MIXER,name='Direct Monitor Playback Switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+numid=22,iface=MIXER,name='Mix A Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=160
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=23,iface=MIXER,name='Mix A Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=24,iface=MIXER,name='Mix A Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=25,iface=MIXER,name='Mix A Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=26,iface=MIXER,name='Mix B Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=27,iface=MIXER,name='Mix B Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=160
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=28,iface=MIXER,name='Mix B Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=29,iface=MIXER,name='Mix B Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=30,iface=MIXER,name='Mix C Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=160
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=31,iface=MIXER,name='Mix C Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=32,iface=MIXER,name='Mix C Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=33,iface=MIXER,name='Mix C Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=34,iface=MIXER,name='Mix D Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=35,iface=MIXER,name='Mix D Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=160
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=36,iface=MIXER,name='Mix D Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=37,iface=MIXER,name='Mix D Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=38,iface=MIXER,name='Mix E Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=39,iface=MIXER,name='Mix E Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=40,iface=MIXER,name='Mix E Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=41,iface=MIXER,name='Mix E Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=42,iface=MIXER,name='Mix F Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=43,iface=MIXER,name='Mix F Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=44,iface=MIXER,name='Mix F Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=45,iface=MIXER,name='Mix F Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=12,iface=MIXER,name='Mixer Input 01 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=11
+numid=13,iface=MIXER,name='Mixer Input 02 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=12
+numid=14,iface=MIXER,name='Mixer Input 03 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=9
+numid=15,iface=MIXER,name='Mixer Input 04 Capture Enum'
+  ; type=ENUMERATED,access=rw------,values=1,items=13
+  ; Item #0 'Off'
+  ; Item #1 'Analogue 1'
+  ; Item #2 'Analogue 2'
+  ; Item #3 'Mix A'
+  ; Item #4 'Mix B'
+  ; Item #5 'Mix C'
+  ; Item #6 'Mix D'
+  ; Item #7 'Mix E'
+  ; Item #8 'Mix F'
+  ; Item #9 'DSP 1'
+  ; Item #10 'DSP 2'
+  ; Item #11 'PCM 1'
+  ; Item #12 'PCM 2'
+  : values=10
+numid=49,iface=MIXER,name='Monitor Mix A Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=150
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=50,iface=MIXER,name='Monitor Mix A Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=51,iface=MIXER,name='Monitor Mix A Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=52,iface=MIXER,name='Monitor Mix A Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=53,iface=MIXER,name='Monitor Mix B Input 01 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=0
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=54,iface=MIXER,name='Monitor Mix B Input 02 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=150
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=55,iface=MIXER,name='Monitor Mix B Input 03 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=56,iface=MIXER,name='Monitor Mix B Input 04 Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=1,min=0,max=184,step=1
+  : values=154
+  | dBminmax-min=-80.00dB,max=12.00dB
+numid=47,iface=MIXER,name='Sync Status'
+  ; type=ENUMERATED,access=r-------,values=1,items=2
+  ; Item #0 'Unlocked'
+  ; Item #1 'Locked'
+  : values=1
+numid=2,iface=PCM,name='Capture Channel Map'
+  ; type=INTEGER,access=r--v-R--,values=4,min=0,max=36,step=0
+  : values=0,0,0,0
+  | container
+    | chmap-fixed=FL,FR,FC,LFE
+numid=46,iface=PCM,name='Level Meter'
+  ; type=INTEGER,access=r--v----,values=12,min=0,max=4095,step=1
+  : values=0,0,0,0,0,2,0,2,0,2,0,0
+numid=1,iface=PCM,name='Playback Channel Map'
+  ; type=INTEGER,access=r--v-R--,values=2,min=0,max=36,step=0
+  : values=0,0
+  | container
+    | chmap-fixed=FL,FR
