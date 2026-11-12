@@ -104,7 +104,7 @@ class CameraPage(Adw.PreferencesPage):
         writes = camera.defaults(self.ctrls, names)  # auto modes first, sent as one ordered batch
         self.values.update(writes)
         self.show(dict(writes))
-        self.setter.set([(n, v) for n, v in writes if n not in camera.held(self.values)])
+        self.setter.set(camera.reset_batch(self.ctrls, names))
         self.refresh()
 
     def show(self, names):
@@ -136,8 +136,6 @@ class CameraPage(Adw.PreferencesPage):
             missed = done(ok)
         except Exception as e:  # OSError (disk full, read-only) or anything else json.dump raises
             self.errors[row] = f"Set, but not saved: {getattr(e, 'strerror', None) or e}"
-        for n in missed:  # back to what the camera has, so held()/insensitive() decide from the camera
-            self.values[n] = self.setter.taken[n]
-        self.show(missed)
+        self.show(camera.revert(self.values, self.setter.taken, missed))
         self.refresh()
         return GLib.SOURCE_REMOVE

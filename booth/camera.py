@@ -110,6 +110,22 @@ def defaults(ctrls, names):
     return ordered({n: ctrls[n]["default"] for n in names if n in ctrls})
 
 
+def reset_batch(ctrls, names):
+    """What ↺ sends for `names`: their defaults, auto modes first, without a manual value whose auto mode the reset
+    turns on (the driver would refuse it and stop the batch). Every manual control's auto mode is in its own group."""
+    writes = defaults(ctrls, names)
+    hold = held(dict(writes))
+    return [(n, v) for n, v in writes if n not in hold]
+
+
+def revert(values, taken, missed):
+    """Put the page's `values` of the `missed` controls back to what the camera has (`taken`), so held() and
+    insensitive() decide from the camera → the names whose widgets to move."""
+    for n in missed:
+        values[n] = taken[n]
+    return missed
+
+
 def changes(values, name):
     """What to set after `name` changed to values[name]: nothing for a manual value its auto mode holds; when an auto
     mode was just turned off, also the manual value shown, so the camera matches the page."""

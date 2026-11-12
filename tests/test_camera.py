@@ -163,6 +163,19 @@ class Model(unittest.TestCase):
         self.assertEqual(dict(image)["power_line_frequency"], 2)
         self.assertEqual(camera.defaults(self.ctrls, ["not_on_this_camera", "gain"]), [("gain", 0)])
 
+    def test_reset_sends_no_manual_value_after_its_auto_mode_goes_on(self):
+        for _, main, adv in camera.GROUPS:
+            batch = dict(camera.reset_batch(self.ctrls, main + adv))
+            for manual, (auto, off) in camera.AUTO.items():
+                if manual in batch:  # the driver refuses a manual value while its auto mode is on
+                    self.assertEqual(batch.get(auto, off), off, manual)
+        self.assertEqual(camera.reset_batch(self.ctrls, ["focus_automatic_continuous", "focus_absolute"]),
+                         [("focus_automatic_continuous", 1)])
+        image = dict(camera.reset_batch(self.ctrls, camera.GROUPS[1][1] + camera.GROUPS[1][2]))
+        self.assertNotIn("exposure_time_absolute", image)
+        self.assertNotIn("white_balance_temperature", image)
+        self.assertEqual((image["auto_exposure"], image["brightness"]), (3, 128))
+
     def test_changes_sends_the_value(self):
         self.values["brightness"] = 90
         self.assertEqual(camera.changes(self.values, "brightness"), [("brightness", 90)])
@@ -339,6 +352,23 @@ class SetterTest(unittest.TestCase):
         self.assertEqual(self.spawn.finish(False), [])  # 300 is still coming: the page keeps showing it
         self.assertEqual(self.spawn.cmds, [zoom(200), zoom(300)])
 
+    def test_a_queued_auto_off_survives_a_later_value_for_its_manual_control(self):
+        self.setter.set([("zoom_absolute", 200)])  # a write is out
+        self.setter.set([(AF, 0), (FOCUS, 40)])
+        self.setter.set([(FOCUS, 50)])
+        while self.spawn.done:
+            self.spawn.finish(True)
+        self.assertEqual(self.spawn.cmds, [zoom(200), cmd(AF, 0), cmd(FOCUS, 40), cmd(FOCUS, 50)])
+        self.assertEqual(self.settings["camera"], {"zoom_absolute": 200, AF: 0, FOCUS: 50})
+
+    def test_a_refusal_puts_the_page_values_back_to_what_the_camera_has(self):
+        values = {"zoom_absolute": 100, AF: 0, FOCUS: 40}  # the page after the user turned autofocus off
+        self.setter.set([(AF, 0), (FOCUS, 40)])
+        missed = self.spawn.finish(False)
+        self.assertEqual(camera.revert(values, self.setter.taken, missed), [AF, FOCUS])
+        self.assertEqual(values, {"zoom_absolute": 100, AF: 1, FOCUS: 0})
+        self.assertIn(FOCUS, camera.held(values))  # so the focus row is insensitive again
+
     def test_batches_for_other_controls_do_not_collapse(self):
         self.setter.set([("zoom_absolute", 200)])
         self.setter.set([])  # nothing to send (a held manual value) must not stall the queue
@@ -348,6 +378,25 @@ class SetterTest(unittest.TestCase):
             self.spawn.finish(True)
         self.assertEqual(self.spawn.cmds, [zoom(200), cmd("pan_absolute", 0), cmd("tilt_absolute", 0)])
         self.assertEqual(self.spawn.done, [])
+
+
+class PageQuietTest(unittest.TestCase):
+    """The page's own widget moves (a reset, a revert) send nothing: driven on a stub, no window."""
+
+    def test_show_moves_widgets_without_sending(self):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from booth.ui.camera import CameraPage
+
+        sent = []
+        page = mock.Mock(quiet=False, values={"zoom_absolute": 300})
+        page.setter.set = sent.append
+        page.widgets = {"zoom_absolute": lambda v: CameraPage.changed(page, "zoom_absolute", v)}  # a widget's signal
+        CameraPage.show(page, ["zoom_absolute"])
+        self.assertEqual(sent, [])
+        CameraPage.changed(page, "zoom_absolute", 250)  # the user moving it still sends
+        self.assertEqual(sent, [[("zoom_absolute", 250)]])
 
 
 if __name__ == "__main__":
