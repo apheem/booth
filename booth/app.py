@@ -1,6 +1,7 @@
 """The Booth application: a single-instance libadwaita app. Logic lives in the pure modules; this file only wires."""
 import sys
 import threading
+import traceback
 
 import gi
 
@@ -45,9 +46,14 @@ class Application(Adw.Application):
             GLib.idle_add(self.show_window, settings, node, ctrls)
 
     def show_window(self, settings, node, ctrls):
-        self.window = Window(self, settings, node, ctrls)
-        self.window.present()
-        self.release()
+        try:
+            self.window = Window(self, settings, node, ctrls)
+            self.window.present()
+        except Exception:  # no window: release lets Booth exit instead of living on with nothing to show
+            traceback.print_exc()
+        finally:
+            self.starting = False
+            self.release()
         return GLib.SOURCE_REMOVE
 
 

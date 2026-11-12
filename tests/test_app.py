@@ -69,5 +69,24 @@ class LaunchOffTheMainLoop(unittest.TestCase):
         self.assertEqual(idle, [(stub.show_window, ({"version": 1, "camera": {}}, None, {}))])
 
 
+    def test_activate_again_presents_the_open_window_and_builds_no_second(self):
+        threads, stub = [], mock.Mock(window=mock.Mock(), starting=False)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app, "Window") as window:
+            app.Application.do_activate(stub)
+        stub.window.present.assert_called_once_with()
+        window.assert_not_called()
+        stub.hold.assert_not_called()
+        self.assertEqual(threads, [])
+
+    def test_a_window_that_fails_to_build_releases_the_app_and_prints_why(self):
+        stub, err = mock.Mock(window=None, starting=True), io.StringIO()
+        with mock.patch.object(app, "Window", side_effect=RuntimeError("no display")), contextlib.redirect_stderr(err):
+            self.assertEqual(app.Application.show_window(stub, {"camera": {}}, None, {}), app.GLib.SOURCE_REMOVE)
+        stub.release.assert_called_once_with()
+        self.assertIs(stub.starting, False)  # the next launch's activate tries again
+        self.assertIsNone(stub.window)
+        self.assertIn("no display", err.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

@@ -135,11 +135,13 @@ def revert(values, taken, missed):
     return missed
 
 
-def changes(values, name):
-    """What to set after `name` changed to values[name]: nothing for a manual value its auto mode holds; when an auto
-    mode was just turned off, also the manual value shown, so the camera matches the page."""
+def changes(ctrls, values, name):
+    """What to set after `name` changed to values[name]: nothing for a manual value its auto mode holds, or for a menu
+    value the menu lacks ("Unknown (n)" is shown, never sent or saved); when an auto mode was just turned off, also the
+    manual value shown, so the camera matches the page."""
     hold = held(values)
-    sends = [] if name in hold else [(name, values[name])]
+    unknown = "menu" in ctrls.get(name, {}) and values[name] not in ctrls[name]["menu"]
+    sends = [] if name in hold or unknown else [(name, values[name])]
     return sends + [(m, values[m]) for m, (auto, _) in AUTO.items() if auto == name and m in values and m not in hold]
 
 

@@ -96,7 +96,7 @@ class CameraPage(Adw.PreferencesPage):
         if self.quiet:  # the page itself is moving the widget (a reset, a revert): nothing to send
             return
         self.values[name] = value
-        self.setter.set(camera.changes(self.values, name))
+        self.setter.set(camera.changes(self.ctrls, self.values, name))
         self.refresh()
 
     def reset(self, names):

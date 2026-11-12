@@ -227,23 +227,29 @@ class Model(unittest.TestCase):
 
     def test_changes_sends_the_value(self):
         self.values["brightness"] = 90
-        self.assertEqual(camera.changes(self.values, "brightness"), [("brightness", 90)])
+        self.assertEqual(camera.changes(self.ctrls, self.values, "brightness"), [("brightness", 90)])
 
     def test_changes_holds_a_manual_value_while_auto_is_on(self):
         self.values["exposure_time_absolute"] = 400
-        self.assertEqual(camera.changes(self.values, "exposure_time_absolute"), [])
+        self.assertEqual(camera.changes(self.ctrls, self.values, "exposure_time_absolute"), [])
 
     def test_turning_auto_off_sends_the_manual_value_shown(self):
         self.values.update(focus_automatic_continuous=0, focus_absolute=40)
-        self.assertEqual(camera.changes(self.values, "focus_automatic_continuous"),
+        self.assertEqual(camera.changes(self.ctrls, self.values, "focus_automatic_continuous"),
                          [("focus_automatic_continuous", 0), ("focus_absolute", 40)])
         self.values["focus_automatic_continuous"] = 1
-        self.assertEqual(camera.changes(self.values, "focus_automatic_continuous"),
+        self.assertEqual(camera.changes(self.ctrls, self.values, "focus_automatic_continuous"),
                          [("focus_automatic_continuous", 1)])
+
+    def test_a_value_the_menu_lacks_is_shown_but_never_sent(self):  # "Unknown (4)": an undocumented XU byte
+        ctrls = brio()
+        for n, v in (("led_mode", 4), ("fov", 7), ("power_line_frequency", 9)):
+            self.assertEqual(camera.changes(ctrls, {**self.values, n: v}, n), [], n)
+        self.assertEqual(camera.changes(ctrls, {**self.values, "led_mode": 0}, "led_mode"), [("led_mode", 0)])
 
     def test_pan_is_sent_at_1x(self):  # disabled in the UI, but a reset still centers it
         self.values["pan_absolute"] = 0
-        self.assertEqual(camera.changes(self.values, "pan_absolute"), [("pan_absolute", 0)])
+        self.assertEqual(camera.changes(self.ctrls, self.values, "pan_absolute"), [("pan_absolute", 0)])
 
     def test_nudge_pan_and_tilt_one_step_within_range(self):
         pan = self.ctrls["pan_absolute"]
@@ -481,7 +487,7 @@ class PageQuietTest(unittest.TestCase):
         from booth.ui.camera import CameraPage
 
         sent = []
-        page = mock.Mock(quiet=False, values={"zoom_absolute": 300})
+        page = mock.Mock(quiet=False, values={"zoom_absolute": 300}, ctrls=brio())
         page.setter.set = sent.append
         page.widgets = {"zoom_absolute": lambda v: CameraPage.changed(page, "zoom_absolute", v)}  # a widget's signal
         CameraPage.show(page, ["zoom_absolute"])
