@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from booth import camera, devices, headset, monitor, mute, routing, service, store, voice  # noqa: E402
+from booth import camera, devices, headset, monitor, mute, routing, service, stereo, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
 APP_ID = service.APP_ID
@@ -196,10 +196,11 @@ class Application(Adw.Application):
 
     def sync_voice(self):
         """Booth Mic's config up to date with the Scarlett and its service started, then processed monitoring as its
-        switch says (amixer, pw-dump, systemctl: off the main loop)."""
+        switch says, then Booth Stereo (amixer, pw-dump, systemctl: off the main loop)."""
         def sync():
             voice.sync(self.settings)
             monitor.sync(self.settings, on=self.headset_monitor.on)
+            stereo.sync(self.settings)
         threading.Thread(target=sync, daemon=True).start()
 
     def watch_mute(self):
@@ -277,7 +278,10 @@ class Application(Adw.Application):
             try:  # monitoring back after Booth Mic or the PRO X dongle came back, window or not
                 monitor.sync(self.settings, on=self.headset_monitor.on)  # paused while the PRO X is off
             finally:
-                self.healing = False
+                try:  # Booth Stereo (#19) back after Booth Mic or its source came back; it follows a new source
+                    stereo.sync(self.settings)
+                finally:
+                    self.healing = False
 
     def low_battery(self, percent):
         note = Gio.Notification.new("Headset battery low")

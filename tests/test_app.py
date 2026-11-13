@@ -362,6 +362,22 @@ class BackgroundLaunch(unittest.TestCase):
         sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)
         self.assertFalse(stub.healing)
 
+    def test_booth_stereo_is_started_at_start_and_brought_back_every_heal_tick_off_the_main_loop(self):  # #19
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync"), mock.patch.object(app.monitor, "sync"), \
+                mock.patch.object(app.voice, "heal", side_effect=OSError("boom")), \
+                mock.patch.object(app.stereo, "sync") as sync:
+            app.Application.sync_voice(stub)
+            app.Application.heal_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+            with self.assertRaises(OSError):  # Booth Mic's heal failed: Booth Stereo is still looked after
+                threads[1]()
+        self.assertEqual(sync.call_args_list, [mock.call(stub.settings)] * 2)
+        self.assertFalse(stub.healing)
+
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
         threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False, mic={})
         stub.heal_once = lambda: app.Application.heal_once(stub)

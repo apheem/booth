@@ -17,14 +17,19 @@ knob at once; a knob moved after shows Custom) is saved and applied live to Boot
 (voice.Throttle: about 20 set-params a second, the last change always lands); each poll also brings Booth Mic's config
 up to date with the mic it found (a no-op when nothing changed) and checks the plugins: a stage whose plugin is missing
 or changed says so, greyed out, and is bypassed. Last, processed monitoring's switch (booth.monitor),
-saved and handed to monitor.sync off the main loop."""
+saved and handed to monitor.sync off the main loop.
+
+Then Booth Stereo (booth.stereo, #19): the voice's side, the other side's source (the dropdown lists what the last
+stereo.sync found, and a saved source that is away stays chosen) and the privacy note. A change is saved and handed to
+stereo.sync off the main loop, which restarts only Booth Stereo; every voice change is synced to it too (its own chain,
+live)."""
 import functools
 import threading
 import types
 
 from gi.repository import Adw, GLib, Gtk
 
-from booth import headset, meter, monitor, routing, scarlett, store, voice
+from booth import headset, meter, monitor, routing, scarlett, stereo, store, voice
 from booth.ui.levelmeter import LevelMeter
 
 POLL_S = 2
@@ -35,6 +40,8 @@ AUTO = "Booth turns it back off when the headset is on again"
 MISSING = "Plugin missing or changed, so it is bypassed: run ./install.sh again"
 PENDING = "Plugin installed: it loads when Booth Mic restarts, bypassed until then"  # verified, not in the running chain
 PRESET = "Sets every stage at once"
+SIDES = ["Left", "Right"]  # Booth Stereo's voice side, in stereo.SIDES' order
+SIDE = "Your processed voice; the other side carries the source below"
 PRESETS = list(voice.PRESETS) + ["Custom"]  # Custom: what no preset matches, never applied
 # Each stage's rows (voice.STAGES's keys and "tone"): title, subtitle.
 STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room between words"),
@@ -144,9 +151,21 @@ class MicrophonePage(Adw.PreferencesPage):
                     self.voice.add(knob.row)
             self.voice.add(stage.details)
         self.voice.add(self.monitoring)
+        self.stereo = Adw.PreferencesGroup(title="Booth Stereo")
+        self.stereo.set_description(stereo.NOTE)  # privacy: the voice while Booth Mic is muted, the computer's sound
+        self.side = Adw.ComboRow(title="Voice On", subtitle=SIDE, model=Gtk.StringList.new(SIDES))
+        self.side.set_selected(list(stereo.SIDES).index(stereo.sides(settings)[0]))
+        self.side.connect("notify::selected", self.on_side)
+        self.other = Adw.ComboRow(title="Other Side")
+        self.other.connect("notify::selected", self.on_other)
+        self.other_items, self.stereo_unsaved = None, ""  # the dropdown's (value, label)s; a save that failed
+        self.show_sources()
+        self.stereo.add(self.side)
+        self.stereo.add(self.other)
         self.add(self.levels)
         self.add(self.group)
         self.add(self.voice)
+        self.add(self.stereo)
         self.poll()
         self.timer = GLib.timeout_add_seconds(POLL_S, self.poll)
 
@@ -199,6 +218,8 @@ class MicrophonePage(Adw.PreferencesPage):
         self.meter_update()
         self.voice.set_description(voice.describe(state, selecting, said, running, source))
         self.show_monitoring(monitor.LAST)  # the latest sync, the switch's or a heal tick's
+        self.show_sources()
+        self.show_stereo(stereo.LAST)
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
             ctrls = state["ctrls"] if state else {}
@@ -311,6 +332,41 @@ class MicrophonePage(Adw.PreferencesPage):
         """What isn't as switched (waiting, not started…) first, then a save that failed, else the label."""
         self.monitoring.set_subtitle(monitor.problem(said) or self.monitor_unsaved or monitor.LABEL)
 
+    def show_sources(self):
+        """The dropdown from the sources the last stereo.sync found, the saved one selected; shown, never written."""
+        items = stereo.choices(self.settings, stereo.SOURCES)
+        quiet, self.quiet = self.quiet, True
+        if items != self.other_items:
+            self.other_items = items
+            self.other.set_model(Gtk.StringList.new([label for _value, label in items]))
+        self.other.set_selected([v for v, _label in items].index(self.settings["voice"].get("stereo_source",
+                                                                                        stereo.SCARLETT)))
+        self.quiet = quiet
+
+    def on_side(self, row, _param):
+        if not self.quiet and row.get_selected() < len(SIDES):
+            self.stereo_change("stereo_side", list(stereo.SIDES)[row.get_selected()])
+
+    def on_other(self, row, _param):
+        if not self.quiet and row.get_selected() < len(self.other_items):
+            self.stereo_change("stereo_source", self.other_items[row.get_selected()][0])
+
+    def stereo_change(self, key, value):
+        """Saved, then stereo.sync restarts Booth Stereo (only it) off the main loop; what it did is said."""
+        self.settings["voice"][key] = value
+        try:
+            store.save(self.settings)
+            self.stereo_unsaved = ""
+        except OSError as e:  # applied anyway: the user must know it won't last
+            self.stereo_unsaved = f"Set, but not saved: {e.strerror or e}"
+        self.show_stereo(None)
+        threading.Thread(target=lambda: GLib.idle_add(self.show_stereo, stereo.sync(self.settings)),
+                         daemon=True).start()
+
+    def show_stereo(self, said):
+        """A save that failed first, else what the other side carries or why it is silent (stereo.sync's)."""
+        self.other.set_subtitle(self.stereo_unsaved or said)
+
     def on_input(self, row, _param):
         self.settings["microphone"]["input"] = list(scarlett.INPUTS)[row.get_selected()]
         try:  # on the main loop, like the other pages' saves of the same dict
@@ -388,6 +444,7 @@ class MicrophonePage(Adw.PreferencesPage):
         row, said = self.voice_row, voice.apply(self.settings, None)
         if said.startswith("not "):  # not recorded: the next poll's apply tries again
             GLib.idle_add(row.set_subtitle, f"Set, but {said}")
+        GLib.idle_add(self.show_stereo, stereo.sync(self.settings))  # Booth Stereo's own chain, live too
 
     def spawn(self, make, done):
         threading.Thread(target=lambda: self.write(make, done), daemon=True).start()
