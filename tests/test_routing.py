@@ -105,12 +105,35 @@ class Rules(unittest.TestCase):
                                       event(True, default=SCARLETT, prox=None, direct=True, final=True)),
                          ({}, [("direct", False), ("notify", routing.NO_PROX)]))
 
-    def test_direct_monitor_to_put_back_is_dropped_at_the_cap_and_at_the_next_off(self):  # one move cycle only
-        self.assertEqual(routing.next({"direct": False}, event(True, scarlett=None, direct=None, final=True)), ({}, []))
-        self.assertEqual(routing.next({"direct": False}, event(False, default=HDMI, direct=True)), ({}, []))
-        # turned on by hand since: a new move takes it as it is, and never turns it off later
-        self.assertEqual(routing.next({"direct": False}, event(False, direct=True)),
-                         ({"moved": True, "direct": True}, [("default", SCARLETT), ("notify", routing.MOVED)]))
+    def test_direct_monitor_to_put_back_is_kept_while_the_scarlett_is_gone(self):  # never dropped while it can't be read
+        owed, gone = {"direct": False}, {"scarlett": None, "direct": None}
+        self.assertEqual(routing.next(owed, event(True, final=True, **gone)), (owed, []))  # past the cap
+        self.assertEqual(routing.next(owed, event(False, **gone)), (owed, [("notify", routing.NO_SCARLETT)]))
+        self.assertEqual(routing.next(owed, event(False, default=HDMI, **gone)), (owed, []))
+        # the Scarlett's sink back before its controls can be read: the move keeps the value to put back
+        self.assertEqual(routing.next(owed, event(False, direct=None)),
+                         ({"direct": False, "moved": True}, [("default", SCARLETT), ("notify", routing.MOVED)]))
+
+    def test_an_off_with_direct_monitor_to_put_back_puts_it_back_first(self):  # Booth's own never taken as the user's
+        owed = {"direct": False}
+        self.assertEqual(routing.next(owed, event(False, default=HDMI, direct=True)), ({}, [("direct", False)]))
+        self.assertEqual(routing.next(owed, event(False, default=HDMI)), ({}, []))  # off by hand meanwhile: resolved
+        self.assertEqual(routing.next(owed, event(False, direct=True)),
+                         ({"moved": True, "direct": False},
+                          [("direct", False), ("default", SCARLETT), ("direct", True), ("notify", MOVED_DIRECT)]))
+
+    def test_an_off_never_carries_a_record_that_is_neither_a_move_nor_owed(self):  # e.g. a hand-edited settings file
+        self.assertEqual(routing.next({"direct": True}, event(False)), routing.next({}, event(False)))
+
+    def test_the_tick_puts_direct_monitor_back_once_it_can_be_read(self):
+        def tick(direct):
+            return {"kind": "direct", "final": True, "default": PROX, "prox": PROX, "scarlett": SCARLETT,
+                    "direct": direct, "auto": True}
+        self.assertEqual(routing.next({"direct": False}, tick(True)), ({}, [("direct", False)]))
+        self.assertEqual(routing.next({"direct": False}, tick(False)), ({}, []))
+        self.assertEqual(routing.next({"direct": False}, tick(None)), ({"direct": False}, []))
+        for state in ({}, {"moved": True, "direct": False}):  # nothing owed, or the next "on" puts it back
+            self.assertEqual(routing.next(state, tick(True)), (state, []))
 
     def test_on_while_the_scarlett_is_gone_returns_to_the_prox_and_keeps_direct_monitor_to_put_back(self):
         # its name stays the configured default; Direct Monitor can't be read, so its previous value is kept
@@ -363,6 +386,75 @@ class Executor(unittest.TestCase):
         self.assertEqual(self.settle(ex), 6)
         self.assertEqual(self.notes, ["Sound routing gave up: switching Direct Monitor kept failing"])
         self.assertEqual((ex.state, self.saved), ({}, [{}]))
+
+    def unplug(self, ex, configured):
+        """The Scarlett gone: no card, no sink; Direct Monitor kept on across the unplug, as Booth left it."""
+        objects = [o for o in json.loads(dump(configured, PROX)) if "Focusrite" not in json.dumps(o.get("info") or {})]
+        self.run.pw, self.run.direct, ex.card = json.dumps(objects), "on", lambda: None
+
+    def plug(self, ex):
+        self.run.pw, ex.card = dump(), lambda: "Gen"
+
+    def off_then_on_without_the_scarlett(self):
+        ex = self.executor(dump())
+        ex.listener("off")
+        ex.step(ex.events.get_nowait())
+        self.unplug(ex, SCARLETT)
+        ex.listener("on")
+        ex.step(ex.events.get_nowait())
+        self.assertEqual((self.notes[-1], ex.state), (routing.BACK, {"direct": False}))
+        return ex
+
+    def assert_put_back_on_return(self, ex):
+        self.assertEqual(ex.state, {"direct": False})
+        writes = len(self.run.writes)
+        self.plug(ex)
+        self.assertEqual(self.settle(ex), 1)  # the next tick
+        self.assertEqual(self.run.writes[writes:],
+                         [["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch", "off"]])
+        self.assertEqual((ex.state, self.saved[-1]), ({}, {}))
+        self.run.direct = "on"  # turned on by hand later: never turned off by Booth
+        self.assertEqual((self.settle(ex), len(self.run.writes)), (0, writes + 1))
+
+    def test_direct_monitor_is_put_back_when_the_scarlett_returns_after_the_cap(self):
+        ex = self.off_then_on_without_the_scarlett()
+        self.assertEqual(self.settle(ex), 6)  # the cap passes with the Scarlett gone: no tick while it is
+        self.assert_put_back_on_return(ex)
+
+    def test_direct_monitor_is_put_back_when_the_scarlett_returns_after_more_transitions(self):
+        ex = self.off_then_on_without_the_scarlett()
+        self.unplug(ex, PROX)
+        for name in ("off", "on", "off"):  # moves nothing and keeps the record
+            ex.listener(name)
+            ex.step(ex.events.get_nowait())
+        self.assertEqual(self.notes[-1], routing.NO_SCARLETT)
+        self.assert_put_back_on_return(ex)
+
+    def test_an_off_after_the_scarlett_returned_puts_direct_monitor_back_before_its_move(self):
+        ex = self.off_then_on_without_the_scarlett()
+        self.plug(ex)
+        ex.listener("off")
+        ex.step(ex.events.get_nowait())
+        dm = ["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch"]
+        self.assertEqual(self.run.writes[-3:], [dm + ["off"], ["wpctl", "set-default", "176"], dm + ["on"]])
+        self.assertEqual((self.notes[-1], ex.state), (MOVED_DIRECT, {"moved": True, "direct": False}))
+
+    def test_a_record_with_the_scarlett_present_resolves_at_the_first_tick(self):  # e.g. saved before a restart
+        for failing, notes in (((), []), (("amixer",), ["Sound routing gave up: switching Direct Monitor kept failing"])):
+            ex = self.executor(dump(PROX, PROX), {"direct": False}, failing=failing)
+            self.run.direct = "on"
+            self.assertEqual(self.settle(ex), 1)
+            self.assertEqual(self.run.writes,
+                             [["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch", "off"]])
+            self.assertEqual((self.notes, ex.state, self.saved), (notes, {}, [{}]))
+
+    def test_a_put_back_tick_never_stops_the_headsets_retries(self):
+        objects = [o for o in json.loads(dump(SCARLETT, SCARLETT)) if "Logitech" not in json.dumps(o.get("info") or {})]
+        ex = self.executor(json.dumps(objects), {"moved": True})
+        ex.listener("on")
+        ex.step(ex.events.get_nowait())
+        ex.step({"kind": "direct", "final": True})
+        self.assertTrue(ex.pending)
 
     def test_pw_dump_unknown_for_the_whole_cap_stops_retrying(self):
         ex = self.executor("")

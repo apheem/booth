@@ -17,10 +17,13 @@ nothing, and on returns output only when a move is saved (Booth moved it before 
 
 state: the record in settings["routing"], {} or {"moved": True, "direct": Direct Monitor's value before the move,
   absent when Booth didn't own it}, or {"direct": False} once output is back but the Scarlett is gone, until Direct
-  Monitor can be put back. A record lives for one move cycle: it is honoured at the first "on" (or the Scarlett back
-  within the cap) and dropped at the cap or the next "off". next() never changes the dict it is given.
-event: {"kind": "headset", "on": bool, "final": bool when the last retry} | observe(): the facts read just before it,
-  with "auto": the user's Direct Monitor setting.
+  Monitor can be put back. A move's record lives for one move cycle, honoured at the first "on". The {"direct": False}
+  one is never dropped while Direct Monitor can't be read (no cap, kept through later "off"s and "on"s): it is resolved
+  the first time it can be, by the 10 s tick's "direct" event or an "off" (put back first, then the off rule), and then
+  it is gone, so a Direct Monitor turned on by hand later stands. next() never changes the dict it is given.
+event: {"kind": "headset", "on": bool, "final": bool when the last retry} or {"kind": "direct", "final": True} (the tick
+  while Direct Monitor is owed and the Scarlett's card is there) | observe(): the facts read just before it, with
+  "auto": the user's Direct Monitor setting.
 actions: ("default", sink node name), ("direct", bool), ("notify", text), in the order to run.
 A new event (#20: the Scarlett or a mic gone or back) is a new kind with its function in RULES and its facts in
 observe(); the headset's rule doesn't change."""
@@ -43,10 +46,18 @@ GAVE_UP = "Sound routing gave up: {} kept failing"
 TRIES = 6  # retries after a transition, one per 10 s tick: then the last event gives up
 
 
+def _owed(state):
+    """Output is back but Direct Monitor isn't: Booth turned it on and the Scarlett was gone to put it back."""
+    return state.get("direct") is False and not state.get("moved")
+
+
 def _headset(state, e):
     default, final = e["default"] or "", e.get("final", False)
     if not e["on"]:
-        kept = state if state.get("moved") else {}  # this move cycle's record (a restart while moved), never an older one
+        if _owed(state) and e["direct"] is not None:  # put back first: Booth's own is never taken as the user's value
+            new, actions = _headset({}, e | {"direct": False})
+            return new, ([("direct", False)] if e["direct"] else []) + actions
+        kept = state if state.get("moved") or _owed(state) else {}  # this cycle's record, or one still owed
         if devices.PRO_X_USB not in default:  # not playing on the headset: whatever the user chose stands
             return kept, []
         if e["scarlett"] is None:
@@ -63,7 +74,7 @@ def _headset(state, e):
     if state.get("direct") is False:  # put back at once, never waiting for the PRO X sink
         if e["direct"]:  # still on, as Booth left it
             actions.append(("direct", False))
-        elif e["direct"] is None and not final:  # the Scarlett gone: kept until it is back, within the cap
+        elif e["direct"] is None:  # the Scarlett gone: kept until it is back, past the cap (the tick checks)
             new["direct"] = False
     # still where Booth put it (the Scarlett's name stays configured when it is unplugged)
     if state.get("moved") and default.startswith(SINK):
@@ -75,7 +86,14 @@ def _headset(state, e):
     return new, actions
 
 
-RULES = {"headset": _headset}
+def _direct(state, e):
+    """The tick while Direct Monitor is owed and the Scarlett is back: put it back if still on, then the record is gone."""
+    if not _owed(state) or e["direct"] is None:
+        return state, []
+    return {}, [("direct", False)] if e["direct"] else []
+
+
+RULES = {"headset": _headset, "direct": _direct}
 
 
 def next(state, event):
@@ -133,6 +151,8 @@ class Executor:
         if self.pending:
             self.pending, self.tries = False, self.tries + 1
             self.events.put(self.last | {"final": True} if self.tries >= TRIES else self.last)
+        elif _owed(self.state) and self.card():  # no cap: once the Scarlett is back; a failed write gives up at once
+            self.events.put({"kind": "direct", "final": True})
         return True
 
     def _work(self):
@@ -148,8 +168,9 @@ class Executor:
         ctrls = scarlett.parse_contents(self.run("amixer", "-c", card, "contents")) if card else {}
         dump = self.run("pw-dump")
         sinks, _ = devices.parse_sinks(dump)
-        final = event.get("final", False)
-        self.pending = not final  # the last retry gives up, settled or not
+        final, headset = event.get("final", False), event["kind"] == "headset"  # a put-back tick leaves the retries be
+        if headset:
+            self.pending = not final  # the last retry gives up, settled or not
         if not sinks:  # pw-dump failed or PipeWire not up yet (login): unknown, not "not the PRO X"
             return
         before, quiet, direct_on = self.state, False, False
@@ -176,7 +197,8 @@ class Executor:
                     state = {"direct": before.get("direct")} | state  # not put back: still Booth's to put back
             elif not quiet:
                 self.notify(value if direct_on else value.removesuffix(DIRECT_ON))  # only what happened
-        self.pending = event["on"] and bool(state)  # at the final retry the rules keep nothing
+        if headset:  # after the final retry only Direct Monitor can be left owed: the tick has it
+            self.pending = event["on"] and bool(state) and not final
         if state != self.state:
             self.state = state
             self.save(state)
