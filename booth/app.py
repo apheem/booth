@@ -83,6 +83,7 @@ class Application(Adw.Application):
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.snd_monitor, self.dongle, self.healing = None, None, False
+        self.mic, self.mic_source, self.mic_poke = {}, voice.SCARLETT, None  # #20: the mic rule's state, what it said
         self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # watch() subscribes the routing
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
@@ -128,6 +129,9 @@ class Application(Adw.Application):
         self.snd_monitor = Gio.File.new_for_path(devices.SND_BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES,
                                                                                        None)
         self.snd_monitor.connect("changed", self.on_snd_by_id)
+        # Booth Mic's mic fallback (#20) within seconds, not at the next tick: a heal once a sound card's (the
+        # Scarlett's, the BRIO's, the dongle's) burst of links settles, or the PRO X turns on or off
+        self.mic_poke = service.Debounce(REPLUG_MS, self.heal_voice, GLib.timeout_add, GLib.source_remove)
         self.fix_headset()
         self.sync_voice()
         # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
@@ -135,6 +139,7 @@ class Application(Adw.Application):
         self.routing = routing.Executor(self.settings, lambda text: GLib.idle_add(self.routed, text),
                                         lambda state: on_main(self.save_routing, state))
         self.headset_monitor.listeners.append(self.routing.listener)
+        self.headset_monitor.listeners.append(self.on_headset)
         self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
         GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
         GLib.timeout_add_seconds(BATTERY_S, self.routing.retry)  # a rule not settled yet (the PRO X sink not back) again
@@ -155,6 +160,12 @@ class Application(Adw.Application):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file  # as in on_by_id
         if devices.dongle_appeared(entry.get_basename(), event.value_nick):
             self.dongle.poke()
+        if event.value_nick in ("created", "deleted", "moved-in", "moved-out", "renamed"):  # a mic may be back or gone
+            self.mic_poke.poke()
+
+    def on_headset(self, event):
+        if event in ("on", "off"):  # the PRO X mic is a backup only while the headset is on
+            self.mic_poke.poke()
 
     def fix_headset(self):
         threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
@@ -175,7 +186,13 @@ class Application(Adw.Application):
 
     def heal_once(self):
         try:
-            voice.heal(self.settings)
+            voice.heal(self.settings, on=lambda: self.headset_monitor.on is True)
+            source = voice.CHOSEN if voice.running() else routing.DOWN
+            self.mic, actions = routing.next(self.mic, {"kind": "mic", "source": source})
+            if "seen" in self.mic:  # a change seen once: looked at again once things settle, not at the next tick
+                GLib.idle_add(self.mic_poke.poke)
+            if actions:
+                GLib.idle_add(self.mic_moved, actions)
         finally:
             try:  # monitoring back after Booth Mic or the PRO X dongle came back, window or not
                 monitor.sync(self.settings)
@@ -189,6 +206,18 @@ class Application(Adw.Application):
 
     def routed(self, text):
         self.send_notification("routing", Gio.Notification.new(text))  # one id: the newest replaces the last
+        return GLib.SOURCE_REMOVE
+
+    def mic_moved(self, actions):
+        """The mic rule's actions, on the main loop: the notification (one id: the newest replaces the last), then the
+        source for the sidebar and the Microphone page's banner, now and in a window opened later."""
+        for kind, value in actions:
+            if kind == "notify":
+                self.send_notification("booth-mic", Gio.Notification.new(value))
+            else:
+                self.mic_source = value
+                if self.window is not None:
+                    self.window.show_mic(value, True)
         return GLib.SOURCE_REMOVE
 
     def save_routing(self, state):

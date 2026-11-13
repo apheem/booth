@@ -84,8 +84,9 @@ def routing(ctrls):
     return found
 
 
-def _source(dump):
-    """`pw-dump` JSON → (the Scarlett capture node's name, its channel positions), or (None, [])."""
+def _source(dump, prefix=SOURCE):
+    """`pw-dump` JSON → (the capture node's name, the Scarlett's or the first whose name starts with `prefix`, its
+    channel positions), or (None, [])."""
     try:
         objects = json.loads(dump)
     except ValueError:
@@ -94,7 +95,7 @@ def _source(dump):
         props = (o.get("info") or {}).get("props") or {}
         name = props.get("node.name") or ""
         if (o.get("type") == "PipeWire:Interface:Node" and props.get("media.class") == "Audio/Source"
-                and name.startswith(SOURCE)):
+                and name.startswith(prefix)):
             return name, str(props.get("audio.position") or "").split(",")
     return None, []
 

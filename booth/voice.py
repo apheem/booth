@@ -11,8 +11,12 @@ WirePlumber destroys it instead of moving it to another mic, Booth Mic carries s
 heal() restarts it once the Scarlett is back. With the Scarlett there but the mic on no capture channel (rerouted to the
 computer's playback or a mix) the selector is stopped and its config removed: Booth Mic never carries what the mic's old
 channel carries now. heal() reads the Scarlett's routing and node every 10 s, so it follows a reroute, a renamed node
-(a fast replug, a profile switch) and a login race with only the background Booth running. #20's fallback changes only
-the selector's target and positions.
+(a fast replug, a profile switch) and a login race with only the background Booth running.
+Fallback (#20): with the Scarlett gone from ALSA and PipeWire, heal() moves the selector to a backup mic, the PRO X mic
+while the headset is on, else the BRIO's, each found by name and taken at its own first discovered position, and back
+to the Scarlett when it returns (choose()). apply() stays the one writer of the selector; only the selector restarts, so
+Booth Mic and its node mute stay. With neither backup the selector stops: Booth Mic is silent, never on a mic Booth no
+longer picks.
 Every stage and the master switch is a dry/wet `mixer`, set live with `pw-cli set-param` on booth.mic.input: a switch
 or a knob changes only control values, so it never restarts anything; a new shape restarts both.
 The plugin stages (STAGES) are in the graph exactly when their plugin verified (booth.plugins) as the chain was built
@@ -58,6 +62,10 @@ STOPPED = "Booth Mic isn't running: see systemctl --user status booth-voice.serv
 _LOCK = threading.RLock()  # the page's poll, the service's start and heal may run at once
 HEAL_BACKOFF_S = 60
 _HEALED = {}  # (selector config, Scarlett node object.serial) → when heal last restarted the selector for it
+SCARLETT, PRO_X_MIC, BRIO_MIC = "Scarlett", "PRO X mic", "BRIO mic"  # what Booth Mic takes; None: no mic
+# the backups in order, by their PipeWire source's name: then the serial and profile
+BACKUPS = ((PRO_X_MIC, "alsa_input." + devices.PRO_X_USB), (BRIO_MIC, "alsa_input.usb-046d_Logitech_BRIO_"))
+CHOSEN = SCARLETT  # the mic heal() chose last, for the routing policy's notice
 
 
 def path():
@@ -209,13 +217,45 @@ def build_selector(mic):
     return _config("libpipewire-module-loopback", selector)
 
 
-def _channel(cfg):
-    """The capture channel a selector config (any JSON on disk) was built for, or None."""
+def _capture(cfg, key):
+    """`key` of a selector config's (any JSON on disk) capture.props: CHANNEL, the capture channel it was built for;
+    "target.object", the source it takes. None when absent."""
     try:
-        return next(m["args"]["capture.props"][CHANNEL] for m in cfg["context.modules"]
+        return next(m["args"]["capture.props"][key] for m in cfg["context.modules"]
                     if m["name"] == "libpipewire-module-loopback")
     except (AttributeError, KeyError, StopIteration, TypeError):
         return None
+
+
+def _named(node):
+    """A source's node name → SCARLETT, PRO_X_MIC or BRIO_MIC, or None."""
+    return next((n for n, prefix in ((SCARLETT, scarlett.SOURCE),) + BACKUPS if (node or "").startswith(prefix)), None)
+
+
+def choose(state, on, dump, current):
+    """The one source choice for the selector → (the mic: SCARLETT, PRO_X_MIC, BRIO_MIC or None, what apply() takes).
+    `state`: scarlett.read; `on`: the PRO X headset answers on (HeadsetMonitor); `dump`: pw-dump JSON, read while the
+    Scarlett is absent; `current`: the source the selector config on disk takes. The Scarlett in ALSA is always the
+    Scarlett, its mic routed or not (not routed: apply stops the selector, never another mic). Absent from ALSA and
+    PipeWire: the PRO X mic while on, else the BRIO mic, at its first discovered position (a backup with none is
+    skipped). Neither: a backup's selector is stopped ({"mic": None}); the Scarlett's keeps its config (None: kept)."""
+    if state is not None:
+        return SCARLETT, state
+    try:
+        known = isinstance(json.loads(dump), list)
+    except ValueError:
+        known = False
+    if not known:  # pw-dump failed: nothing to choose from, the selector stays as it is
+        return _named(current), None
+    if scarlett._source(dump)[0]:  # amixer failed, or the card is going: still in PipeWire, so not absent yet
+        return SCARLETT, None
+    for name, prefix in BACKUPS:
+        if name == PRO_X_MIC and not on:  # off: its dongle stays in PipeWire, its mic carries nothing
+            continue
+        node, positions = scarlett._source(dump, prefix)
+        if node and positions[0]:  # channel None: never kept as a Scarlett channel by apply
+            return name, {"mic": {"node": node, "position": positions[0], "channel": None}}
+    return None, ({"mic": None} if _named(current) in (PRO_X_MIC, BRIO_MIC) else None)
 
 
 def _graph_nodes(cfg):
@@ -347,7 +387,7 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
-        kept = mic and not mic["node"] and mic["channel"] == _channel(_load(select_file))
+        kept = mic and not mic["node"] and mic["channel"] == _capture(_load(select_file), CHANNEL)
         if state is not None and sel is None and old_sel_text is not None and not kept:
             if not run(STOP_SELECT):  # the config stays: the next apply stops it again
                 return "not stopped: Booth Mic's source still takes the mic's old channel"
@@ -382,21 +422,25 @@ def _choice(settings):
     return (settings.get("microphone") or {}).get("input", scarlett.DEFAULT_INPUT)
 
 
-def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, clock=time.monotonic):
-    """Every 10 s: apply() with the Scarlett read now, so a reroute, a new channel or a renamed Scarlett node is
-    followed with or without a window. Then restart the selector when it should run, the Scarlett and Booth Mic's input
-    are in PipeWire and it isn't: it unloads itself when the Scarlett goes, or when it started before it at login.
-    Never without Booth Mic's input (BindsTo would pull a stopped booth-voice.service back up), and at most once a
-    minute for the same config and Scarlett node, so a selector that won't stay up isn't restarted every tick. True when
-    it restarted it."""
+def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, clock=time.monotonic, on=lambda: False):
+    """Every 10 s (and on a debounced sound-card or headset change): apply() with the mic choose() picks now, from the
+    Scarlett read now, so a reroute, a new channel, a renamed Scarlett node or a fallback is followed with or without a
+    window; `on()`: the PRO X headset answers on. The choice is kept in CHOSEN. Then restart the selector when it should
+    run, its source and Booth Mic's input are in PipeWire and it isn't: it unloads itself when its source goes, or when
+    it started before it at login. Never without Booth Mic's input (BindsTo would pull a stopped booth-voice.service
+    back up), and at most once a minute for the same config and source node, so a selector that won't stay up isn't
+    restarted every tick. True when it restarted it."""
+    global CHOSEN
     state = read(_choice(settings))
+    select_file = (file or path()).with_name(SELECT_CONF)
+    CHOSEN, state = choose(state, on(), dump() if state is None else "", _capture(_load(select_file), "target.object"))
     if state is None:
-        return False  # unplugged: the selector keeps its config for the Scarlett's return
+        return False  # unplugged with no backup (or pw-dump failed): the selector keeps its config
     with _LOCK:
         said = apply(settings, state, run, dump, file, clock)
         sel = build_selector(state["mic"])
         # only the selector's own config on disk: never revived on an old channel, whatever the chain's save did
-        if sel is None or _load((file or path()).with_name(SELECT_CONF)) != json.loads(sel):
+        if sel is None or _load(select_file) != json.loads(sel):
             return False
         if said.startswith(("restarted", "selector restarted")):
             return True  # by apply, which recorded it: it is coming up
