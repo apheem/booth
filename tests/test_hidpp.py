@@ -126,6 +126,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(hidpp.sidetone_request(128)[:5], bytes.fromhex("11ff051a64"))
         self.assertEqual(hidpp.sidetone_request(64)[4], 50)
         self.assertEqual(hidpp.sidetone_request(127)[4], 99)  # map<uint8_t> truncates
+        self.assertEqual((hidpp.sidetone_request(65)[4], hidpp.sidetone_request(1)[4]), (50, 0))  # 50.8, 0.8
         self.assertEqual(hidpp.sidetone_request(200)[4], 100)  # clamped, as map() clamps
         self.assertEqual(hidpp.sidetone_request(-5)[4], 0)
 

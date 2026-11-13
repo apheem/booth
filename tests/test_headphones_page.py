@@ -204,8 +204,8 @@ class Battery(unittest.TestCase):
 
 
 class Settings(unittest.TestCase):
-    """Sidetone and Auto power-off through the page's real __init__: shown only once the headset acknowledged its
-    command, sent through the service's monitor and saved."""
+    """Sidetone and Auto power-off through the page's real __init__: shown while the headset is on unless it refused a
+    value the user sent, sent through the service's monitor and saved."""
 
     def setUp(self):
         self.spawned, self.settings = [], {"headphones": {"sidetone": 64}}
@@ -221,28 +221,50 @@ class Settings(unittest.TestCase):
 
     def test_the_saved_values_are_shown_and_nothing_is_sent_for_them(self):
         self.assertEqual(self.page.sidetone.set["set_value"], (64,))
-        self.assertEqual(self.auto_off.set["set_value"], (headset.DEFAULTS["auto_off"],))
+        self.assertEqual(self.sidetone.set["set_subtitle"], (headphones.SUBTITLES["sidetone"],))
         self.assertEqual(self.spawned, [])
 
-    def test_hidden_until_the_headset_acknowledges_each_command(self):
+    def test_an_unsaved_one_shows_not_set_rather_than_a_value(self):  # the headset can't report its own
+        page = Page()
+        with stand_ins():
+            headphones.HeadphonesPage.__init__(page, {"headphones": {}}, lambda text: None, self.monitor)
+        self.assertNotIn("set_value", page.sidetone.set)
+        self.assertEqual(page.hidpp_rows["sidetone"].set["set_subtitle"], (headphones.NOT_SET,))
+        self.assertNotIn("set_value", self.auto_off.set)
+        self.assertEqual(self.auto_off.set["set_subtitle"], (headphones.NOT_SET,))
+        with mock.patch.object(headphones.store, "save"):
+            self.page.on_setting("auto_off", 10)
+        self.assertEqual(self.auto_off.set["set_subtitle"], (headphones.SUBTITLES["auto_off"],))
+
+    def test_shown_whenever_the_headset_is_on(self):
         self.assertEqual(self.visible(), ((False,), (False,)))
         self.monitor.poll()
-        self.spawned[-1][1]((3990, False))  # on: both are sent, one at a time
-        kinds = [k for k in ("sidetone", "auto_off") if k not in self.monitor.queue]
-        self.spawned[-1][1](True)
-        self.assertEqual(self.page.hidpp_rows[kinds[0]].set["set_visible"], (True,))
-        self.spawned[-1][1](False)  # the other one refused: it stays hidden
-        self.assertEqual(self.visible(), tuple((k == kinds[0],) for k in ("sidetone", "auto_off")))
+        self.spawned[-1][1]((3990, False))
+        self.assertEqual(self.visible(), ((True,), (True,)))  # before any reply
+        self.spawned[-1][1](False)  # the saved sidetone re-sent and refused: not the user's ask now
+        self.assertEqual(self.visible(), ((True,), (True,)))
+        self.assertEqual(self.page.note.set["set_visible"], (False,))
+        self.monitor.poll()
+        self.spawned[-1][1](hidpp.OFF)
+        self.assertEqual(self.visible(), ((False,), (False,)))
 
-    def test_off_hides_them_again(self):
+    def test_a_users_value_the_headset_does_not_acknowledge_hides_its_row_until_restart(self):
+        self.monitor.poll()
+        self.spawned[-1][1]((3990, False))
+        self.spawned[-1][1](True)
+        with mock.patch.object(headphones.store, "save"):
+            self.page.on_setting("auto_off", 10)
+        self.spawned[-1][1](None)
+        self.assertEqual(self.visible(), ((True,), (False,)))
+        self.assertEqual(self.page.note.set["set_title"], ("This headset doesn't accept auto power-off",))
+        self.assertEqual(self.page.note.set["set_visible"], (True,))
+        self.monitor.poll()
+        self.spawned[-1][1](hidpp.OFF)
         self.monitor.poll()
         self.spawned[-1][1]((3990, False))
         self.spawned[-1][1](True)
         self.spawned[-1][1](True)
-        self.assertEqual(self.visible(), ((True,), (True,)))
-        self.monitor.poll()
-        self.spawned[-1][1](hidpp.OFF)
-        self.assertEqual(self.visible(), ((False,), (False,)))
+        self.assertEqual(self.visible(), ((True,), (False,)))
 
     def test_a_change_is_sent_through_the_monitor_and_saved(self):
         with mock.patch.object(headphones.store, "save") as save:

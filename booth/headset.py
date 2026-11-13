@@ -7,7 +7,7 @@ before every command: PipeWire reuses ids after a replug.
 
 HeadsetMonitor follows the battery (booth.hidpp) for the service's 10 s poll: on/off, a smoothed estimate, and one
 low-battery warning per discharge. It also sends sidetone and auto power-off on the same one-exchange-at-a-time
-guard, and re-sends them on every "on"."""
+guard, and re-sends the saved ones (only values the user chose in Booth) on every "on"."""
 import functools
 import re
 import sys
@@ -128,8 +128,6 @@ def card(monitor):
 MISSES = 2  # no answer this many polls in a row (~20 s) is off; orchestrator adjudication on #9
 SMOOTHING = 0.3  # each 10 s reading moves the voltage this far: a load spike barely shows, a real drop in ~a minute
 WARN_AT, REARM_ABOVE = 15, 30
-# what an unsaved setting sends on "on": the headset can't report its own, so this probe is what shows the row
-DEFAULTS = {"sidetone": 0, "auto_off": 30}
 REQUESTS = {"sidetone": hidpp.sidetone_request, "auto_off": hidpp.auto_off_request}
 
 
@@ -150,15 +148,16 @@ class HeadsetMonitor:
                 the first answer
       percent   the smoothed estimate, 0..100, or None when off
       charging  True while charging
-      acked     {"sidetone" / "auto_off": True when the headset acknowledged that command last}; emptied when off
+      refused   the kinds ("sidetone", "auto_off") whose value the user sent got no acknowledgement; kept until
+                Booth restarts (a re-send on "on" never adds one)
     `notify(percent)` is called once per discharge at <= WARN_AT %. `spawn(work, done)` runs work() off the main loop
     and done(its result) back on it. `settings`: the app's shared settings dict, whose "headphones" sidetone and
-    auto_off (or DEFAULTS) are re-sent on every "on"; None sends nothing."""
+    auto_off, when saved, are re-sent on every "on" (never a value the user didn't choose); None sends nothing."""
 
     def __init__(self, notify=lambda percent: None, spawn=None, settings=None):
         self.notify, self.spawn, self.listeners, self.settings = notify, spawn, [], settings
         self.on, self.percent, self.charging, self.mv, self.armed, self.busy = None, None, False, None, True, False
-        self.misses, self.queue, self.acked = 0, {}, {}
+        self.misses, self.queue, self.refused = 0, {}, set()  # queue: {kind: (value, the user's ask now)}
 
     def poll(self):
         """A GLib timeout callback: ask the headset, unless an exchange (a poll's or a setting's) hasn't answered."""
@@ -175,18 +174,19 @@ class HeadsetMonitor:
     def set(self, kind, value):
         """Send the headset "sidetone" (0..128) or "auto_off" (minutes) once no exchange is in flight: never two
         threads on the node. A newer value replaces a queued one of its kind; kinds never drop each other."""
-        self.queue[kind] = value
+        self.queue[kind] = value, True
         self._next()
 
     def _next(self):
-        if not self.busy and self.queue:
+        if not self.busy and self.queue and self.on is not False:  # off: kept for the next "on", which re-sends
             self.busy = True
-            kind, value = self.queue.popitem()
-            self.spawn(functools.partial(hidpp.setting, REQUESTS[kind](value)), lambda ok: self._acked(kind, ok))
+            kind, (value, user) = self.queue.popitem()
+            self.spawn(functools.partial(hidpp.setting, REQUESTS[kind](value)), lambda ok: self._acked(kind, user, ok))
 
-    def _acked(self, kind, ok):
+    def _acked(self, kind, user, ok):
         self.busy = False
-        self.acked[kind] = ok is True  # refused, unanswered or raised: its row hides rather than half-works
+        if user and ok is not True:  # refused, unanswered or raised: its row hides rather than half-works
+            self.refused.add(kind)
         self._emit(["ack"])
         self._next()
 
@@ -202,7 +202,7 @@ class HeadsetMonitor:
             self.misses = 0
         if reading is None or reading == hidpp.OFF:
             if self.on is not False:
-                self.on, self.percent, self.mv, self.acked = False, None, None, {}
+                self.on, self.percent, self.mv = False, None, None
                 events.append("off")
         else:
             mv, charging = reading
@@ -211,8 +211,10 @@ class HeadsetMonitor:
             percent = hidpp.estimate(round(self.mv))
             if not self.on:
                 events.append("on")
-                for kind in REQUESTS if self.settings is not None else ():  # they may reset at power-on
-                    self.queue[kind] = self.settings["headphones"].get(kind, DEFAULTS[kind])
+                saved = self.settings["headphones"] if self.settings is not None else {}
+                for kind in REQUESTS:  # they may reset at power-on; a user's ask still queued goes as theirs
+                    if kind in saved:
+                        self.queue.setdefault(kind, (saved[kind], False))
             if fresh or percent != self.percent:
                 events.append("battery")
             self.on, self.percent, self.charging = True, percent, charging

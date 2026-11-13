@@ -344,7 +344,7 @@ class Poll(unittest.TestCase):
 
 class Settings(unittest.TestCase):
     """Sidetone and auto power-off through the monitor: one HID++ exchange at a time with the battery poll, the saved
-    values (or the defaults) re-sent on every "on", and `acked` true only for a command the headset echoed."""
+    values (only the user's) re-sent on every "on", and `refused` the kinds whose user-sent value got no echo."""
 
     def setUp(self):
         self.spawned, self.log, self.saved = [], [], {}
@@ -372,13 +372,18 @@ class Settings(unittest.TestCase):
         self.finish(True)
         self.assertFalse(self.m.busy)
 
-    def test_nothing_saved_sends_sidetone_off_and_30_minutes(self):
+    def test_nothing_saved_sends_nothing(self):  # never a value the user didn't choose: it would overwrite theirs
+        self.on()
+        self.assertEqual((self.sent(), self.m.busy), ([], False))
+
+    def test_only_the_saved_kinds_are_sent_again(self):
+        self.saved.update(sidetone=64)
         self.on()
         self.finish(True)
-        self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(0), hidpp.auto_off_request(30)]))
-        self.assertEqual(self.saved, {})  # a probe, not the user's choice: nothing is saved
+        self.assertEqual((self.sent(), self.m.busy), ([hidpp.sidetone_request(64)], False))
 
     def test_every_on_sends_them_again(self):  # they may reset at power-on
+        self.saved.update(sidetone=64, auto_off=10)
         self.on()
         self.assertEqual(len(self.sent()), 1)
         self.finish(True)
@@ -412,24 +417,49 @@ class Settings(unittest.TestCase):
         self.finish(True)
         self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(30), hidpp.auto_off_request(5)]))
 
-    def test_only_an_acknowledged_command_is_acked(self):
+    def test_a_users_value_without_an_ack_is_refused(self):
         self.m.set("sidetone", 10)
         self.finish(True)
-        self.assertEqual((self.m.acked, self.log), ({"sidetone": True}, ["ack"]))
-        for result in (False, None):  # refused (the captured error reply), or no answer / the exchange raised
-            self.m.set("sidetone", 10)
-            self.finish(result)
-            self.assertEqual(self.m.acked, {"sidetone": False})
+        self.assertEqual((self.m.refused, self.log), (set(), ["ack"]))
+        self.m.set("sidetone", 10)
+        self.finish(False)  # refused: the captured error reply
+        self.m.set("auto_off", 5)
+        self.finish(None)  # no answer, or the exchange raised
+        self.assertEqual(self.m.refused, {"sidetone", "auto_off"})
+        self.m.set("sidetone", 10)
+        self.finish(True)
+        self.assertEqual(self.m.refused, {"sidetone", "auto_off"})  # until Booth restarts
         self.assertFalse(self.m.busy)
 
-    def test_off_forgets_every_acknowledgement(self):
+    def test_a_resend_on_on_without_an_ack_refuses_nothing(self):
+        self.saved.update(sidetone=64, auto_off=10)
         self.on()
-        self.finish(True)
-        self.finish(True)
-        self.assertEqual(self.m.acked, {"sidetone": True, "auto_off": True})
+        self.finish(False)
+        self.finish(None)
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 2))
+
+    def test_off_keeps_the_refusals(self):
+        self.m.set("sidetone", 10)
+        self.finish(False)
         self.m.poll()
         self.finish(hidpp.OFF)
-        self.assertEqual((self.m.acked, self.log[-1]), ({}, "off"))
+        self.on()
+        self.assertEqual((self.m.refused, self.log[-2:]), ({"sidetone"}, ["on", "battery"]))
+
+    def test_a_value_asked_during_a_poll_that_finds_it_off_waits_for_the_next_on(self):
+        self.on()
+        self.m.poll()
+        self.m.set("sidetone", 10)
+        self.saved["sidetone"] = 10  # the page saves it as it asks: the "on" re-send must not take it over
+        self.finish(hidpp.OFF)
+        self.assertEqual((self.sent(), self.m.busy, self.m.refused), ([], False, set()))
+        self.m.poll()
+        self.finish(hidpp.OFF)
+        self.assertEqual(self.sent(), [])
+        self.on()
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)])
+        self.finish(False)  # still the user's value: its refusal counts
+        self.assertEqual(self.m.refused, {"sidetone"})
 
     def test_without_the_settings_nothing_is_sent(self):  # the monitor before the app loaded them
         m = headset.HeadsetMonitor(spawn=lambda work, done: self.spawned.append((work, done)))

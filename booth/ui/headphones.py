@@ -14,6 +14,8 @@ from booth import headset, store
 POLL_S = 2
 SWITCH_SUBTITLE = "Play all sound through the headset"
 SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
+NOT_SET = "Not set in Booth"  # the headset can't report its own value: the widget's position means nothing yet
+NAMES = {"sidetone": "sidetone", "auto_off": "auto power-off"}
 
 
 class HeadphonesPage(Adw.PreferencesPage):
@@ -39,22 +41,27 @@ class HeadphonesPage(Adw.PreferencesPage):
         for row in self.rows:
             self.group.add(row)
             row.set_sensitive(False)  # until the first poll finds the sink
-        # HID++ settings: the values set before connecting, so showing them sends nothing; visible per on_headset
+        # HID++ settings: the user's saved values, set before connecting, so showing them sends nothing (an unsaved one
+        # shows NOT_SET); visible per on_headset
         saved = settings["headphones"]
         self.sidetone = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 128, 1)
         self.sidetone.set_hexpand(True)
-        self.sidetone.set_value(saved.get("sidetone", headset.DEFAULTS["sidetone"]))
+        if "sidetone" in saved:
+            self.sidetone.set_value(saved["sidetone"])
         self.sidetone.connect("value-changed", lambda s: self.on_setting("sidetone", round(s.get_value())))
-        sidetone = Adw.ActionRow(title="Sidetone", subtitle=SUBTITLES["sidetone"])
+        sidetone = Adw.ActionRow(title="Sidetone")
         sidetone.add_suffix(self.sidetone)
         auto_off = Adw.SpinRow.new_with_range(0, 90, 5)
         auto_off.set_title("Auto power-off")
-        auto_off.set_subtitle(SUBTITLES["auto_off"])
-        auto_off.set_value(saved.get("auto_off", headset.DEFAULTS["auto_off"]))
+        if "auto_off" in saved:
+            auto_off.set_value(saved["auto_off"])
         auto_off.connect("notify::value", lambda r, _p: self.on_setting("auto_off", round(r.get_value())))
         self.hidpp_rows = {"sidetone": sidetone, "auto_off": auto_off}
-        for row in self.hidpp_rows.values():
+        for kind, row in self.hidpp_rows.items():
+            row.set_subtitle(SUBTITLES[kind] if kind in saved else NOT_SET)
             self.group.add(row)
+        self.note = Adw.ActionRow()  # "This headset doesn't accept …": a refused row hides rather than half-works
+        self.group.add(self.note)
         monitor.listeners.append(self.on_headset)
         self.on_headset()
         self.add(self.group)
@@ -72,8 +79,11 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.group.set_title(title)
         self.battery.set_subtitle(battery or "")
         self.battery.set_visible(battery is not None)
-        for kind, row in self.hidpp_rows.items():  # only once the headset acknowledged it: never half-working
-            row.set_visible(self.monitor.acked.get(kind, False))
+        on, refused = self.monitor.on is True, [k for k in self.hidpp_rows if k in self.monitor.refused]
+        for kind, row in self.hidpp_rows.items():  # hidden until restart once it refused a value the user sent
+            row.set_visible(on and kind not in refused)
+        self.note.set_title("This headset doesn't accept " + " or ".join(NAMES[k] for k in refused))
+        self.note.set_visible(on and bool(refused))
         self.status(headset.status(self.state, self.monitor))
 
     def on_setting(self, kind, value):
