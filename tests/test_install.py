@@ -151,7 +151,7 @@ class Install(unittest.TestCase):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         # restart, not start: a re-install must run the new copy (start leaves a running old one as it is).
-        self.assertEqual(self.calls.read_text().splitlines(), VOICE_CALLS + [QUIT, OWNER] + UNIT_CALLS)
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + VOICE_CALLS + UNIT_CALLS)
         self.assertNotIn("couldn't start", r.stderr)
         self.assertNotIn(STALE, r.stdout + r.stderr)
         unit = self.unit.read_text().splitlines()
@@ -429,14 +429,14 @@ class Install(unittest.TestCase):
         self.calls.write_text("")  # the user may have chosen another mic since: a re-install never overrides it
         self.assertEqual(self.install().returncode, 0)
         self.assertNotIn("pw-metadata", self.calls.read_text())
-        self.assertEqual(self.calls.read_text().splitlines()[:A], VOICE_AGAIN)
+        self.assertEqual(self.calls.read_text().splitlines()[2:2 + A], VOICE_AGAIN)
 
     def test_booth_mic_is_set_up_even_with_the_background_service_switched_off(self):
         self.assertEqual(self.install().returncode, 0)
         self.env["UNIT_STATE"] = "disabled"
         self.calls.write_text("")
         self.assertEqual(self.install().returncode, 0)
-        self.assertEqual(self.calls.read_text().splitlines()[:A], VOICE_AGAIN)
+        self.assertEqual(self.calls.read_text().splitlines()[2:2 + A], VOICE_AGAIN)
 
     def test_without_a_user_manager_it_says_how_to_start_booth_mic(self):
         self.env["SYSTEMCTL_RC"] = "1"
@@ -489,8 +489,9 @@ class Install(unittest.TestCase):
         self.env["OWNED_POLLS"] = "3"
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
+        # first: the old Booth's heal or poll would restart Booth Mic once more under booth.voice's sync
         self.assertEqual(self.calls.read_text().splitlines(),
-                         VOICE_CALLS + [QUIT] + [OWNER, "sleep 0.5"] * 3 + [OWNER] + UNIT_CALLS)
+                         [QUIT] + [OWNER, "sleep 0.5"] * 3 + [OWNER] + VOICE_CALLS + UNIT_CALLS)
         self.assertNotIn(STALE, r.stdout + r.stderr)
 
     def test_a_booth_that_wont_quit_is_waited_for_at_most_5_s_then_named(self):
@@ -559,7 +560,7 @@ class Install(unittest.TestCase):
         self.env["GDBUS_RC"] = "1"
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.calls.read_text().splitlines(), VOICE_CALLS + [QUIT, OWNER] + UNIT_CALLS)
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + VOICE_CALLS + UNIT_CALLS)
         self.assertNotIn(STALE, r.stdout + r.stderr)
 
     def test_the_unit_follows_xdg_config_home_unless_relative(self):
@@ -609,7 +610,7 @@ class Install(unittest.TestCase):
         self.assertIn("install.sh: some voice plugins couldn't be fetched or verified (above)", r.stderr)
         self.assertIn("librnnoise_ladspa.so: refused (missing)", r.stdout)
         self.assertFalse((self.app.parent / "plugins").exists())  # nothing unverified was placed
-        self.assertEqual(self.calls.read_text().splitlines(), VOICE_CALLS + [QUIT, OWNER] + UNIT_CALLS)  # the service still restarts
+        self.assertEqual(self.calls.read_text().splitlines(), [QUIT, OWNER] + VOICE_CALLS + UNIT_CALLS)  # the service still restarts
         self.assertEqual(tree(self.app), tree(REPO / "booth"))
 
     def test_the_plugins_follow_xdg_data_home_and_survive_a_reinstall(self):
