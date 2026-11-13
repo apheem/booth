@@ -179,6 +179,7 @@ class Application(Adw.Application):
         mute.stop()  # #21: its pw-dump --monitor ends with Booth
         if self.window is not None:  # a quit closes no window by close-request: its pending voice change saved here
             self.window.microphone.save_voice()
+            self.window.microphone.take.stop()  # and no test recording is left playing, or its file kept
         Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):

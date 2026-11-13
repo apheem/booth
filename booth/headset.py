@@ -9,11 +9,12 @@ HeadsetMonitor follows the battery (booth.hidpp) for the service's 10 s poll: on
 low-battery warning per discharge. It also sends sidetone and auto power-off on the same one-exchange-at-a-time
 guard, and re-sends the saved ones (only values the user chose in Booth) on every "on"."""
 import functools
+import json
 import re
 import sys
 import traceback
 
-from booth import devices, hidpp
+from booth import devices, hidpp, routing, scarlett
 
 PCM = "PCM Playback Volume"
 _NAME = re.compile(r"name='(.*)'")
@@ -67,12 +68,16 @@ def percent(volume):
     return round(min(max(volume, 0.0), 1.0) * 100)
 
 
-def volume_cmd(dump, percent):
+def volume_cmd(dump, percent, name=None):
     """`pw-dump` JSON and the slider's 0..100 → the wpctl command that sets the PRO X sink, or None when it is gone.
-    Clamped to 1.0, and with wpctl's own limit as well: Booth never sets more than 100 %."""
-    sinks, _ = devices.parse_sinks(dump)
-    name = devices.find_sink(sinks)
+    Clamped to 1.0, and with wpctl's own limit as well: Booth never sets more than 100 %. `name`: the backup slider's
+    sink (state()'s output) instead, set only while it is still the default: never an output sound has left."""
+    sinks, default = devices.parse_sinks(dump)
     if name is None:
+        name = devices.find_sink(sinks)
+    elif name != default:
+        return None
+    if name not in sinks:
         return None
     return ["wpctl", "set-volume", "-l", "1.0", str(sinks[name][0]), f"{min(max(percent, 0), 100) / 100:.2f}"]
 
@@ -96,24 +101,64 @@ def default_cmd(dump, on, previous=None):
     return ["wpctl", "clear-default", "0"], None
 
 
-def state(run=devices._run):
-    """The PRO X sink now → {"volume": wpctl volume, "default": whether it is the default sink}, or None when gone."""
-    sinks, default = devices.parse_sinks(run("pw-dump"))
+def state(run=devices._run, card=devices.scarlett_card):
+    """The PRO X sink now → {"volume": wpctl volume, "default": whether it is the default sink, "output": the default
+    sink when it is another one (the backup Booth moved sound to, or the user's pick), else None}, or None when the
+    PRO X sink is gone. output: {"name", "label": its description, "volume": wpctl's, "direct": the Scarlett's Direct
+    Monitor when it is the Scarlett's sink and its card is there, else None}."""
+    dump = run("pw-dump")
+    sinks, default = devices.parse_sinks(dump)
     name = devices.find_sink(sinks)
     if name is None:
         return None
     volume = parse_volume(run("wpctl", "get-volume", str(sinks[name][0])))
-    return None if volume is None else {"volume": volume, "default": name == default}
+    if volume is None:
+        return None
+    output = None
+    if default in sinks and default != name:
+        heard = parse_volume(run("wpctl", "get-volume", str(sinks[default][0])))
+        if heard is not None:
+            props = next((o["info"]["props"] for o in json.loads(dump) if o.get("id") == sinks[default][0]), {})
+            card_id = card() if default.startswith(routing.SINK) else None
+            ctrls = scarlett.parse_contents(run("amixer", "-c", card_id, "contents")) if card_id else {}
+            output = {"name": default, "label": props.get("node.description") or default, "volume": heard,
+                      "direct": scarlett.value(ctrls, scarlett.DIRECT)}
+    return {"volume": volume, "default": name == default, "output": output}
+
+
+OFF_NOTE = "The headset is off: its sidetone and auto power-off come back when it turns on"
+
+
+def playing(state, on):
+    """The Sound Output card's line: where sound plays now. `on`: HeadsetMonitor.on."""
+    if state is None:
+        return "Unknown"
+    if state["default"]:
+        return "PRO X Wireless" + (" — it is off, so nothing is heard" if on is False else "")
+    if state["output"] is None:
+        return "No sound output"
+    return state["output"]["label"] + (" — the backup while the PRO X is off" if on is False else "")
+
+
+def note(state, on):
+    """The PRO X card's description: why its rows are greyed out or hidden, or None."""
+    if state is None:
+        return "Not connected"
+    return OFF_NOTE if on is False else None
 
 
 def status(state, monitor=None):
-    """The Headphones sidebar subtitle, e.g. "~70 % · Volume 63 %"; "Not connected" when the dongle's sink is gone."""
+    """The Headphones sidebar subtitle, e.g. "~70 % · Volume 63 %"; "Not connected" when the dongle's sink is gone.
+    Off with sound on another output: that one's volume, the one heard."""
     if state is None:
         return "Not connected"
     volume = f"Volume {round(state['volume'] * 100)} %"
     if monitor is None or monitor.on is None:
         return volume
-    return f"~{monitor.percent} % · {volume}" if monitor.on else f"Off · {volume}"
+    if monitor.on:
+        return f"~{monitor.percent} % · {volume}"
+    output = state.get("output")
+    return f"Off · Backup volume {round(output['volume'] * 100)} %" if output else f"Off · {volume}"
 
 
 def card(monitor):

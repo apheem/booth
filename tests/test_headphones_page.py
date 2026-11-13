@@ -178,7 +178,7 @@ def stand_ins():
 class Battery(unittest.TestCase):
     """The status card and sidebar follow the service's HeadsetMonitor through the page's real __init__."""
 
-    def page(self, monitor, state={"volume": 0.63, "default": False}):
+    def page(self, monitor, state={"volume": 0.63, "default": False, "output": None}):
         page, sidebar = Page(), []
         with stand_ins():
             headphones.HeadphonesPage.__init__(page, {"headphones": {}}, sidebar.append, monitor)
@@ -222,6 +222,76 @@ class Battery(unittest.TestCase):
             page.stop()
         monitor.update((3990, False))
         self.assertEqual(sidebar[-1], "Volume 63 %")
+
+
+class SoundOutput(unittest.TestCase):
+    """Where sound plays now, and the backup output's own volume and Direct Monitor, through the page's real __init__."""
+    BACKUP = {"volume": 0.63, "default": False,
+              "output": {"name": SCARLETT, "label": "Scarlett Solo 4th Gen Analog Stereo", "volume": 0.76,
+                         "direct": False}}
+    ON_PRO_X = {"volume": 0.63, "default": True, "output": None}
+
+    def page(self, state, reading=hidpp.OFF):
+        self.monitor, self.sidebar, self.sent, page = headset.HeadsetMonitor(), [], [], Page()
+        self.monitor.update(reading)
+        with stand_ins():
+            headphones.HeadphonesPage.__init__(page, {"headphones": {}}, self.sidebar.append, self.monitor)
+            page.show(state, page.writer.writes)
+        return page
+
+    @contextlib.contextmanager
+    def writing(self):
+        """The page's writes with the captured pw-dump: every command they would run is kept in self.sent."""
+        with stand_ins(), mock.patch.object(headphones.headset, "send", lambda make: self.sent.append(make(DUMP))):
+            yield
+
+    def test_off_with_sound_on_the_scarlett_says_so_and_shows_that_outputs_volume(self):
+        page = self.page(self.BACKUP)
+        self.assertEqual(page.playing.set["set_subtitle"],
+                         ("Scarlett Solo 4th Gen Analog Stereo — the backup while the PRO X is off",))
+        self.assertEqual((page.backup_row.set["set_visible"], page.direct.set["set_visible"]), ((True,), (True,)))
+        self.assertEqual((page.backup.value, page.direct.set["set_active"]), (76, (False,)))
+        self.assertEqual(page.group.set["set_description"], (headset.OFF_NOTE,))
+        self.assertEqual(self.sidebar[-1], "Off · Backup volume 76 %")
+        self.assertEqual(page.writer.writes, 0)  # showing it wrote nothing
+
+    def test_sound_on_the_pro_x_hides_the_backup_rows(self):
+        page = self.page(self.ON_PRO_X, (3990, False))
+        self.assertEqual(page.playing.set["set_subtitle"], ("PRO X Wireless",))
+        self.assertEqual((page.backup_row.set["set_visible"], page.direct.set["set_visible"]), ((False,), (False,)))
+        self.assertEqual(page.group.set["set_description"], (None,))
+
+    def test_an_output_that_is_not_the_scarlett_has_a_volume_and_no_direct_monitor(self):
+        page = self.page({**self.BACKUP, "output": {**self.BACKUP["output"], "direct": None}})
+        self.assertEqual((page.backup_row.set["set_visible"], page.direct.set["set_visible"]), ((True,), (False,)))
+
+    def test_the_headset_turning_on_or_off_is_said_at_once_without_waiting_for_a_poll(self):
+        page = self.page(self.BACKUP)
+        self.monitor.update((3990, False))
+        self.assertEqual(page.playing.set["set_subtitle"], ("Scarlett Solo 4th Gen Analog Stereo",))
+        self.assertEqual(page.group.set["set_description"], (None,))
+        self.monitor.update(hidpp.OFF)
+        self.assertEqual(page.group.set["set_description"], (headset.OFF_NOTE,))
+
+    def test_the_backup_slider_sets_the_output_it_shows_never_the_pro_x(self):
+        page = self.page(self.BACKUP)
+        with self.writing():
+            page.backup.set_value(40)
+        self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "176", "0.40"]])
+
+    def test_the_pro_x_slider_still_sets_the_pro_x(self):
+        page = self.page(self.BACKUP)
+        with self.writing():
+            page.scale.set_value(40)
+        self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "33", "0.40"]])
+
+    def test_direct_monitor_is_written_to_the_scarlett_by_name(self):
+        page, cards = self.page(self.BACKUP), []
+        page.direct.active = True
+        with self.writing(), mock.patch.object(headphones.scarlett, "send", lambda make: cards.append(make("Gen"))):
+            page.direct.handlers["notify::active"](page.direct, None)
+        self.assertEqual(cards, [["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch", "on"]])
+        self.assertEqual(self.sent, [None])  # and no wpctl command besides
 
 
 class Settings(unittest.TestCase):

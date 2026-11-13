@@ -10,6 +10,8 @@ from tests.fixture import read
 
 CGET, CONTENTS = read("headset/amixer-cget-pcm.txt"), read("headset/amixer-contents.txt")
 DUMP, VOLUME = read("headset/pw-dump.json"), read("headset/wpctl-get-volume.txt")
+SCARLETT_CONTENTS = read("scarlett/amixer-contents.txt")
+DIRECT_OFF = "name='Direct Monitor Playback Switch'\n  ; type=BOOLEAN,access=rw------,values=1\n  : values=off"
 PRO_X = "alsa_output.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.iec958-stereo"
 SCARLETT = "alsa_output.usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00.analog-stereo"
 
@@ -118,6 +120,15 @@ class Volume(unittest.TestCase):
         self.assertIsNone(headset.volume_cmd(gone, 50))
         self.assertIsNone(headset.volume_cmd("", 50))  # no PipeWire: pw-dump printed nothing
 
+    def test_the_backup_slider_sets_the_output_it_shows_while_it_is_still_the_default(self):
+        self.assertEqual(headset.volume_cmd(DUMP, 40, SCARLETT), ["wpctl", "set-volume", "-l", "1.0", "176", "0.40"])
+        self.assertEqual(headset.volume_cmd(DUMP, 150, SCARLETT)[-1], "1.00")
+
+    def test_the_backup_slider_never_sets_an_output_sound_has_left(self):
+        back = dump(lambda o: default_sink(o, PRO_X))  # the PRO X turned on mid-drag: not its volume, not the old one
+        self.assertIsNone(headset.volume_cmd(back, 40, SCARLETT))
+        self.assertIsNone(headset.volume_cmd(dump(lambda o: o.remove(node(o, SCARLETT))), 40, SCARLETT))
+
 
 class UseForAllSound(unittest.TestCase):
     """On remembers the default sink it replaces, by node name; off puts that one back, or clears WirePlumber's
@@ -157,25 +168,77 @@ class UseForAllSound(unittest.TestCase):
 
 
 class State(unittest.TestCase):
-    def state(self, text=DUMP):
+    OUTPUT = {"name": SCARLETT, "label": "Scarlett Solo 4th Gen Analog Stereo", "volume": 0.76, "direct": False}
+
+    def state(self, text=DUMP, card="Gen", volumes=None, contents=SCARLETT_CONTENTS):
         asked = []
 
         def run(*cmd):
             asked.append(list(cmd))
-            return text if cmd == ("pw-dump",) else VOLUME
-        return headset.state(run), asked
+            if cmd == ("pw-dump",):
+                return text
+            if cmd[0] == "amixer":
+                return contents
+            return (volumes or {"33": VOLUME, "176": "Volume: 0.76\n", "59": "Volume: 0.40\n"})[cmd[-1]]
+        return headset.state(run, lambda: card), asked
 
-    def test_volume_of_the_sink_resolved_now_and_not_default(self):
+    def test_volume_of_the_sink_resolved_now_and_the_output_in_use_instead(self):
         state, asked = self.state()
-        self.assertEqual(state, {"volume": 0.63, "default": False})
+        self.assertEqual(state, {"volume": 0.63, "default": False, "output": self.OUTPUT})
+        self.assertEqual(asked, [["pw-dump"], ["wpctl", "get-volume", "33"], ["wpctl", "get-volume", "176"],
+                                 ["amixer", "-c", "Gen", "contents"]])
+
+    def test_default_when_pipewire_says_so_and_then_no_other_output(self):
+        state, asked = self.state(dump(lambda o: default_sink(o, PRO_X)))
+        self.assertIs(state["default"], True)
+        self.assertIsNone(state["output"])
         self.assertEqual(asked, [["pw-dump"], ["wpctl", "get-volume", "33"]])
 
-    def test_default_when_pipewire_says_so(self):
-        state, _ = self.state(dump(lambda o: default_sink(o, PRO_X)))
-        self.assertIs(state["default"], True)
+    def test_direct_monitor_as_the_scarlett_has_it(self):
+        self.assertIn(DIRECT_OFF, SCARLETT_CONTENTS)
+        on = SCARLETT_CONTENTS.replace(DIRECT_OFF, DIRECT_OFF[:-3] + "on")
+        self.assertIs(self.state(contents=on)[0]["output"]["direct"], True)
+
+    def test_another_output_has_no_direct_monitor_and_the_scarlett_is_never_asked(self):
+        usb = "alsa_output.usb-Generic_USB_Audio-00.iec958-stereo"
+        state, asked = self.state(dump(lambda o: default_sink(o, usb)))
+        self.assertEqual(state["output"], {"name": usb, "label": "USB Audio Digital Stereo (IEC958)", "volume": 0.40,
+                                           "direct": None})
+        self.assertEqual(asked[2:], [["wpctl", "get-volume", "59"]])
+
+    def test_the_scarlett_unplugged_between_the_two_reads_has_no_direct_monitor(self):
+        self.assertIsNone(self.state(card=None)[0]["output"]["direct"])
+        self.assertIsNone(self.state(contents="")[0]["output"]["direct"])
+
+    def test_an_output_without_a_description_is_called_by_its_name(self):
+        state, _ = self.state(dump(lambda o: node(o, SCARLETT)["info"]["props"].pop("node.description")))
+        self.assertEqual(state["output"]["label"], SCARLETT)
+
+    def test_no_output_when_the_default_is_unknown_or_its_volume_is(self):
+        self.assertIsNone(self.state(dump(lambda o: default_sink(o, "gone")))[0]["output"])
+        self.assertIsNone(self.state(volumes={"33": VOLUME, "176": ""})[0]["output"])
 
     def test_unplugged(self):
         self.assertEqual(self.state(dump(lambda o: o.remove(node(o, PRO_X)))), (None, [["pw-dump"]]))
+
+    def test_where_sound_plays_now(self):
+        backup = {"volume": 0.63, "default": False, "output": self.OUTPUT}
+        prox = {"volume": 0.63, "default": True, "output": None}
+        self.assertEqual(headset.playing(backup, False),
+                         "Scarlett Solo 4th Gen Analog Stereo — the backup while the PRO X is off")
+        self.assertEqual(headset.playing(backup, True), "Scarlett Solo 4th Gen Analog Stereo")  # the user's own pick
+        self.assertEqual(headset.playing(backup, None), "Scarlett Solo 4th Gen Analog Stereo")  # before the first poll
+        self.assertEqual(headset.playing(prox, True), "PRO X Wireless")
+        self.assertEqual(headset.playing(prox, False), "PRO X Wireless — it is off, so nothing is heard")
+        self.assertEqual(headset.playing({"volume": 0.63, "default": False, "output": None}, True), "No sound output")
+        self.assertEqual(headset.playing(None, False), "Unknown")
+
+    def test_the_card_says_why_the_headsets_own_settings_are_hidden(self):
+        state = {"volume": 0.63, "default": False, "output": None}
+        self.assertEqual(headset.note(state, False), headset.OFF_NOTE)
+        self.assertIsNone(headset.note(state, True))
+        self.assertIsNone(headset.note(state, None))
+        self.assertEqual(headset.note(None, False), "Not connected")
 
     def test_sidebar_subtitle(self):
         self.assertEqual(headset.status({"volume": 0.63, "default": False}), "Volume 63 %")
@@ -186,6 +249,9 @@ class State(unittest.TestCase):
         on, off = monitor((3990, False)), monitor(hidpp.OFF)
         self.assertEqual(headset.status({"volume": 0.63, "default": False}, on), "~75 % · Volume 63 %")
         self.assertEqual(headset.status({"volume": 0.63, "default": False}, off), "Off · Volume 63 %")
+        backup = {"volume": 0.63, "default": False, "output": State.OUTPUT}
+        self.assertEqual(headset.status(backup, off), "Off · Backup volume 76 %")  # what is heard, not the dead headset
+        self.assertEqual(headset.status(backup, on), "~75 % · Volume 63 %")
         self.assertEqual(headset.status(None, off), "Not connected")  # the dongle itself is gone
         self.assertEqual(headset.status({"volume": 0.63, "default": False}, headset.HeadsetMonitor()), "Volume 63 %")
 

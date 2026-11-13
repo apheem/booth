@@ -29,7 +29,7 @@ import types
 
 from gi.repository import Adw, GLib, Gtk
 
-from booth import headset, meter, monitor, routing, scarlett, stereo, store, voice
+from booth import headset, meter, monitor, routing, scarlett, stereo, store, take, voice
 from booth.ui.levelmeter import LevelMeter
 
 POLL_S = 2
@@ -148,6 +148,13 @@ class MicrophonePage(Adw.PreferencesPage):
         self.monitoring.set_active(v.get("monitor", False))
         self.quiet = False
         self.show_voice()
+        # a test recording (booth.take): hear what a call hears after a change, without a call
+        self.take = take.Take(self.on_take)
+        self.take_row = Adw.ActionRow(title="Test Recording", subtitle=take.HINT)
+        self.take_button = Gtk.Button(label="Record", valign=Gtk.Align.CENTER)
+        self.take_button.connect("clicked", lambda _b: self.take.toggle())
+        self.take_row.add_suffix(self.take_button)
+        self.voice.add(self.take_row)
         self.voice.add(self.master)
         self.voice.add(self.preset)
         self.voice.add(self.rumble)
@@ -183,8 +190,10 @@ class MicrophonePage(Adw.PreferencesPage):
         return self.settings["microphone"].get("input", scarlett.DEFAULT_INPUT)
 
     def stop(self):
-        """The window closed: no more polls, and the Scarlett is released; a pending voice change saved."""
+        """The window closed: no more polls, and the Scarlett is released; a pending voice change saved and a test
+        recording ended."""
         self.save_voice()
+        self.take.stop()
         GLib.source_remove(self.timer)
         self.meter.stop()
         self.after_meter.stop()
@@ -224,6 +233,7 @@ class MicrophonePage(Adw.PreferencesPage):
         if problem:
             self.on_meter_failed(problem)
         self.after_record = AFTER if running else None
+        self.take_button.set_sensitive(running or self.take.proc is not None)  # Stop stays; no take of a stopped mic
         if not running:
             self.after.idle(voice.STOPPED)
         self.meter_update()
@@ -270,6 +280,11 @@ class MicrophonePage(Adw.PreferencesPage):
     def on_meter_failed(self, text):
         for m in (self.bar, self.mini):
             m.idle(text)
+
+    def on_take(self, text, busy):
+        """The test recording said something: the countdown, playing back, why it failed, or None when it is over."""
+        self.take_row.set_subtitle(text or take.HINT)
+        self.take_button.set_label("Stop" if busy else "Record")
 
     def on_phantom(self, row, _param):
         if self.quiet:

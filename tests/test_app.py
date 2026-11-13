@@ -800,6 +800,7 @@ class MicFallback(unittest.TestCase):
         with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"):
             app.Application.do_shutdown(stub)
         stub.window.microphone.save_voice.assert_called_once_with()
+        stub.window.microphone.take.stop.assert_called_once_with()  # no test recording outlives Booth
 
     def test_quitting_ends_the_mute_watchers_pw_dump(self):  # #21: no pw-dump --monitor outlives Booth
         with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"), \
