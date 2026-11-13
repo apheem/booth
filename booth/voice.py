@@ -14,15 +14,20 @@ channel carries now. heal() reads the Scarlett's routing and node every 10 s, so
 (a fast replug, a profile switch) and a login race with only the background Booth running. #20's fallback changes only
 the selector's target and positions.
 Every stage and the master switch is a dry/wet `mixer`, set live with `pw-cli set-param` on booth.mic.input: a switch
-changes only control values, so it never restarts anything; a new stage restarts both.
-    python3 -m booth.voice    write the configs from the saved settings and the Scarlett now, start the services"""
+or a knob changes only control values, so it never restarts anything; a new stage restarts both.
+The plugin stages (STAGES) are in the graph exactly when their plugin verifies (booth.plugins) while the config is
+built, every time: a plugin missing or changed is left out (the mic passes it dry) and the page says so. Only a change
+in what verifies (an install, a changed file) changes the shape. booth-voice.service's ExecStartPre runs `--write`, so
+a plugin changed after Booth last wrote voice.conf is never loaded at the next start either.
+    python3 -m booth.voice            write the configs from the saved settings and the Scarlett now, start the services
+    python3 -m booth.voice --write    only voice.conf, from the saved settings and the plugins verified now (ExecStartPre)"""
 import copy
 import json
 import sys
 import threading
 import time
 
-from booth import devices, scarlett, service, store
+from booth import devices, plugins, scarlett, service, store
 
 UNIT, SELECT_UNIT = "booth-voice.service", "booth-mic-select.service"
 RESTART = ["systemctl", "--user", "restart", UNIT, SELECT_UNIT]  # a new chain: the selector re-links to its new input
@@ -68,18 +73,82 @@ def _config(module, args):
                                            {"name": module, "args": args}]}, indent=2)
 
 
-def build(settings):
-    """The settings → Booth Mic's chain config text (booth-voice.service), whatever the Scarlett does."""
+def strength(knob):
+    """Noise suppression's Strength, 0..100 → RNNoise's controls. RNNoise always removes noise; Strength is how sure it
+    must be that a 10 ms frame is voice before letting it through (VAD Threshold 0..95 %, linear, a whole percent: the
+    port is an integer): higher mutes the room between words harder, but too high clips soft word ends, so it stops at
+    werman's 95 % ceiling. The 200 ms grace keeps word tails; no retroactive grace, which would add that much latency."""
+    return {"VAD Threshold (%)": float(round(knob * 0.95)), "VAD Grace Period (ms)": 200.0,
+            "Retroactive VAD Grace (ms)": 0.0}
+
+
+def amount(knob):
+    """Leveling's Amount, 0..100 → sc4m's controls. 0 is no compression (threshold 0 dB, 1:1); 100 is threshold −30 dB
+    at 6:1, both linear in between. Makeup gain gives back half of what a peak at 0 dB loses, −threshold × (1 − 1/ratio)
+    / 2, so turning it up evens the voice out without making it quieter. RMS sensing, 10 ms attack, 150 ms release and a
+    5 dB knee are fixed: smooth for speech."""
+    f = knob / 100
+    threshold, ratio = 0.0 - 30.0 * f, 1.0 + 5.0 * f
+    return {"RMS/peak": 0.0, "Attack time (ms)": 10.0, "Release time (ms)": 150.0, "Knee radius (dB)": 5.0,
+            "Threshold level (dB)": threshold, "Ratio (1:n)": ratio,
+            "Makeup gain (dB)": round(-threshold * (1 - 1 / ratio) / 2, 2)}
+
+
+def ceiling(db):
+    """The limiter's Ceiling in dB (−20..0, default −1) → the limiter's Limit, as it is; no input gain, 50 ms release."""
+    return {"Input gain (dB)": 0.0, "Limit (dB)": float(db), "Release time (s)": 0.05}
+
+
+# The plugin stages after the rumble filter, in chain order: (settings key = node name, plugin file, LADSPA label,
+# audio inputs, audio output, the knob's settings key, its default, its mapping). The names are #14's fixture's exactly.
+# The limiter is stereo: the mono chain feeds both its inputs and takes Output 1.
+# #17's tone stage (builtin bq_* filters, no plugin) goes between "noise" and "leveling".
+STAGES = (("noise", "librnnoise_ladspa.so", "noise_suppressor_mono", ("Input",), "Output",
+           "noise_strength", 50, strength),
+          ("leveling", "sc4m_1916.so", "sc4m", ("Input",), "Output", "leveling_amount", 50, amount),
+          ("limiter", "fast_lookahead_limiter_1913.so", "fastLookaheadLimiter", ("Input 1", "Input 2"), "Output 1",
+           "limiter_ceiling", -1.0, ceiling))
+
+
+def verified(where=None, manifest=plugins.MANIFEST):
+    """{plugin file: its path} for each plugin that verifies now (plugins.verify): the only paths a config may hold."""
+    found = {}
+    for name in manifest:
+        try:
+            found[name] = str(plugins.verify(name, where, manifest))
+        except (plugins.Refused, OSError):
+            pass
+    return found
+
+
+def missing(found):
+    """The stages whose plugin isn't in `found` (verified): left out of the chain, so the mic passes them dry."""
+    return [s[0] for s in STAGES if s[1] not in found]
+
+
+def build(settings, found=None):
+    """The settings → Booth Mic's chain config text (booth-voice.service), whatever the Scarlett does. Plugin stages
+    only from `found` (verified() now when not given): every stage that verifies is in the graph, on or off."""
     v = settings.get("voice") or {}
+    found = verified() if found is None else found
     nodes = [{"type": "builtin", "name": "in", "label": "copy"},
              {"type": "builtin", "name": "rumble", "label": "bq_highpass", "control": {"Freq": RUMBLE_HZ, "Q": 0.707}},
-             _mix("rumble_mix", v.get("rumble", True)),
-             _mix("master", v.get("enabled", True))]
+             _mix("rumble_mix", v.get("rumble", True))]
     links = [{"output": "in:Out", "input": "rumble:In"},
              {"output": "rumble:Out", "input": "rumble_mix:In 1"},
-             {"output": "in:Out", "input": "rumble_mix:In 2"},
-             {"output": "rumble_mix:Out", "input": "master:In 1"},
-             {"output": "in:Out", "input": "master:In 2"}]
+             {"output": "in:Out", "input": "rumble_mix:In 2"}]
+    last = "rumble_mix:Out"
+    for key, file, label, ins, out, knob, default, mapping in STAGES:
+        if file not in found:
+            continue
+        nodes += [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
+                   "control": mapping(v.get(knob, default))},
+                  _mix(f"{key}_mix", v.get(key, True))]
+        links += [{"output": last, "input": f"{key}:{port}"} for port in ins]
+        links += [{"output": f"{key}:{out}", "input": f"{key}_mix:In 1"}, {"output": last, "input": f"{key}_mix:In 2"}]
+        last = f"{key}_mix:Out"
+    nodes.append(_mix("master", v.get("enabled", True)))
+    links += [{"output": last, "input": "master:In 1"}, {"output": "in:Out", "input": "master:In 2"}]
     chain = {"node.description": "Booth Mic", "media.name": "Booth Mic",
              "filter.graph": {"nodes": nodes, "links": links, "inputs": ["in:In"], "outputs": ["master:Out"]},
              "audio.channels": 1, "audio.position": ["MONO"],
@@ -219,9 +288,9 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
     A chain change that fails never holds back the selector."""
     file = file or path()
     select_file = file.with_name(SELECT_CONF)
-    chain, sel_text = json.loads(build(settings)), build_selector(state["mic"]) if state else None
-    sel = sel_text and json.loads(sel_text)
-    with _LOCK:
+    with _LOCK:  # built inside: the plugins verified just before the write, the latest settings applied last
+        chain, sel_text = json.loads(build(settings)), build_selector(state["mic"]) if state else None
+        sel = sel_text and json.loads(sel_text)
         old, old_text, old_sel_text, said = _load(file), _text(file), _text(select_file), None
         restart = shape(old) != shape(chain)
         if old != chain and not restart and (cmd := set_params_cmd(dump(), chain)) and not run(cmd):
@@ -308,7 +377,19 @@ def sync(settings, read=scarlett.read, run=service.run, dump=_dump, file=None):
     return describe(state)
 
 
+def write(file=None):
+    """booth-voice.service's ExecStartPre: voice.conf from the saved settings and the plugins verified now, so a plugin
+    changed since the last write is never loaded. No systemctl, no Scarlett: the unit is starting. None, or what went
+    wrong: then the unit doesn't start on the old config."""
+    return _save(json.loads(build(store.load())), file or path())
+
+
 def main():
+    if sys.argv[1:] == ["--write"]:
+        said = write()
+        if said:
+            print(f"booth.voice: {said}", file=sys.stderr)
+        return 1 if said else 0
     print(sync(store.load()))
     return 0
 

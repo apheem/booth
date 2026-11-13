@@ -1,7 +1,9 @@
 """install.sh runs against a throwaway HOME only, never the real home folder."""
 import filecmp
+import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -147,6 +149,48 @@ class Install(unittest.TestCase):
         self.assertIn("Booth Mic is waiting for the Scarlett", r.stdout)  # what booth.voice said
         self.assertEqual(sorted(os.listdir(self.unit.parent)),
                          ["booth-mic-select.service", "booth-voice.service", "booth.service"])
+
+    def pre_start(self):
+        """booth-voice.service's ExecStartPre as argv: systemd's %% and $$ undone, then its quoted words split."""
+        line = next(ln for ln in (self.unit.parent / "booth-voice.service").read_text().splitlines()
+                    if ln.startswith("ExecStartPre="))
+        return shlex.split(line.removeprefix("ExecStartPre=").replace("%%", "%").replace("$$", "$"))
+
+    def test_booth_voice_rewrites_its_config_from_freshly_verified_plugins_before_each_start(self):
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self.pre_start()
+        self.assertEqual(argv, ["/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.voice",
+                                "--write"])  # the installed copy, never the repo
+        # voice.conf written while sc4m verified; the file changed since: the next start must never load it
+        plugin = self.app.parent / "plugins/sc4m_1916.so"
+        plugin.parent.mkdir(exist_ok=True)
+        plugin.write_bytes(b"changed after install")
+        conf = self.home / ".config/booth/voice.conf"
+        cfg = json.loads(conf.read_text())
+        chain = next(m for m in cfg["context.modules"] if m["name"] == "libpipewire-module-filter-chain")["args"]
+        chain["filter.graph"]["nodes"].append({"type": "ladspa", "name": "leveling", "plugin": str(plugin),
+                                               "label": "sc4m"})
+        conf.write_text(json.dumps(cfg))
+        before = self.calls.read_text()
+        r = subprocess.run(argv, env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("ladspa", conf.read_text())
+        self.assertNotIn(str(plugin), conf.read_text())
+        self.assertEqual(self.calls.read_text(), before)  # no systemctl from inside the unit's own start
+
+    def test_booth_voice_doesnt_start_when_its_pre_start_cant_write_the_config(self):
+        self.assertEqual(self.install().returncode, 0)
+        unit = (self.unit.parent / "booth-voice.service").read_text().splitlines()
+        self.assertLess(unit.index(next(ln for ln in unit if ln.startswith("ExecStartPre="))),
+                        unit.index(next(ln for ln in unit if ln.startswith("ExecStart="))))
+        self.assertNotIn("ExecStartPre=-", "\n".join(unit))  # a failure stops the start
+        conf = self.home / ".config/booth/voice.conf"
+        conf.unlink()
+        conf.mkdir()  # a folder where the file goes: the write fails
+        r = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not saved", r.stderr)
 
     def test_installs_booth_mic_select_which_runs_the_selector_bound_to_booth_voice(self):
         r = self.install()
@@ -394,6 +438,15 @@ class Install(unittest.TestCase):
                 self.assertIsNotNone(m, line)
                 self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
                                  str(self.home / ".config/booth" / conf))
+        line = next(ln for ln in voice_unit.read_text().splitlines() if ln.startswith("ExecStartPre="))
+        m = re.fullmatch(r'ExecStartPre=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
+                         r'booth\.voice --write', line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
+                         str(self.home / ".local/share/booth"))
+        self.unit = unit
+        pre = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
+        self.assertEqual(pre.returncode, 0, pre.stderr)  # the installed copy found, whatever the home's name
         if shutil.which("systemd-analyze"):  # read-only: parses the unit, starts nothing
             for u in (unit, voice_unit, select_unit):
                 v = subprocess.run(["systemd-analyze", "--user", "verify", str(u)], capture_output=True, text=True,

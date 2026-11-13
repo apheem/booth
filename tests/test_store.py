@@ -139,6 +139,28 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_the_voice_stages_and_knobs_round_trip(self):
+        settings = store.load(self.path)
+        settings["voice"].update(noise=False, leveling=True, limiter=False, noise_strength=0, leveling_amount=100,
+                                 limiter_ceiling=-20.0)
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], settings["voice"])
+        settings["voice"].update(noise_strength=100, leveling_amount=0, limiter_ceiling=0)
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], settings["voice"])
+
+    def test_a_bad_stage_or_knob_value_counts_as_corrupt(self):
+        # the stage rows show and apply them; a knob out of range would reach the plugin
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"voice": {"noise": 1}}', '{"voice": {"leveling": "on"}}', '{"voice": {"limiter": null}}',
+                     '{"voice": {"noise_strength": 101}}', '{"voice": {"noise_strength": -1}}',
+                     '{"voice": {"noise_strength": 50.5}}', '{"voice": {"leveling_amount": true}}',
+                     '{"voice": {"leveling_amount": 200}}', '{"voice": {"limiter_ceiling": 0.5}}',
+                     '{"voice": {"limiter_ceiling": -20.5}}', '{"voice": {"limiter_ceiling": NaN}}',
+                     '{"voice": {"limiter_ceiling": false}}', '{"voice": {"limiter_ceiling": "-1"}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
     def test_failed_save_keeps_the_previous_file(self):
         old = store.defaults()
         old["camera"]["zoom_absolute"] = 250

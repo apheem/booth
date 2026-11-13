@@ -7,7 +7,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import meter, scarlett, voice
+from booth import meter, plugins, scarlett, voice
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
@@ -39,7 +39,8 @@ class _W:
     def __init__(self, *_args, **kwargs):
         self.handlers, self.active, self.selected, self.sensitive = {}, False, 0, True
         self.description = self.subtitle = self.model = None
-        self.title = kwargs.get("title")
+        self.title, self.adjustment = kwargs.get("title"), kwargs.get("adjustment")
+        self.value, self.rows = (self.adjustment or {}).get("value"), []
         self.responses = []
 
     def connect(self, signal, handler, *args):
@@ -65,6 +66,17 @@ class _W:
             self.selected = i
             if "notify::selected" in self.handlers:
                 self.emit("notify::selected", None)
+
+    def get_value(self):
+        return self.value
+
+    def set_value(self, value):
+        if value != self.value:
+            self.value = value
+            self.emit("notify::value", None)
+
+    def add_row(self, row):
+        self.rows.append(row)
 
     def set_model(self, model):
         self.model = model
@@ -132,6 +144,7 @@ class PageCase(unittest.TestCase):
     def setUp(self):
         self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
         self.said, self.selecting = "live", True  # what voice.apply returns; whether Booth Mic's selector runs
+        self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.verified: every plugin verifies
         self.settings = {"microphone": {}}
 
         real_send = scarlett.send
@@ -147,8 +160,11 @@ class PageCase(unittest.TestCase):
         for patch in (
                 mock.patch.object(microphone, "super", lambda *a: ns(__init__=lambda: None), create=True),
                 mock.patch.object(microphone, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W, ComboRow=_W,
-                                                        AlertDialog=dialog, ResponseAppearance=ns(DESTRUCTIVE=2))),
-                mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295)),
+                                                        SpinRow=_W, ExpanderRow=_W, AlertDialog=dialog,
+                                                        ResponseAppearance=ns(DESTRUCTIVE=2))),
+                mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295,
+                                                        Adjustment=ns(new=lambda value, lower, upper, *_: dict(
+                                                            value=value, lower=lower, upper=upper)))),
                 mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
                 mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: f(*a)),
                 mock.patch.object(microphone.threading, "Thread", Inline),
@@ -157,6 +173,7 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "apply",
                                   lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
+                mock.patch.object(microphone.voice, "verified", lambda: self.found),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst)):
             patch.start()
@@ -443,6 +460,88 @@ class VoiceGroup(PageCase):
     real_poll = ScarlettGroup.real_poll
 
 
+class StageRows(PageCase):
+    """Noise suppression, leveling and the limiter: a switch, one knob and the raw controls each, saved and applied live;
+    a plugin missing or changed shows so and is bypassed."""
+
+    def stage(self, key):
+        return self.page.stages[key]
+
+    def test_each_stage_has_a_switch_a_knob_and_its_raw_controls_in_chain_order(self):
+        self.assertEqual(list(self.page.stages), ["noise", "leveling", "limiter"])
+        self.assertEqual([(s.switch.title, s.knob.title) for s in self.page.stages.values()],
+                         [("Noise Suppression", "Strength"), ("Leveling", "Amount"), ("Limiter", "Ceiling (dB)")])
+        self.assertEqual([s.details.title for s in self.page.stages.values()], ["Show details"] * 3)
+        self.assertEqual([r.title for r in self.stage("leveling").details.rows], list(voice.amount(50)))
+
+    def test_stages_start_on_with_the_default_knobs(self):
+        self.assertEqual([s.switch.active for s in self.page.stages.values()], [True] * 3)
+        self.assertEqual([s.knob.value for s in self.page.stages.values()], [50, 50, -1.0])
+        self.assertEqual([r.subtitle for r in self.stage("limiter").details.rows], ["0", "-1", "0.05"])
+        self.assertEqual(self.settings["voice"], {})  # nothing saved by showing them
+
+    def test_saved_values_are_shown_at_start(self):
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {
+            "noise": False, "noise_strength": 80, "limiter_ceiling": -3.5}})
+        self.assertEqual((page.stages["noise"].switch.active, page.stages["noise"].knob.value,
+                          page.stages["limiter"].knob.value), (False, 80, -3.5))
+        self.assertEqual(page.stages["noise"].details.rows[0].subtitle, "76")
+
+    def test_the_knob_ranges_stay_inside_what_the_settings_accept(self):
+        for s, (lo, hi) in zip(self.page.stages.values(), ((0, 100), (0, 100), (-12, 0))):
+            self.assertEqual((s.knob.adjustment["lower"], s.knob.adjustment["upper"]), (lo, hi))
+
+    def test_a_stage_switch_is_saved_and_applied_live_never_moving_the_selector(self):
+        self.click(self.stage("noise").switch, False)
+        self.assertEqual((self.settings["voice"], self.saved), ({"noise": False}, [self.settings]))
+        self.assertEqual(self.applied, [({"noise": False}, None)])
+
+    def test_a_knob_is_saved_applied_and_its_raw_controls_follow(self):
+        self.stage("noise").knob.set_value(80.0)
+        self.assertEqual(self.settings["voice"], {"noise_strength": 80})
+        self.assertIs(type(self.settings["voice"]["noise_strength"]), int)  # the settings accept whole numbers only
+        self.assertEqual(self.applied, [({"noise_strength": 80}, None)])
+        self.assertEqual(self.stage("noise").details.rows[0].subtitle, "76")
+        self.stage("limiter").knob.set_value(-2.5)
+        self.assertEqual(self.settings["voice"]["limiter_ceiling"], -2.5)
+        self.assertEqual(self.stage("limiter").details.rows[1].subtitle, "-2.5")
+
+    def test_a_knob_that_cant_be_saved_says_so_and_still_applies(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.stage("leveling").knob.set_value(70.0)
+        self.assertEqual(self.stage("leveling").knob.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(len(self.applied), 1)
+
+    def test_a_plugin_missing_or_changed_says_so_and_the_stage_is_bypassed(self):
+        self.page.show(state(), self.page.writer.writes, True, "", ["leveling"])
+        row = self.stage("leveling")
+        self.assertEqual(row.switch.subtitle, microphone.MISSING)
+        self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (False, False, False))
+        self.assertEqual((self.settings["voice"], self.saved, self.applied), ({}, [], []))  # shown, never saved
+        self.assertTrue(self.stage("noise").switch.sensitive)
+        self.page.show(state(), self.page.writer.writes, True, "", [])  # ./install.sh fetched it again
+        self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (True, True, True))
+        self.assertNotEqual(row.switch.subtitle, microphone.MISSING)
+
+    def test_each_poll_checks_the_plugins(self):
+        self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
+        idle = ScarlettGroup.real_poll(self, lambda choice: state())
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.stage("noise").switch.subtitle, microphone.MISSING)
+        self.assertNotEqual(self.stage("limiter").switch.subtitle, microphone.MISSING)
+
+    def test_the_master_switch_off_greys_every_stage(self):
+        self.click(self.page.master, False)
+        self.assertEqual([(s.switch.sensitive, s.knob.sensitive) for s in self.page.stages.values()],
+                         [(False, False)] * 3)
+        self.click(self.page.master, True)
+        self.assertEqual([(s.switch.sensitive, s.knob.sensitive) for s in self.page.stages.values()],
+                         [(True, True)] * 3)
+
+
 class Meters(PageCase):
     """The before-meter and the sidebar meter: what they say, and when the Scarlett is metered."""
 
@@ -558,7 +657,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4, True, ""))])
+        self.assertEqual(self.idle, [(page.show, (None, 4, True, "", None))])  # None: the stage rows stay as they are
 
 
 if __name__ == "__main__":

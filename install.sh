@@ -77,11 +77,14 @@ mv "$units/booth.service.new" "$units/booth.service"
 
 # booth-voice.service runs Booth Mic, the voice chain, as its own PipeWire client from the config Booth writes beside
 # its settings, so Booth Mic stays in a call with Booth closed or crashed. It lives with the user's PipeWire. No config
-# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above.
+# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above. ExecStartPre rewrites voice.conf with the
+# installed booth.voice from the saved settings and the plugins verified right then (booth.plugins), so a plugin file
+# changed since Booth last wrote the config is left out, never loaded; if it can't write it, the unit doesn't start.
 voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
 [ -e "$units/booth-voice.service" ] || voice_first=1
 voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 select_arg=$(printf '%s' "$config/booth/voice-select.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+dest_arg=$(printf '%s' "$dest" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 cat > "$units/booth-voice.service.new" <<EOF
 [Unit]
 Description=Booth Mic: the voice chain (a PipeWire filter-chain)
@@ -90,6 +93,7 @@ BindsTo=pipewire.service
 
 [Service]
 ExecCondition=/usr/bin/test -f "$voice_arg"
+ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write
 ExecStart=/usr/bin/pipewire -c "$voice_arg"
 Restart=on-failure
 RestartSec=5

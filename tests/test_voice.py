@@ -1,15 +1,30 @@
 """The voice chain builder and its service side: Booth Mic is a mono source fed only from the mic's channel, through a
 separate source selector, with every stage and the master switch a live dry/wet bypass."""
 import copy
+import hashlib
+import itertools
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from booth import scarlett, voice
+from booth import plugins, scarlett, voice
 from tests.fixture import read
 from tests.test_headset import DUMP
+
+PORTS = json.loads(read("ladspa/ports.json"))  # #14's capture of each verified plugin's descriptors: exact port names
+FOUND = {name: f"/home/u/.local/share/booth/plugins/{name}" for name in plugins.MANIFEST}  # every plugin verified
+STAGE_KEYS = ("noise", "leveling", "limiter")
+REAL_VERIFIED = getattr(voice, "verified", None)
+
+
+def setUpModule():
+    """No plugin verifies unless a test says so: apply() never reads the real plugin folder."""
+    patch = mock.patch.object(voice, "verified", lambda: {}, create=True)
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
 
 CTRLS = scarlett.parse_contents(read("scarlett/amixer-contents.txt"))
 MIC = scarlett.mic(CTRLS, DUMP, "XLR")
@@ -62,9 +77,25 @@ SCARLETT_BACK = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"])])
 SELECTING = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"]), node(80, "booth.mic.select")])
 
 
-def config(settings=ON):
-    """Booth Mic's chain: booth-voice.service's config, whatever the Scarlett does."""
-    return json.loads(voice.build(settings))
+def config(settings=ON, found=None):
+    """Booth Mic's chain: booth-voice.service's config, whatever the Scarlett does, with the plugins in `found` verified
+    (none when not given)."""
+    return json.loads(voice.build(settings, {} if found is None else found))
+
+
+def descriptor(plugin_path, label):
+    """The fixture's descriptor of `label` in the plugin file at `plugin_path`."""
+    found = [d for d in PORTS[os.path.basename(plugin_path)] if d["label"] == label]
+    assert len(found) == 1, (plugin_path, label)
+    return found[0]
+
+
+def audio(desc, direction):
+    return [p["name"] for p in desc["ports"] if p["type"] == "audio" and p["direction"] == direction]
+
+
+def ladspa(cfg):
+    return [n for n in module(cfg, "libpipewire-module-filter-chain")["filter.graph"]["nodes"] if n["type"] == "ladspa"]
 
 
 def selector(mic=MIC):
@@ -107,6 +138,10 @@ def flow(cfg):
             return {p: g for p, g in out.items() if g}
         if node["label"].startswith("bq_"):
             return {f"{name}({p})": g for p, g in signal(f"{name}:In").items()}
+        if node["type"] == "ladspa":  # every audio input fed the same signal (a stereo plugin in a mono chain)
+            ins = [signal(f"{name}:{p}") for p in audio(descriptor(node["plugin"], node["label"]), "input")]
+            assert ins and all(i == ins[0] for i in ins), (name, ins)
+            return {f"{name}({p})": g for p, g in ins[0].items()}
         raise AssertionError(f"unknown label {node['label']}")
 
     return output(graph_out.split(":")[0])
@@ -198,7 +233,7 @@ class Bypass(unittest.TestCase):
         self.assertEqual((rumble["type"], rumble["label"]), ("builtin", "bq_highpass"))
         self.assertEqual(rumble["control"]["Freq"], 80.0)
         types = {n["type"] for n in nodes}
-        self.assertEqual(types, {"builtin"})  # no LADSPA plugin in this slice
+        self.assertEqual(types, {"builtin"})  # no plugin verified: no LADSPA plugin
 
     def test_switches_change_only_control_values_so_they_never_need_a_restart(self):
         configs = [config({"voice": {"enabled": e, "rumble": r}}) for e in (True, False) for r in (True, False)]
@@ -218,6 +253,209 @@ class Bypass(unittest.TestCase):
     def test_no_chain_running_no_live_change(self):
         self.assertIsNone(voice.set_params_cmd("[]", config()))
         self.assertIsNone(voice.set_params_cmd("not json", config()))
+
+
+class Stages(unittest.TestCase):
+    """Noise suppression, leveling and the limiter: verified plugins only, always in the graph once verified, each with
+    its own live dry/wet bypass."""
+
+    def test_every_verified_stage_is_in_the_chain_in_order(self):
+        self.assertEqual(flow(config(ON, FOUND)), {"limiter(leveling(noise(rumble(in))))": 1.0})
+
+    def test_every_on_off_combination_bypasses_exactly_the_stages_that_are_off(self):
+        keys = ("rumble",) + STAGE_KEYS
+        for on in itertools.product((True, False), repeat=len(keys)):
+            settings, path = {"voice": dict(zip(keys, on))}, "in"
+            for key, active in zip(keys, on):
+                path = f"{key}({path})" if active else path
+            self.assertEqual(flow(config(settings, FOUND)), {path: 1.0}, settings)
+
+    def test_the_master_switch_off_passes_the_raw_mic_whatever_the_stages(self):
+        self.assertEqual(flow(config({"voice": {"enabled": False}}, FOUND)), {"in": 1.0})
+
+    def test_a_plugin_that_didnt_verify_is_left_out_and_bypassed(self):
+        for missing in plugins.MANIFEST:
+            found = {k: v for k, v in FOUND.items() if k != missing}
+            cfg = config(ON, found)
+            self.assertNotIn(missing, [os.path.basename(n["plugin"]) for n in ladspa(cfg)])
+            gone = voice.missing(found)
+            self.assertEqual(len(gone), 1, missing)
+            path = "rumble(in)"
+            for key in STAGE_KEYS:
+                path = path if key in gone else f"{key}({path})"
+            self.assertEqual(flow(cfg), {path: 1.0}, missing)
+        self.assertEqual((flow(config(ON, {})), ladspa(config(ON, {}))), ({"rumble(in)": 1.0}, []))
+        self.assertEqual((voice.missing({}), voice.missing(FOUND)), (list(STAGE_KEYS), []))
+
+    def test_plugins_are_loaded_only_from_the_paths_verification_returned(self):
+        self.assertEqual(sorted(n["plugin"] for n in ladspa(config(ON, FOUND))), sorted(FOUND.values()))
+
+    def test_labels_and_control_names_match_the_captured_descriptors_exactly(self):
+        nodes = ladspa(config(ON, FOUND))
+        self.assertEqual(len(nodes), 3)
+        for n in nodes:
+            desc = descriptor(n["plugin"], n["label"])  # the label itself must be in the fixture
+            ports = {p["name"]: p for p in desc["ports"] if p["type"] == "control" and p["direction"] == "input"}
+            self.assertTrue(n["control"], n["name"])
+            for name, value in n["control"].items():
+                self.assertIn(name, ports, n["name"])
+                self.assertIsInstance(value, float, name)  # pw-cli reads 1 as an Int
+                self.assertGreaterEqual(value, ports[name].get("lower", value), name)
+                self.assertLessEqual(value, ports[name].get("upper", value), name)
+
+    def test_each_stage_output_is_a_real_output_port_of_its_plugin(self):
+        cfg = config(ON, FOUND)
+        graph = module(cfg, "libpipewire-module-filter-chain")["filter.graph"]
+        for n in ladspa(cfg):
+            outs = {lk["output"].split(":", 1)[1] for lk in graph["links"] if lk["output"].startswith(n["name"] + ":")}
+            self.assertEqual(len(outs), 1, n["name"])
+            self.assertIn(outs.pop(), audio(descriptor(n["plugin"], n["label"]), "output"))
+
+    def test_switches_and_knobs_never_change_the_shape_so_booth_mic_is_never_restarted(self):
+        configs = [config({"voice": {"noise": a, "leveling": b, "limiter": c, "noise_strength": k,
+                                     "leveling_amount": k, "limiter_ceiling": -k / 10}}, FOUND)
+                   for a, b, c in itertools.product((True, False), repeat=3) for k in (0, 50, 100)]
+        self.assertEqual(len({json.dumps(voice.shape(c), sort_keys=True) for c in configs}), 1)
+        self.assertEqual(len({json.dumps(c, sort_keys=True) for c in configs}), len(configs))
+
+    def test_a_stage_toggle_is_set_live_on_its_own_mixer(self):
+        cmd = voice.set_params_cmd(CHAIN_DUMP, config({"voice": {"leveling": False}}, FOUND))
+        params = json.loads(cmd[4])["params"]
+        pairs = dict(zip(params[::2], params[1::2]))
+        self.assertEqual((pairs["leveling_mix:Gain 1"], pairs["leveling_mix:Gain 2"]), (0.0, 1.0))
+        self.assertEqual((pairs["noise_mix:Gain 1"], pairs["noise_mix:Gain 2"]), (1.0, 0.0))
+        self.assertEqual(pairs["limiter:Limit (dB)"], -1.0)  # the knobs ride along: live too
+        self.assertTrue(all(isinstance(v, float) for v in params[1::2]))
+
+    def test_the_knobs_reach_their_stages(self):
+        cfg = config({"voice": {"noise_strength": 100, "leveling_amount": 0, "limiter_ceiling": -3.5}}, FOUND)
+        self.assertEqual({n["name"]: n["control"] for n in ladspa(cfg)},
+                         {"noise": voice.strength(100), "leveling": voice.amount(0), "limiter": voice.ceiling(-3.5)})
+
+    def test_the_defaults_are_on_at_the_middle_with_a_minus_1_db_ceiling(self):
+        self.assertEqual({n["name"]: n["control"] for n in ladspa(config(ON, FOUND))},
+                         {"noise": voice.strength(50), "leveling": voice.amount(50), "limiter": voice.ceiling(-1.0)})
+
+
+class Mappings(unittest.TestCase):
+    """Each friendly knob → its plugin's raw controls: both ends and the middle."""
+
+    def test_strength_raises_the_voice_gate(self):
+        self.assertEqual(voice.strength(0), {"VAD Threshold (%)": 0.0, "VAD Grace Period (ms)": 200.0,
+                                             "Retroactive VAD Grace (ms)": 0.0})
+        self.assertEqual(voice.strength(50)["VAD Threshold (%)"], 48.0)  # a whole percent: RNNoise reads it as an integer
+        self.assertEqual(voice.strength(100)["VAD Threshold (%)"], 95.0)
+
+    def test_amount_lowers_the_threshold_and_raises_the_ratio_with_makeup_gain(self):
+        fixed = {"RMS/peak": 0.0, "Attack time (ms)": 10.0, "Release time (ms)": 150.0, "Knee radius (dB)": 5.0}
+        self.assertEqual(voice.amount(0), {**fixed, "Threshold level (dB)": 0.0, "Ratio (1:n)": 1.0,
+                                           "Makeup gain (dB)": 0.0})
+        self.assertEqual(voice.amount(50), {**fixed, "Threshold level (dB)": -15.0, "Ratio (1:n)": 3.5,
+                                            "Makeup gain (dB)": 5.36})
+        self.assertEqual(voice.amount(100), {**fixed, "Threshold level (dB)": -30.0, "Ratio (1:n)": 6.0,
+                                             "Makeup gain (dB)": 12.5})
+
+    def test_ceiling_is_the_limit_in_db(self):
+        for db in (0, -1.0, -20.0):
+            self.assertEqual(voice.ceiling(db), {"Input gain (dB)": 0.0, "Limit (dB)": float(db),
+                                                 "Release time (s)": 0.05})
+        self.assertIsInstance(voice.ceiling(0)["Limit (dB)"], float)
+
+
+def plugin_folder(test, good, bad):
+    """A plugin folder and a manifest: each of `good` holds its pinned bytes, each of `bad` other bytes."""
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    where = Path(tmp.name) / "plugins"
+    where.mkdir()
+    where.chmod(0o755)
+    manifest = {name: hashlib.sha256(name.encode()).hexdigest() for name in plugins.MANIFEST}
+    for name in good:
+        (where / name).write_bytes(name.encode())
+    for name in bad:
+        (where / name).write_bytes(b"changed after install")
+    for f in where.iterdir():
+        f.chmod(0o644)
+    return where, manifest
+
+
+class Verification(unittest.TestCase):
+    """The trust seam: every chain Booth writes holds only plugins verified while it was built."""
+
+    def found(self, where, manifest):
+        return REAL_VERIFIED(where, manifest)
+
+    def test_only_plugins_that_verify_now_are_found(self):
+        names = list(plugins.MANIFEST)
+        where, manifest = plugin_folder(self, good=names[:1], bad=names[1:2])  # the third is missing
+        self.assertEqual(self.found(where, manifest), {names[0]: str(where / names[0])})
+        where, manifest = plugin_folder(self, good=names, bad=())
+        self.assertEqual(self.found(where, manifest), {n: str(where / n) for n in names})
+
+    def test_a_symlinked_plugin_is_never_found(self):
+        names = list(plugins.MANIFEST)
+        where, manifest = plugin_folder(self, good=names, bad=())
+        real = where.parent / "elsewhere.so"
+        (where / names[0]).rename(real)
+        (where / names[0]).symlink_to(real)
+        self.assertNotIn(names[0], self.found(where, manifest))
+
+    def test_every_build_verifies_again(self):
+        calls = []
+        with mock.patch.object(voice, "verified", lambda: calls.append(1) or FOUND):
+            voice.build(ON)
+            voice.build(ON)
+        self.assertEqual(len(calls), 2)
+
+    def test_apply_writes_only_what_verified_just_before_and_drops_a_plugin_changed_since(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file, ran = Path(tmp.name) / "voice.conf", []
+
+        def run(cmd):
+            ran.append(cmd)
+            return True
+        with mock.patch.object(voice, "verified", lambda: FOUND):
+            voice.apply(ON, STATE, run=run, dump=lambda: CHAIN_DUMP, file=file)
+        self.assertEqual(len(ladspa(json.loads(file.read_text()))), 3)
+        ran.clear()
+        changed = {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}
+        with mock.patch.object(voice, "verified", lambda: changed):
+            self.assertEqual(voice.apply(ON, STATE, run=run, dump=lambda: CHAIN_DUMP, file=file), "restarted")
+        self.assertNotIn("sc4m", [n["label"] for n in ladspa(json.loads(file.read_text()))])
+        self.assertEqual(ran, [RESTART])
+
+    def test_the_services_pre_start_rewrites_the_chain_from_the_settings_and_a_fresh_verification(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file = Path(tmp.name) / "voice.conf"
+        file.write_text(voice.build(ON, FOUND))  # written while every plugin verified
+        settings = {"voice": {"noise": False}}
+        with mock.patch.object(voice.store, "load", lambda: settings):
+            self.assertIsNone(voice.write(file))  # all three changed since (none verifies now): none is ever loaded
+        self.assertEqual(json.loads(file.read_text()), config(settings, {}))
+        self.assertEqual(ladspa(json.loads(file.read_text())), [])
+
+    def test_a_pre_start_that_cant_write_fails_so_the_old_chain_never_starts(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file = Path(tmp.name) / "voice.conf"
+        file.mkdir()  # a folder where the file goes: the write fails
+        with mock.patch.object(voice.store, "load", lambda: ON):
+            self.assertIn("not saved", voice.write(file))
+            with mock.patch.object(voice, "path", lambda: file), mock.patch.object(voice.sys, "argv", ["x", "--write"]):
+                self.assertEqual(voice.main(), 1)
+
+    def test_the_pre_start_never_runs_systemctl_or_reads_the_scarlett(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file = Path(tmp.name) / "voice.conf"
+        with mock.patch.object(voice.store, "load", lambda: ON), mock.patch.object(voice, "path", lambda: file), \
+                mock.patch.object(voice.sys, "argv", ["x", "--write"]), \
+                mock.patch.object(voice.service, "run", side_effect=AssertionError("ran")), \
+                mock.patch.object(voice.scarlett, "read", side_effect=AssertionError("read the Scarlett")):
+            self.assertEqual(voice.main(), 0)
+        self.assertEqual(json.loads(file.read_text()), config())
 
 
 class Apply(unittest.TestCase):
