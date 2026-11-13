@@ -1527,8 +1527,8 @@ class Muted(unittest.TestCase):
         run = self.file.with_name(voice.RUN_CONF)
         last = voice.build(MUTED, {})
         run.write_text(last)
-        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))
-        with mock.patch.object(voice.store, "load", eio), mock.patch.object(voice, "verified", lambda w=None: {}):
+        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))  # the settings file's read, in store.load
+        with mock.patch.object(voice.store.Path, "read_bytes", eio), mock.patch.object(voice, "verified", lambda w=None: {}):
             self.assertEqual(voice.write(run), "kept the last config, not read: the settings (Input/output error)")
             self.assertEqual(run.read_text(), last)
             run.unlink()
