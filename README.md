@@ -16,8 +16,9 @@ No pip installs, no sudo.
     ./install.sh
 
 It copies the repo app folder `booth/` to the install folder `~/.local/share/booth/booth/` (a real copy, never a
-symlink), and writes the launcher `~/.local/bin/booth` and the app-grid entry
-`~/.local/share/applications/io.github.apheem.Booth.desktop`. It also writes the systemd user unit
+symlink), and writes the launcher `~/.local/bin/booth`, the app-grid entry
+`~/.local/share/applications/io.github.apheem.Booth.desktop` and its icon
+`~/.local/share/icons/hicolor/scalable/apps/io.github.apheem.Booth.svg`. It also writes the systemd user unit
 `~/.config/systemd/user/booth.service` (`booth --background`, started with your desktop session; it re-applies the
 camera settings at login and whenever the BRIO is plugged back in), enables it and (re)starts it. Opening Booth then
 shows the window of that running instance; "Run in Background" in the main menu disables or enables the service; on, it also
@@ -41,6 +42,9 @@ To check an install matches the repo:
 
     booth                 # the installed launcher (needs ~/.local/bin on PATH), or "Booth" in the app grid
     python3 -m booth      # straight from the repo root, without installing
+
+Shortcuts: Ctrl+1/2/3 open Camera, Microphone and Headphones; Ctrl+0 resets the camera zoom; Ctrl+M mutes Booth Mic
+(GNOME's Ctrl+Alt+M mutes the default mic anywhere); Ctrl+? lists them all.
 
 Settings are saved to `~/.config/booth/settings.json` (`$XDG_CONFIG_HOME/booth/settings.json`). A corrupt file is
 renamed to `settings.json.corrupt-<time>` and defaults load.

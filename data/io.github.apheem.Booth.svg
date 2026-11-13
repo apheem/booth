@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Booth's app icon: a recording booth (a rounded panel) with a camera lens and a microphone. Original drawing. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a8f8a"/>
+      <stop offset="1" stop-color="#1f5e63"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="12" width="112" height="108" rx="20" fill="#16454a"/>
+  <rect x="8" y="8" width="112" height="106" rx="20" fill="url(#panel)"/>
+  <!-- the camera: a lens at the top of the booth -->
+  <circle cx="64" cy="28" r="10" fill="#0f2f33"/>
+  <circle cx="64" cy="28" r="5" fill="#7fd4cc"/>
+  <circle cx="61.5" cy="25.5" r="1.8" fill="#ffffff"/>
+  <!-- the microphone: capsule, cradle and stand -->
+  <rect x="50" y="44" width="28" height="42" rx="14" fill="#f4f1ea"/>
+  <path d="M55 56h18M55 64h18M55 72h18" stroke="#c9c3b5" stroke-width="3" stroke-linecap="round"/>
+  <path d="M40 70a24 24 0 0 0 48 0" fill="none" stroke="#f4f1ea" stroke-width="6" stroke-linecap="round"/>
+  <path d="M64 94v10M50 106h28" fill="none" stroke="#f4f1ea" stroke-width="6" stroke-linecap="round"/>
+</svg>

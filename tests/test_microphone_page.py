@@ -225,6 +225,16 @@ class PageCase(unittest.TestCase):
         return ["amixer", "-c", "Gen", "cset", f"name={name}", value]
 
 
+class ZoomTips(PageCase):
+    def test_the_zoom_tips_hint_says_the_four_settings(self):  # #22, the AC's words
+        tips = self.page.tips.description
+        self.assertEqual(self.page.tips.title, "Zoom Tips")
+        for tip in ("Pick Booth Mic", "Set Suppress background noise to Low",
+                    "Turn off Automatically adjust microphone volume",
+                    "Set the speaker to Same as System so the auto-switch carries the call"):
+            self.assertIn(tip, tips)
+
+
 class ScarlettGroup(PageCase):
     def test_turning_48v_on_asks_first_writes_nothing_and_leaves_the_switch_off(self):
         self.show(state())

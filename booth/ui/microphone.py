@@ -42,6 +42,11 @@ PENDING = "Plugin installed: it loads when Booth Mic restarts, bypassed until th
 PRESET = "Sets every stage at once"
 SIDES = ["Left", "Right"]  # Booth Stereo's voice side, in stereo.SIDES' order
 SIDE = "Your processed voice; the other side carries the source below"
+ZOOM_TIPS = ("In Zoom's audio settings:\n"  # #22: Booth Mic does the processing; the speaker follows Booth's routing
+             "• Pick Booth Mic as the microphone\n"
+             "• Set Suppress background noise to Low\n"
+             "• Turn off Automatically adjust microphone volume\n"
+             "• Set the speaker to Same as System so the auto-switch carries the call")
 PRESETS = list(voice.PRESETS) + ["Custom"]  # Custom: what no preset matches, never applied
 # Each stage's rows (voice.STAGES's keys and "tone"): title, subtitle.
 STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room between words"),
@@ -166,6 +171,9 @@ class MicrophonePage(Adw.PreferencesPage):
         self.add(self.group)
         self.add(self.voice)
         self.add(self.stereo)
+        self.tips = Adw.PreferencesGroup(title="Zoom Tips")
+        self.tips.set_description(ZOOM_TIPS)
+        self.add(self.tips)
         self.poll()
         self.timer = GLib.timeout_add_seconds(POLL_S, self.poll)
 

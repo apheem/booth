@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
 
 from booth import voice
 
@@ -103,6 +104,23 @@ class Install(unittest.TestCase):
             if (REPO / "booth" / name).is_file():
                 self.assertTrue(filecmp.cmp(REPO / "booth" / name, self.app / name, shallow=False), name)
 
+    def test_installs_the_apps_own_icon_which_the_desktop_entry_uses(self):  # #22
+        icon = self.home / f".local/share/icons/hicolor/scalable/apps/{APP_ID}.svg"
+        for _ in range(2):  # re-runnable: replaced in place, no .new left
+            r = self.install()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(filecmp.cmp(REPO / "data" / f"{APP_ID}.svg", icon, shallow=False))
+            self.assertEqual(os.listdir(icon.parent), [icon.name])
+        self.assertIn(f"Icon={APP_ID}", self.desktop.read_text().splitlines())
+
+    def test_the_icon_is_a_plain_drawing_with_nothing_embedded_or_fetched(self):  # original art: no image, no link
+        root = ElementTree.parse(REPO / "data" / f"{APP_ID}.svg").getroot()
+        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertEqual((root.get("width"), root.get("height")), ("128", "128"))  # GNOME's app icon grid
+        tags = {e.tag.rpartition("}")[2] for e in root.iter()}
+        self.assertFalse(tags & {"image", "script", "foreignObject", "use"}, tags)
+        self.assertFalse([a for e in root.iter() for a in e.attrib if a.endswith("href")])
+
     def test_copies_never_symlinks_and_never_points_into_the_repo(self):
         self.assertEqual(self.install().returncode, 0)
         links = [p for p in self.home.rglob("*") if p.is_symlink()]
@@ -113,6 +131,7 @@ class Install(unittest.TestCase):
     def test_a_symlink_in_the_source_is_installed_as_a_file(self):
         src = self.home.parent / "src"
         shutil.copytree(REPO / "booth", src / "booth", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(REPO / "data", src / "data")  # the icon
         shutil.copy(REPO / "install.sh", src)
         (src / "extra.py").write_text("x = 1\n")
         (src / "booth" / "extra.py").symlink_to("../extra.py")

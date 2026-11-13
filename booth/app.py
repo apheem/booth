@@ -13,10 +13,10 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from booth import camera, devices, headset, monitor, mute, routing, service, stereo, store, voice  # noqa: E402
-from booth.ui.window import Window  # noqa: E402
+from booth.ui.window import SHORTCUTS, Window  # noqa: E402
 
 APP_ID = service.APP_ID
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
@@ -99,7 +99,10 @@ class Application(Adw.Application):
         self.mute_action = Gio.SimpleAction.new_stateful("mute", None, GLib.Variant.new_boolean(False))
         self.mute_action.connect("change-state", self.on_mute)
         self.add_action(self.mute_action)
-        self.set_accels_for_action("app.mute", ["<Control>m"])
+        for _group, action, accel, _title in SHORTCUTS:  # Ctrl+M (#21), Ctrl+1/2/3 and Ctrl+0 (#22), Ctrl+?
+            if action:  # None: GNOME's own Ctrl+Alt+M, listed only
+                self.set_accels_for_action(action, [accel])
+        Gtk.Window.set_default_icon_name(APP_ID)  # install.sh's icon, by the app's id (as the desktop entry's Icon=)
 
     def do_handle_local_options(self, options):
         if options.contains("background"):
@@ -136,6 +139,8 @@ class Application(Adw.Application):
         self.snd_monitor = Gio.File.new_for_path(devices.SND_BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES,
                                                                                        None)
         self.snd_monitor.connect("changed", self.on_snd_by_id)
+        # #22: the open window's Camera page follows the BRIO coming and going, once a burst of by-id events settles
+        self.camera_seen = service.Debounce(REPLUG_MS, self.check_camera, GLib.timeout_add, GLib.source_remove)
         # Booth Mic's mic fallback (#20) within seconds, not at the next tick: a heal once a sound card's (the
         # Scarlett's, the BRIO's, the dongle's) burst of links settles, or the PRO X turns on or off
         self.mic_poke = service.Debounce(REPLUG_MS, self.heal_voice, GLib.timeout_add, GLib.source_remove)
@@ -179,6 +184,29 @@ class Application(Adw.Application):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file
         if devices.replugged(entry.get_basename(), event.value_nick):
             self.replug.poke()
+        if devices.camera_moved(entry.get_basename(), event.value_nick):
+            self.camera_seen.poke()
+
+    def check_camera(self):
+        """#22: the BRIO found now (on a worker: udevadm, v4l2-ctl) shown on the open window's Camera page. Its own
+        camera back: restore_saved's reapply restores it. A camera the page lacks: restored and read for a new page."""
+        window = self.window
+        if window is None:  # a window opened later reads the camera in start()
+            return
+        page = window.camera
+
+        def find():
+            with RESTORING:  # after a restore or write in flight, so a new page reads what they left
+                node = devices.discover()["camera"]
+                if node is None or (node == page.node and camera.ZOOM in page.ctrls):
+                    return node, None
+                node = restore_camera(self.settings)
+                return node, camera.read_ctrls(node) if node else None
+
+        def show(found):
+            if found is not None and self.window is window:  # not a window closed meanwhile
+                window.show_camera(*found)
+        off_main(find, show)
 
     def on_snd_by_id(self, _monitor, file, other, event):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file  # as in on_by_id
@@ -186,10 +214,17 @@ class Application(Adw.Application):
             self.dongle.poke()
         if event.value_nick in ("created", "deleted", "moved-in", "moved-out", "renamed"):  # a mic may be back or gone
             self.mic_poke.poke()
+            self.show_dongle()
 
     def on_headset(self, event):
         if event in ("on", "off"):  # the PRO X mic is a backup only while the headset is on
             self.mic_poke.poke()
+            self.show_dongle()
+
+    def show_dongle(self):
+        """#22: the open window's Headphones page: the PRO X dongle there or not, by its by-id link now."""
+        if self.window is not None:
+            self.window.show_headset(devices.dongle_present())
 
     def fix_headset(self):
         threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
@@ -349,6 +384,7 @@ class Application(Adw.Application):
             self.window = Window(self, settings, node, ctrls)
             self.window.show_mic(self.mic_source)  # opened on a backup: its sidebar line and banner say so
             self.window.show_mute(self.muted())
+            self.window.show_headset(devices.dongle_present())
             self.window.connect("close-request", self.on_close)
             self.window.present()
         except Exception:  # no window: release lets Booth exit instead of living on with nothing to show

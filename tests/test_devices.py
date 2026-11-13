@@ -187,5 +187,32 @@ class DongleAppeared(unittest.TestCase):
             self.assertFalse(devices.dongle_appeared(name, event), (name, event))
 
 
+class Presence(unittest.TestCase):
+    """#22: the not-connected pages follow the by-id folders, re-resolved on every event."""
+    BRIO = f"usb-046d_Logitech_BRIO_{FAKE_SERIAL}-video-index0"
+
+    def test_a_color_node_or_the_folder_coming_or_going_may_move_the_brio(self):
+        for name in (self.BRIO, "by-id"):
+            for event in ("created", "deleted", "moved-in", "moved-out", "renamed"):
+                self.assertTrue(devices.camera_moved(name, event), (name, event))
+
+    def test_the_ir_node_or_another_event_never_does(self):
+        self.assertFalse(devices.camera_moved(self.BRIO.replace("index0", "index2"), "deleted"))
+        self.assertFalse(devices.camera_moved(self.BRIO, "changes-done-hint"))
+        self.assertFalse(devices.camera_moved(self.BRIO, "attribute-changed"))
+
+    def test_the_dongle_is_there_while_its_by_id_link_is(self):
+        scarlett = f"usb-Focusrite_Scarlett_Solo_4th_Gen_{FAKE_SERIAL}-00"
+        asked = []
+        self.assertTrue(devices.dongle_present(lambda p: asked.append(p) or [scarlett, devices.PRO_X_USB + "00"]))
+        self.assertEqual(asked, [devices.SND_BY_ID])
+        self.assertFalse(devices.dongle_present(lambda p: [scarlett]))
+
+    def test_no_folder_is_no_dongle(self):  # udev removes /dev/snd/by-id with the last USB sound card
+        def gone(_path):
+            raise FileNotFoundError
+        self.assertFalse(devices.dongle_present(gone))
+
+
 if __name__ == "__main__":
     unittest.main()
