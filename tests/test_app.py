@@ -701,11 +701,15 @@ class HeadsetBattery(unittest.TestCase):
         stub.send_notification.assert_called_once_with("routing-unsaved", notification.new.return_value)
 
     def test_booth_stereos_notice_is_sent_on_the_main_loop_under_its_own_id(self):  # #19: from sync's worker
+        idle = []
         with mock.patch.object(app.Gio, "Notification") as notification, \
-                mock.patch.object(app.GLib, "idle_add", lambda f, *a: f(*a)):
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
             stub = mock.Mock()
             app.Application.stereo_switched(stub, "Booth Stereo switched computer sound to X — a recording on it "
                                                   "restarted")
+            stub.send_notification.assert_not_called()  # never on sync's worker
+            for f, a in idle:
+                f(*a)
         notification.new.assert_called_once_with("Booth Stereo switched computer sound to X — a recording on it "
                                                   "restarted")
         stub.send_notification.assert_called_once_with("booth-stereo", notification.new.return_value)
@@ -1116,6 +1120,32 @@ class Shortcuts(unittest.TestCase):
             ui_window.Window.reset_zoom(win)
             self.assertEqual(win.camera.reset_zoom.call_count, int(plugged))  # never a write to a gone camera
 
+    def test_the_shortcuts_window_lists_each_shortcut_in_its_group(self):  # m22
+        with mock.patch.object(ui_window, "Gtk") as gtk:
+            gtk.ShortcutsGroup.side_effect = lambda title: mock.Mock(title=title)
+            gtk.ShortcutsShortcut.side_effect = lambda title, accelerator: (title, accelerator)
+            ui_window.shortcuts_window()
+        groups = [c.args[0] for c in gtk.ShortcutsSection.return_value.add_group.call_args_list]
+        self.assertEqual([(g.title, *c.args[0]) for g in groups for c in g.add_shortcut.call_args_list],
+                         [(group, title, accel) for group, _action, accel, title in ui_window.SHORTCUTS])
+        gtk.ShortcutsWindow.return_value.add_section.assert_called_once_with(gtk.ShortcutsSection.return_value)
+
+    def test_a_new_window_has_the_shortcuts_window_and_shows_the_camera_as_found(self):  # m23, m33
+        win, ns = mock.Mock(), mock.Mock()
+        with mock.patch.object(ui_window, "super", lambda *a: ns, create=True), \
+                mock.patch.multiple(ui_window, Adw=mock.DEFAULT, Gtk=mock.DEFAULT, Gio=mock.DEFAULT, GLib=mock.DEFAULT,
+                                    CameraPage=mock.DEFAULT, HeadphonesPage=mock.DEFAULT, MicrophonePage=mock.DEFAULT,
+                                    shortcuts_window=mock.DEFAULT) as m:
+            ui_window.Window.__init__(win, mock.Mock(), {"camera": {}}, DEV, {})
+        win.set_help_overlay.assert_called_once_with(m["shortcuts_window"].return_value)
+        win.show_camera.assert_called_once_with(DEV)
+
+    def test_the_mute_button_says_booth_stereo_keeps_recording(self):  # #19 W5 final
+        with mock.patch.object(ui_window, "Gtk") as gtk, mock.patch.object(ui_window, "Adw"):
+            ui_window.page("Booth", mock.Mock(), ui_window.main_menu())
+        tip = next(c.kwargs["tooltip_text"] for c in gtk.ToggleButton.call_args_list)
+        self.assertEqual(tip, "Mute Booth Mic (Ctrl+M) — Booth Stereo keeps recording")
+
     def test_the_window_uses_the_apps_own_icon(self):
         app.Application()
         self.assertEqual(Gtk.Window.get_default_icon_name(), app.APP_ID)
@@ -1171,6 +1201,27 @@ class NotConnected(unittest.TestCase):
         stub, _, restore, read_ctrls, ctrls = self.check(mock.Mock(node=DEV, ctrls={}), DEV)
         restore.assert_called_once_with(stub.settings)
         stub.window.show_camera.assert_called_once_with(DEV, ctrls)
+
+    def test_the_camera_is_probed_under_the_restore_lock(self):  # m32: never between a restore's writes
+        lock, held = mock.MagicMock(), []
+        lock.__enter__.side_effect = lambda *_: held.append(True)
+        lock.__exit__.side_effect = lambda *_: held.pop() and False
+        with mock.patch.object(app, "RESTORING", lock), mock.patch.object(app, "off_main", lambda w, t: t(w())), \
+                mock.patch.object(app.devices, "discover", side_effect=lambda: {"camera": DEV} if held else 1 / 0):
+            app.Application.check_camera(mock.Mock(window=mock.Mock(camera=mock.Mock(node=DEV,
+                                                                                    ctrls={camera.ZOOM: {}}))))
+
+    def test_a_window_shown_checks_the_camera_again(self):  # #22 W5 final: an event while starting was dropped
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.SCARLETT)
+        with mock.patch.object(app, "Window"), mock.patch.object(app.devices, "dongle_present", return_value=True):
+            app.Application.show_window(stub, {"camera": {}}, DEV, {}, False)
+        stub.check_camera.assert_called_once_with()
+
+    def test_a_brio_whose_controls_werent_read_shows_the_status_page(self):  # m05: no zoom, no page to show
+        win = mock.Mock()
+        win.camera.node, win.camera.ctrls, win.camera.values = DEV, {}, {}
+        ui_window.Window.show_camera(win, DEV)
+        win.camera_stack.set_visible_child_name.assert_called_once_with("missing")
 
     def test_with_no_window_nothing_is_probed(self):
         _, discover, _, _, _ = self.check(None, DEV, window=False)

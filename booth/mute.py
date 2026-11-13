@@ -90,7 +90,8 @@ def write(on, run=service.run, dump=voice._dump):
 
 def enforce(load=store.load, dump=voice._dump, run=service.run, sleep=time.sleep):
     """booth-voice.service's ExecStartPost: the saved record muted → booth_mic's node muted once it shows, waiting
-    ENFORCE_S at most; never unmuted. False: muted, but no booth_mic took it in time."""
+    ENFORCE_S at most; never unmuted. The record holds a node mute made with Booth closed once booth.voice's own runs
+    saw it (install's sync and --reload, the pre-start: voice._saved). False: muted, but no booth_mic took it in time."""
     if not (load().get("voice") or {}).get("muted"):
         return True
     for _ in range(ENFORCE_S * 4):

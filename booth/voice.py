@@ -32,7 +32,8 @@ whose plugin stopped verifying goes dry live, one that verifies only since waits
 both are missing (loaded()). A new shape (new code) restarts both services, never starting one the user stopped.
 Mute (#21, booth.mute): muted, the master mixer is silent (both gains 0), live and in every voice-run.conf, so a Booth
 Mic recreated by a restart is silent before Booth puts its node mute back; and a running Booth Mic is never restarted
-while muted (_held), since a call falls back to the raw mic, unmuted, while booth_mic is gone.
+while muted (_held: the record, or booth_mic's live node mute), since a call falls back to the raw mic, unmuted, while
+booth_mic is gone. This module's own runs record a live node mute the record lacks (_saved): no Booth may be watching.
     python3 -m booth.voice            write the configs from the saved settings and the Scarlett now, start the services
     python3 -m booth.voice --write [voice-run.conf [plugins folder]]
                                       only voice-run.conf, from the saved settings and the plugins verified now

@@ -140,7 +140,8 @@ class _Root(_W):
 
 Page = type("MicrophoneStandIn", (GObject.Object,), {
     **{k: v for k, v in vars(microphone.MicrophonePage).items() if callable(v) and not k.startswith("__")},
-    "add": lambda self, _group: None, "poll": lambda self: True, "mapped": False,
+    "add": lambda self, group: vars(self).setdefault("added", []).append(group), "poll": lambda self: True,
+    "mapped": False,
     "connect": lambda self, signal, handler, *a: vars(self).setdefault("handlers", {}).update({signal: (handler, a)}),
     "emit": _W.emit, "get_mapped": lambda self: self.mapped, "get_root": lambda self: self.root_})
 
@@ -228,6 +229,7 @@ class PageCase(unittest.TestCase):
 
 class ZoomTips(PageCase):
     def test_the_zoom_tips_hint_says_the_four_settings(self):  # #22, the AC's words
+        self.assertIs(self.page.added[-1], self.page.tips)  # on the page, last
         tips = self.page.tips.description
         self.assertEqual(self.page.tips.title, "Zoom Tips")
         for tip in ("Pick Booth Mic", "Set Suppress background noise to Low",
@@ -1009,7 +1011,7 @@ class BoothStereo(PageCase):
         self.assertEqual(self.page.stereo.description, stereo.NOTE)
         self.assertEqual((self.page.side.model, self.page.side.selected), (["Left", "Right"], 0))
         self.assertEqual((self.page.other.model, self.page.other.selected),
-                         (["Scarlett instrument input", "Computer sound"], 0))
+                         (["Scarlett Instrument input", "Computer sound"], 0))
         self.assertEqual(self.stereo_synced, [])  # showing the saved state starts nothing
 
     def test_the_saved_side_and_source_are_shown_at_start_and_a_missing_source_stays_chosen(self):

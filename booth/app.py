@@ -389,6 +389,7 @@ class Application(Adw.Application):
             self.window.show_headset(devices.dongle_present())
             self.window.connect("close-request", self.on_close)
             self.window.present()
+            self.check_camera()  # a BRIO event while starting found no window: dropped, so looked at again now
         except Exception:  # no window: release lets Booth exit instead of living on with nothing to show
             traceback.print_exc()
         finally:

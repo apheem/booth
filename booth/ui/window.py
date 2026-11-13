@@ -47,7 +47,7 @@ def page(title, child, menu=None, banner=None):
                                        tooltip_text="Main Menu"))
         # #21: pressed while Booth Mic is muted, by Booth, GNOME (Ctrl+Alt+M) or another app
         header.pack_start(Gtk.ToggleButton(icon_name="microphone-sensitivity-muted-symbolic", action_name=MUTE_ACTION,
-                                           tooltip_text="Mute Booth Mic (Ctrl+M)"))
+                                           tooltip_text="Mute Booth Mic (Ctrl+M) — Booth Stereo keeps recording"))
     view.add_top_bar(header)
     if banner:
         view.add_top_bar(banner)

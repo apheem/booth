@@ -1,7 +1,7 @@
-"""Booth Stereo (#19): a second virtual source, "Booth Stereo (for recording)", for recording apps (Audacity, OBS): the
-processed voice on the side the user picks, and on the other a source from a dropdown: the Scarlett's other input (its
-instrument jack while the mic is on the XLR), the computer's sound (the configured default output's monitor) or any
-other source. Booth Mic stays mono and untouched, so a call never goes one-eared.
+"""Booth Stereo (#19): a second virtual source, "Booth Stereo — recording only, not for calls", for recording apps
+(Audacity, OBS): the processed voice on the side the user picks, and on the other a source from a dropdown: the
+Scarlett's other input (its instrument jack while the mic is on the XLR), the computer's sound (the configured default
+output's monitor) or any other source. Booth Mic stays mono and untouched, so a call never goes one-eared.
 
 booth-stereo.service runs it as its own PipeWire client (`pipewire -c stereo.conf`, installed by install.sh, never
 enabled: sync() starts it, as booth.monitor's), so a new side or source restarts only it: never booth-voice,
@@ -38,7 +38,7 @@ from booth import devices, scarlett, service, store, voice
 UNIT = "booth-stereo.service"
 RESTART = ["systemctl", "--user", "restart", UNIT]  # starts it too
 NODE, SINK, VOICE, OTHER = "booth_stereo", "booth.stereo.input", "booth.stereo.voice", "booth.stereo.other"
-DESCRIPTION = "Booth Stereo (for recording)"
+DESCRIPTION = "Booth Stereo — recording only, not for calls"  # what a call app's mic list shows
 SCARLETT, COMPUTER = "scarlett", "computer"  # the other side's choices besides a source's node name
 SIDES = {"L": ("FL", "Left"), "R": ("FR", "Right")}  # settings voice "stereo_side", the voice's: position, name
 STEREO = ("stereo_side", "stereo_source")
@@ -148,7 +148,9 @@ def target(settings, dump, read=scarlett.read):
 def choices(settings, found):
     """The dropdown → [(settings value, label)]: the Scarlett, computer sound, each source in `found` (sources()), and the
     saved one when it isn't there now, so a source that is away stays chosen."""
-    items = [(SCARLETT, "Scarlett instrument input"), (COMPUTER, "Computer sound")] + list(found)
+    mic = (settings.get("microphone") or {}).get("input", scarlett.DEFAULT_INPUT)
+    other = next(k for k in scarlett.INPUTS if k != mic)  # the input _find takes: the one the mic isn't on
+    items = [(SCARLETT, f"Scarlett {other} input"), (COMPUTER, "Computer sound")] + list(found)
     saved = _v(settings).get("stereo_source", SCARLETT)
     return items + ([] if saved in dict(items) else [(saved, f"{saved} (not connected)")])
 
@@ -247,17 +249,19 @@ def _sync(settings, read=scarlett.read, run=service.run, dump=voice._dump, file=
     side, source or chain shape, or not running while Booth Mic's input is there: its unit restarted (its pre-start
     writes the config), at once for a new config or a new booth.mic.input, else at most once in BACKOFF_S. Its other
     side gone (WirePlumber removed that loopback with its source) is what is wanted: silent, no restart. Returns the
-    other side's text (target()), NO_MIC, NOT_RUNNING or "not …". The side and source are `saved`'s (the pre-start's):
-    one that didn't save is never chased by a restart a minute; computer sound moved to a new output is `notify`d."""
+    other side's text (target()), NO_MIC, NOT_RUNNING or "not …". The side, the source and the mic's input (the
+    Scarlett side's channel) are `saved`'s (the pre-start's): one that didn't save is never chased by a restart a
+    minute; computer sound moved to a new output is `notify`d."""
     global SOURCES
     file = file or path()
     now = dump()
     mic = voice._node(now, voice.INPUT)
     if mic is None:  # Booth Mic not running, or pw-dump failed: no voice to take
         return NO_MIC
-    disk = _v(saved())
-    settings = dict(settings, voice=dict({k: v for k, v in _v(settings).items() if k not in STEREO},
-                                         **{k: disk[k] for k in STEREO if k in disk}))
+    disk = saved()  # the mic's input too: the Scarlett side's channel follows it
+    settings = dict(settings, microphone=disk.get("microphone") or {},
+                    voice=dict({k: v for k, v in _v(settings).items() if k not in STEREO},
+                               **{k: _v(disk)[k] for k in STEREO if k in _v(disk)}))
     SOURCES = sources(now)
     other, said = target(settings, now, read)
     found = voice.verified()
