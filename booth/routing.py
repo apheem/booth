@@ -18,9 +18,10 @@ nothing, and on returns output only when a move is saved (Booth moved it before 
 state: the record in settings["routing"], {} or {"moved": True, "direct": Direct Monitor's value before the move,
   absent when Booth didn't own it}, or {"direct": False} once output is back but the Scarlett is gone, until Direct
   Monitor can be put back. A move's record lives for one move cycle, honoured at the first "on". The {"direct": False}
-  one is never dropped while Direct Monitor can't be read (no cap, kept through later "off"s and "on"s): it is resolved
-  the first time it can be, by the 10 s tick's "direct" event or an "off" (put back first, then the off rule), and then
-  it is gone, so a Direct Monitor turned on by hand later stands. next() never changes the dict it is given.
+  one is never dropped while Direct Monitor can't be read (kept through later "off"s and "on"s): it is resolved the
+  first time it can be, by the 10 s tick's "direct" event or an "off" (put back first, then the off rule), and then it
+  is gone, so a Direct Monitor turned on by hand later stands. The tick runs while the Scarlett's card is there, at most
+  TRIES times (then said once), again after each unplug or transition. next() never changes the dict it is given.
 event: {"kind": "headset", "on": bool, "final": bool when the last retry} or {"kind": "direct", "final": True} (the tick
   while Direct Monitor is owed and the Scarlett's card is there) | observe(): the facts read just before it, with
   "auto": the user's Direct Monitor setting.
@@ -167,12 +168,12 @@ class Executor:
     def __init__(self, settings, notify, save, run=devices._run, card=devices.scarlett_card, write=service.run):
         self.settings, self.notify, self.save, self.run, self.card, self.write = settings, notify, save, run, card, write
         self.state = {k: v for k, v in settings.get("routing", {}).items() if k != SETTING}
-        self.events, self.last, self.pending, self.tries = queue.Queue(), None, False, 0
+        self.events, self.last, self.pending, self.tries, self.reads = queue.Queue(), None, False, 0, 0
         threading.Thread(target=self._work, daemon=True).start()
 
     def listener(self, event):
         if event in ("on", "off"):  # never "battery" or "ack": no re-asserting on a poll
-            self.last, self.tries = {"kind": "headset", "on": event == "on"}, 0
+            self.last, self.tries, self.reads = {"kind": "headset", "on": event == "on"}, 0, 0
             self.events.put(self.last)
 
     def retry(self):
@@ -182,8 +183,15 @@ class Executor:
         if self.pending:
             self.pending, self.tries = False, self.tries + 1
             self.events.put(self.last | {"final": True} if self.tries >= TRIES else self.last)
-        elif _owed(self.state) and self.card():  # no cap: once the Scarlett is back; a failed write gives up at once
-            self.events.put({"kind": "direct", "final": True})
+        elif _owed(self.state):  # once the Scarlett is back; a failed write gives up at once
+            if not self.card():
+                self.reads = 0  # gone: its return gets fresh ticks
+            elif self.reads < TRIES:  # Direct Monitor unreadable on a card that is there: never amixer every tick
+                self.reads += 1
+                self.events.put({"kind": "direct", "final": True})
+            elif self.reads == TRIES:
+                self.reads += 1
+                self.notify(GAVE_UP.format("putting Direct Monitor back"))
         return True
 
     def _work(self):
