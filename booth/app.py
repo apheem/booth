@@ -124,6 +124,7 @@ class Application(Adw.Application):
         self.headset_monitor.listeners.append(self.routing.listener)
         self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
         GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
+        GLib.timeout_add_seconds(BATTERY_S, self.routing.retry)  # a rule not settled yet (the PRO X sink not back) again
         # Booth Mic's selector back within 10 s of its Scarlett: a replug, a login race or a profile switch (no by-id event)
         GLib.timeout_add_seconds(BATTERY_S, self.heal_voice)
         if self.background:
@@ -172,7 +173,11 @@ class Application(Adw.Application):
 
     def save_routing(self, state):
         self.settings["routing"] = state  # on the main loop, as every other save of the shared dict
-        store.save(self.settings)
+        try:
+            store.save(self.settings)
+        except OSError as e:  # disk full, read-only: kept in memory, but a restart won't know Booth moved the sound
+            self.send_notification("routing-unsaved",
+                                   Gio.Notification.new(f"Sound routing set, but not saved: {e.strerror or e}"))
         return GLib.SOURCE_REMOVE
 
     def restore_saved(self):

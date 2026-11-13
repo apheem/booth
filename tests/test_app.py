@@ -298,8 +298,10 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertEqual(state, {"moved": True, "direct": False})
         self.assertEqual(idle, [(stub.routed, ("PRO X off",)), (stub.save_routing, ({},))])
         stub.headset_monitor.poll.assert_called_once_with()  # the battery now, in every primary instance
-        # then every 10 s, window or not: the battery, and Booth Mic's selector restarted if its Scarlett is back
-        self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll), mock.call(10, stub.heal_voice)])
+        # then every 10 s, window or not: the battery, a routing rule not settled yet (the PRO X sink not back, a failed
+        # write) run again, and Booth Mic's selector restarted if its Scarlett is back
+        self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll),
+                                                mock.call(10, executor.return_value.retry), mock.call(10, stub.heal_voice)])
         monitor = folders["/dev/v4l/by-id"].monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
@@ -620,6 +622,16 @@ class HeadsetBattery(unittest.TestCase):
             self.assertIs(app.Application.save_routing(stub, {"moved": True, "direct": False}), GLib.SOURCE_REMOVE)
         self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
         save.assert_called_once_with(stub.settings)
+        stub.send_notification.assert_not_called()
+
+    def test_a_routing_state_that_cant_be_saved_is_kept_and_said(self):  # disk full: lost at the next restart
+        stub = mock.Mock(settings={"version": 1, "routing": {}})
+        with mock.patch.object(app.store, "save", side_effect=OSError(28, "No space left on device")), \
+                mock.patch.object(app.Gio, "Notification") as notification:
+            self.assertIs(app.Application.save_routing(stub, {"moved": True, "direct": False}), GLib.SOURCE_REMOVE)
+        self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
+        notification.new.assert_called_once_with("Sound routing set, but not saved: No space left on device")
+        stub.send_notification.assert_called_once_with("routing-unsaved", notification.new.return_value)
 
     def test_the_low_battery_notification_says_the_estimate(self):
         with mock.patch.object(app.Gio, "Notification") as notification:

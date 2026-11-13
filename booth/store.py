@@ -19,7 +19,8 @@ def defaults():
     # microphone: {"input": "XLR" or "Instrument", the Scarlett input that is the mic; XLR when absent}. Never 48V.
     # voice: {"enabled": the Voice processing master switch, "rumble": the rumble filter}, booleans, True when absent.
     # routing: the routing policy's own record, {} or {"moved": True, "direct": Direct Monitor's value before Booth
-    #   moved output to the Scarlett, put back when the PRO X turns on}; written only by booth.routing.
+    #   moved output to the Scarlett, put back when the PRO X turns on}, or {"direct": False} while that is still to
+    #   put back (the Scarlett gone); written only by booth.routing.
     return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}, "voice": {}, "routing": {}}
 
 

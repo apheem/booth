@@ -6,13 +6,15 @@ and a notification says so; with no Scarlett sink nothing switches and the notif
 after Booth moved output: output returns to the PRO X if the Scarlett is still the default, and Direct Monitor to its
 previous value if it is still on: a sink or a switch the user changed by hand stands.
 Only on transitions: the events are HeadsetMonitor's "on" and "off", sent once per change, never on a poll that finds
-nothing new, so the policy never re-asserts. Startup: the monitor's first reading is one of those events and goes
-through the same rules, which look at the desk as it is: off with the PRO X still the default sink moves output (sound
-would go nowhere), off with another default changes nothing, and on returns output only when a move is saved
-(Booth moved it before it restarted).
+nothing new, so the policy never re-asserts; the one exception is Executor.retry, which runs the last event again only
+while its rule is unsettled (at "on": the PRO X sink not in PipeWire yet keeps the move untouched). Startup: the
+monitor's first reading is one of those events and goes through the same rules, which look at the desk as it is: off
+with the PRO X still the default sink moves output (sound would go nowhere), off with another default changes nothing,
+and on returns output only when a move is saved (Booth moved it before it restarted).
 
 state: settings["routing"], {} or {"moved": True, "direct": Direct Monitor's value before the move, absent when Booth
-  didn't own it (no Scarlett card, or the rear outputs not free)}. next() never changes the dict it is given.
+  didn't own it (no Scarlett card, or the rear outputs not free)}, or {"direct": False} once output is back but the
+  Scarlett is gone, until Direct Monitor can be put back. next() never changes the dict it is given.
 event: {"kind": "headset", "on": bool} | observe(): the facts read just before it.
 actions: ("default", sink node name), ("direct", bool), ("notify", text), in the order to run.
 A new event (#20: the Scarlett or a mic gone or back) is a new kind with its function in RULES and its facts in
@@ -23,7 +25,7 @@ import sys
 import threading
 import traceback
 
-from booth import devices, scarlett
+from booth import devices, scarlett, service
 
 REAR_OUTPUTS_FREE = True  # #2: the user confirmed nothing is plugged into the rear line outputs; False: never touch Direct
 SINK = "alsa_output.usb-Focusrite_Scarlett_Solo_4th_Gen_"  # the Scarlett's PipeWire sink: then serial and profile
@@ -40,20 +42,24 @@ def _headset(state, e):
         if e["scarlett"] is None:
             return state, [("notify", NO_SCARLETT)]
         new, actions = {"moved": True}, [("default", e["scarlett"])]
+        if "direct" in state:  # a second move keeps the value from before the first, even when it can't be read now
+            new["direct"] = state["direct"]
         if REAR_OUTPUTS_FREE and e["direct"] is not None:
-            new["direct"] = state.get("direct", e["direct"])  # a second move keeps the value from before the first
+            new.setdefault("direct", e["direct"])
             if not e["direct"]:
                 actions.append(("direct", True))
         return new, actions + [("notify", MOVED)]
-    if not state.get("moved"):
+    if state.get("moved") and not e["prox"]:  # the dongle back before WirePlumber adds its sink: the executor retries
         return state, []
     # still where Booth put it (the Scarlett's name stays configured when it is unplugged)
-    # shortcut: the PRO X sink not in PipeWire yet at "on" leaves output where it is, not retried; upgrade if seen live
-    back = bool(e["prox"]) and default.startswith(SINK)
-    actions = [("default", e["prox"])] if back else []
-    if state.get("direct") is False and e["direct"]:  # still on, as Booth left it
-        actions.append(("direct", False))
-    return {}, actions + ([("notify", BACK)] if back else [])
+    back = state.get("moved") and default.startswith(SINK)
+    actions, new = [("default", e["prox"])] if back else [], {}
+    if state.get("direct") is False:
+        if e["direct"] is None:  # the Scarlett gone: kept until Direct Monitor can be put back
+            new = {"direct": False}
+        elif e["direct"]:  # still on, as Booth left it
+            actions.append(("direct", False))
+    return new, actions + ([("notify", BACK)] if back else [])
 
 
 RULES = {"headset": _headset}
@@ -89,18 +95,28 @@ def observe(dump, ctrls):
 
 class Executor:
     """Runs the policy on one worker thread, events in the order they came (off → on → off fast runs as three steps,
-    each on facts read just before it). `listener` goes in HeadsetMonitor.listeners. `notify(text)` and
-    `save(state)` are called on the worker: the app passes ones that hop to the main loop. `run` and `card` are
-    devices._run and devices.scarlett_card: the card, sink ids and controls are resolved fresh on every step."""
+    each on facts read just before it). `listener` goes in HeadsetMonitor.listeners, `retry` on a GLib timer.
+    `notify(text)` and `save(state)` are called on the worker: the app passes ones that hop to the main loop. `run` and
+    `card` are devices._run and devices.scarlett_card (the card, sink ids and controls are resolved fresh on every
+    step); `write(cmd)` → True when the command succeeded, service.run: only what happened is said and saved."""
 
-    def __init__(self, state, notify, save, run=devices._run, card=devices.scarlett_card):
-        self.state, self.notify, self.save, self.run, self.card = state, notify, save, run, card
-        self.events = queue.Queue()
+    def __init__(self, state, notify, save, run=devices._run, card=devices.scarlett_card, write=service.run):
+        self.state, self.notify, self.save, self.run, self.card, self.write = state, notify, save, run, card, write
+        self.events, self.last, self.pending = queue.Queue(), None, False
         threading.Thread(target=self._work, daemon=True).start()
 
     def listener(self, event):
         if event in ("on", "off"):  # never "battery" or "ack": no re-asserting on a poll
-            self.events.put({"kind": "headset", "on": event == "on"})
+            self.last = {"kind": "headset", "on": event == "on"}
+            self.events.put(self.last)
+
+    def retry(self):
+        """A GLib timeout callback: the last event again, only while its rule is unsettled (pw-dump unknown, a failed
+        write, the PRO X sink not back yet, Direct Monitor still to put back), so nothing settled is re-asserted."""
+        if self.pending:
+            self.pending = False
+            self.events.put(self.last)
+        return True
 
     def _work(self):
         while True:
@@ -114,15 +130,21 @@ class Executor:
         card = self.card()
         ctrls = scarlett.parse_contents(self.run("amixer", "-c", card, "contents")) if card else {}
         dump = self.run("pw-dump")
-        state, actions = next(self.state, event | observe(dump, ctrls))
         sinks, _ = devices.parse_sinks(dump)
+        self.pending = True
+        if not sinks:  # pw-dump failed or PipeWire not up yet (login): unknown, not "not the PRO X"
+            return
+        state, actions = next(self.state, event | observe(dump, ctrls))
         for kind, value in actions:
             if kind == "default":  # by its id in this dump: ids change on replug
-                self.run("wpctl", "set-default", str(sinks[value][0]))
+                if not self.write(["wpctl", "set-default", str(sinks[value][0])]):
+                    return  # nothing moved: nothing said or saved
             elif kind == "direct":  # DIRECT only; cset_cmd never writes 48V without the user's dialog
-                scarlett.send(lambda c: scarlett.cset_cmd(c, scarlett.DIRECT, value), self.run, self.card)
+                if not self.write(scarlett.cset_cmd(card, scarlett.DIRECT, value)):  # card: read this step
+                    state = {"direct": self.state.get("direct")} | state  # not put back: still Booth's to put back
             else:
                 self.notify(value)
+        self.pending = event["on"] and bool(state)
         if state != self.state:
             self.state = state
             self.save(state)

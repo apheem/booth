@@ -86,20 +86,30 @@ class Rules(unittest.TestCase):
         self.assertEqual(routing.next({"moved": True, "direct": False}, event(True, default=SCARLETT, direct=False)),
                          ({}, [("default", PROX), ("notify", routing.BACK)]))
 
-    def test_the_prox_sink_gone_at_on_moves_nothing_but_direct_monitor(self):
-        # shortcut in the rule: PipeWire may add the dongle's sink after the headset answers; not retried
+    def test_the_prox_sink_not_back_yet_at_on_touches_nothing_and_keeps_the_move(self):
+        # the dongle replugged: the headset answers before WirePlumber adds its sink; the executor retries
         self.assertEqual(routing.next({"moved": True, "direct": False}, event(True, default=SCARLETT, prox=None,
-                                                                              direct=True)), ({}, [("direct", False)]))
+                                                                              direct=True)),
+                         ({"moved": True, "direct": False}, []))
 
-    def test_on_while_the_scarlett_is_gone_still_returns_to_the_prox(self):  # its name stays the configured default
+    def test_on_while_the_scarlett_is_gone_returns_to_the_prox_and_keeps_direct_monitor_to_put_back(self):
+        # its name stays the configured default; Direct Monitor can't be read, so its previous value is kept
         self.assertEqual(routing.next({"moved": True, "direct": False}, event(True, default=SCARLETT, scarlett=None,
                                                                               direct=None)),
-                         ({}, [("default", PROX), ("notify", routing.BACK)]))
+                         ({"direct": False}, [("default", PROX), ("notify", routing.BACK)]))
+        self.assertEqual(routing.next({"direct": False}, event(True, scarlett=None, direct=None)), ({"direct": False}, []))
+        self.assertEqual(routing.next({"direct": False}, event(True, direct=True)), ({}, [("direct", False)]))
+        self.assertEqual(routing.next({"direct": False}, event(True, direct=False)), ({}, []))
 
     def test_a_second_move_keeps_the_first_moves_direct_monitor_value(self):  # a restart, then the PRO X picked by hand
         state, actions = routing.next({"moved": True, "direct": False}, event(False, direct=True))
         self.assertEqual(state, {"moved": True, "direct": False})
         self.assertEqual(actions, [("default", SCARLETT), ("notify", routing.MOVED)])
+
+    def test_a_second_move_with_direct_monitor_unreadable_keeps_the_saved_value(self):  # amixer failed
+        for saved in ({"moved": True, "direct": False}, {"direct": False}):
+            self.assertEqual(routing.next(saved, event(False, direct=None)),
+                             ({"moved": True, "direct": False}, [("default", SCARLETT), ("notify", routing.MOVED)]))
 
     def test_next_never_changes_the_state_it_is_given(self):
         state = {"moved": True, "direct": False}
@@ -158,6 +168,14 @@ class Sequences(unittest.TestCase):
         desk.headset(True)
         self.assertEqual((desk.default, desk.direct, desk.state), (PROX, False, {}))
 
+    def test_the_dongle_replugged_returns_output_once_its_sink_is_back(self):
+        desk = World()
+        desk.headset(False)  # unplugged: off at once
+        state, actions = routing.next(desk.state, event(True, desk.default, None, SCARLETT, desk.direct))
+        self.assertEqual((state, actions), (desk.state, []))  # on before WirePlumber adds the PRO X sink
+        desk.headset(True)  # the retry, the sink back
+        self.assertEqual((desk.default, desk.direct, desk.state), (PROX, False, {}))
+
     def test_flapping_without_the_scarlett_never_switches(self):
         desk = World(scarlett=None)
         for _ in range(3):
@@ -181,9 +199,12 @@ def dump(configured=PROX, effective=PROX):
 
 class Observe(unittest.TestCase):
     def test_the_facts_from_pw_dump_and_the_scarletts_controls(self):
-        ctrls = routing.scarlett.parse_contents(read("scarlett/amixer-contents.txt"))
+        direct = "name='Direct Monitor Playback Switch'\n  ; type=BOOLEAN,access=rw------,values=1\n  : values="
+        contents = read("scarlett/amixer-contents.txt")
+        self.assertIn(direct + "off", contents)
+        ctrls = routing.scarlett.parse_contents(contents.replace(direct + "off", direct + "on"))  # 48V stays off
         self.assertEqual(routing.observe(dump(), ctrls),
-                         {"default": PROX, "prox": PROX, "scarlett": SCARLETT, "direct": False})
+                         {"default": PROX, "prox": PROX, "scarlett": SCARLETT, "direct": True})
 
     def test_the_configured_default_wins_over_wireplumbers_fallback(self):  # the dongle unplugged: the PRO X was chosen
         self.assertEqual(routing.observe(dump(PROX, HDMI), {})["default"], PROX)
@@ -200,10 +221,11 @@ class Observe(unittest.TestCase):
 
 
 class Fake:
-    """devices._run stand-in: the given pw-dump and the Scarlett's captured controls; records the writes."""
+    """devices._run stand-in for the reads (the given pw-dump, the Scarlett's captured controls) and service.run's for
+    the writes: records them, and fails the commands named in `failing`."""
 
-    def __init__(self, pw):
-        self.pw, self.writes = pw, []
+    def __init__(self, pw, failing=()):
+        self.pw, self.writes, self.failing = pw, [], failing
 
     def __call__(self, *cmd):
         if cmd == ("pw-dump",):
@@ -213,12 +235,17 @@ class Fake:
         self.writes.append(list(cmd))
         return ""
 
+    def write(self, cmd):
+        self.writes.append(cmd)
+        return cmd[0] not in self.failing
+
 
 class Executor(unittest.TestCase):
-    def executor(self, pw, state=None, card="Gen"):
-        self.notes, self.saved, self.run = [], [], Fake(pw)
+    def executor(self, pw, state=None, card="Gen", failing=()):
+        self.notes, self.saved, self.run = [], [], Fake(pw, failing)
         with mock.patch.object(routing.threading, "Thread"):
-            return routing.Executor(state or {}, self.notes.append, self.saved.append, self.run, lambda: card)
+            return routing.Executor(state or {}, self.notes.append, self.saved.append, self.run, lambda: card,
+                                    self.run.write)
 
     def test_off_sets_the_scarlett_by_its_id_now_and_direct_monitor_on_by_name(self):
         ex = self.executor(dump())
@@ -235,12 +262,76 @@ class Executor(unittest.TestCase):
         self.assertEqual((self.notes, self.saved), ([routing.BACK], [{}]))
 
     def test_direct_monitor_back_off(self):
-        run = Fake("")
-        with mock.patch.object(routing.threading, "Thread"):
-            ex = routing.Executor({"moved": True, "direct": False}, [].append, [].append, run, lambda: "Gen")
+        ex = self.executor(dump(PROX, PROX), {"direct": False})
         with mock.patch.object(routing.scarlett, "value", return_value=True):  # on, as Booth left it
             ex.step({"kind": "headset", "on": True})
-        self.assertEqual(run.writes, [["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch", "off"]])
+        self.assertEqual(self.run.writes, [["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch", "off"]])
+        self.assertEqual((ex.state, self.saved), ({}, [{}]))
+
+    def test_a_failed_direct_monitor_write_keeps_its_value_to_put_back(self):
+        ex = self.executor(dump(PROX, PROX), {"direct": False}, failing=("amixer",))
+        with mock.patch.object(routing.scarlett, "value", return_value=True):
+            ex.step({"kind": "headset", "on": True})
+        self.assertEqual((ex.state, self.saved), ({"direct": False}, []))
+
+    def test_a_failed_set_default_moves_nothing_says_nothing_and_retries(self):
+        ex = self.executor(dump(), failing=("wpctl",))
+        ex.listener("off")
+        ex.step(ex.events.get_nowait())
+        self.assertEqual(self.run.writes, [["wpctl", "set-default", "176"]])  # Direct Monitor is never turned on alone
+        self.assertEqual((self.notes, self.saved, ex.state), ([], [], {}))
+        self.assertIs(ex.retry(), True)
+        self.assertEqual(ex.events.get_nowait(), {"kind": "headset", "on": False})
+        self.run.failing = ()
+        ex.step({"kind": "headset", "on": False})
+        self.assertEqual((self.notes, self.saved), ([routing.MOVED], [{"moved": True, "direct": False}]))
+        ex.retry()
+        self.assertTrue(ex.events.empty())  # settled: never re-asserted
+
+    def test_a_failed_set_default_at_on_keeps_the_move_and_retries(self):
+        ex = self.executor(dump(SCARLETT, SCARLETT), {"moved": True, "direct": True}, failing=("wpctl",))
+        ex.listener("on")
+        ex.step(ex.events.get_nowait())
+        self.assertEqual((self.notes, self.saved, ex.state), ([], [], {"moved": True, "direct": True}))
+        ex.retry()
+        self.assertEqual(ex.events.get_nowait(), {"kind": "headset", "on": True})
+
+    def test_an_empty_or_failed_pw_dump_is_unknown_and_retried(self):  # at login, PipeWire not up yet
+        for pw in ("", "[]"):
+            ex = self.executor(pw)
+            ex.listener("off")
+            ex.step(ex.events.get_nowait())
+            self.assertEqual((self.run.writes, self.notes, self.saved), ([], [], []))
+            ex.retry()
+            self.assertEqual(ex.events.get_nowait(), {"kind": "headset", "on": False})
+            ex.retry()
+            self.assertTrue(ex.events.empty())  # once per unsettled step: a slow worker never piles them up
+            self.run.pw = dump()
+            ex.step({"kind": "headset", "on": False})
+            self.assertEqual(self.notes, [routing.MOVED])
+
+    def test_the_prox_sink_not_back_yet_is_retried_until_it_is(self):
+        objects = [o for o in json.loads(dump(SCARLETT, SCARLETT)) if "Logitech" not in json.dumps(o.get("info") or {})]
+        ex = self.executor(json.dumps(objects), {"moved": True, "direct": False})
+        ex.listener("on")
+        ex.step(ex.events.get_nowait())
+        self.assertEqual((self.run.writes, self.notes, self.saved), ([], [], []))
+        ex.retry()
+        self.assertEqual(ex.events.get_nowait(), {"kind": "headset", "on": True})
+        self.run.pw = dump(SCARLETT, SCARLETT)
+        ex.step({"kind": "headset", "on": True})
+        self.assertEqual(self.run.writes, [["wpctl", "set-default", "33"]])
+        self.assertEqual((self.notes, self.saved, ex.state), ([routing.BACK], [{}], {}))
+        ex.retry()
+        self.assertTrue(ex.events.empty())
+
+    def test_nothing_pending_never_retries(self):
+        ex = self.executor(dump(HDMI, HDMI))
+        self.assertIs(ex.retry(), True)  # before any event
+        ex.listener("off")
+        ex.step(ex.events.get_nowait())
+        ex.retry()
+        self.assertTrue(ex.events.empty())
 
     def test_nothing_to_do_writes_and_saves_nothing(self):
         self.executor(dump(HDMI, HDMI)).step({"kind": "headset", "on": False})
@@ -255,6 +346,7 @@ class Executor(unittest.TestCase):
         seen, done = [], threading.Event()
         with mock.patch.object(routing.Executor, "step", lambda self, e: seen.append(e) or len(seen) == 3 and done.set()):
             ex = routing.Executor({}, print, print)
+            self.assertIs(ex.write, routing.service.run)  # the writes report their exit status
             for name in ("off", "battery", "ack", "on", "off"):
                 ex.listener(name)
             self.assertTrue(done.wait(5))
