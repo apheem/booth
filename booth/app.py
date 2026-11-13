@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from booth import camera, devices, headset, monitor, routing, service, store, voice  # noqa: E402
+from booth import camera, devices, headset, monitor, mute, routing, service, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
 APP_ID = service.APP_ID
@@ -94,6 +94,12 @@ class Application(Adw.Application):
         quit_ = Gio.SimpleAction.new("quit", None)  # install.sh's way to stop a running copy: quit() ignores a hold
         quit_.connect("activate", lambda *_: self.quit())
         self.add_action(quit_)
+        # #21: Booth Mic's mute, the header button's state; activating it (the button, Ctrl+M) toggles it: on_mute
+        self.mute_known = None  # the booth_mic object.serial whose mute Booth follows (booth.mute.seen)
+        self.mute_action = Gio.SimpleAction.new_stateful("mute", None, GLib.Variant.new_boolean(False))
+        self.mute_action.connect("change-state", self.on_mute)
+        self.add_action(self.mute_action)
+        self.set_accels_for_action("app.mute", ["<Control>m"])
 
     def do_handle_local_options(self, options):
         if options.contains("background"):
@@ -138,6 +144,7 @@ class Application(Adw.Application):
         self.fix_headset()
         self.mic_at_start()  # before sync_voice, which may move the selector
         self.sync_voice()
+        self.watch_mute()
         # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
         # before the first poll, whose reading is the startup transition
         self.routing = routing.Executor(self.settings, lambda text: GLib.idle_add(self.routed, text),
@@ -164,6 +171,7 @@ class Application(Adw.Application):
 
     def do_shutdown(self):
         voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
+        mute.stop()  # #21: its pw-dump --monitor ends with Booth
         Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):
@@ -193,6 +201,62 @@ class Application(Adw.Application):
             voice.sync(self.settings)
             monitor.sync(self.settings, on=self.headset_monitor.on)
         threading.Thread(target=sync, daemon=True).start()
+
+    def watch_mute(self):
+        """#21: pw-dump's monitor on a worker for good; each sighting of booth_mic goes to on_mute_seen. Events, not a
+        poll: it prints only when the graph changes, and the record must follow GNOME's mute with the window closed too,
+        so a booth-voice restart starts Booth Mic silent."""
+        threading.Thread(target=lambda: mute.watch(lambda node: GLib.idle_add(self.on_mute_seen, node)),
+                         daemon=True).start()
+
+    def on_mute_seen(self, node):
+        self.mute_known, record, write = mute.seen(node, self.mute_known, self.muted())
+        self.record_mute(record)
+        if write is not None:  # a recreated Booth Mic: its mute put back (by name, on a worker)
+            threading.Thread(target=lambda: mute.write(write), daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def on_mute(self, action, value):
+        """The header button or Ctrl+M: Booth Mic's node mute set, and recorded at once."""
+        on = value.get_boolean()
+        self.record_mute(on)
+
+        def write():  # refused: a mute's silence applied again here, so mute_failed says whether it landed
+            if not mute.write(on):
+                GLib.idle_add(self.mute_failed, on, voice.apply(self.settings, None) if on else None)
+        threading.Thread(target=write, daemon=True).start()
+
+    def mute_failed(self, on, said=None):
+        """wpctl didn't take the button's `on`: the node keeps its mute, and the button shows it (pressing it again
+        tries again). Fail closed: the chain stays (or goes back to) silent, and the node is no longer followed, so its
+        next sighting puts the mute back instead of turning the record live. `said`: voice.apply's, for a mute."""
+        self.mute_known = None
+        self.record_mute(True)
+        self.mute_action.set_state(GLib.Variant.new_boolean(not on))
+        silenced = said in ("live", "unchanged", "restarted", voice.HELD)  # the muted chain set live, or started
+        self.send_notification("mute-failed", Gio.Notification.new(
+            "Couldn't unmute Booth Mic in GNOME — it stays muted; try again" if not on else
+            "Couldn't mute Booth Mic in GNOME — the chain is silenced; try again" if silenced else
+            f"Couldn't mute Booth Mic in GNOME, and its chain couldn't be silenced ({said}); try again"))
+        return GLib.SOURCE_REMOVE
+
+    def muted(self):
+        return bool((self.settings.get("voice") or {}).get("muted"))
+
+    def record_mute(self, on):
+        """The mute shown (button, Ctrl+M, red dot) and, when it changed, recorded: saved for booth-voice's pre-start
+        and Booth Mic's chain silenced or not, live (apply, on a worker)."""
+        self.mute_action.set_state(GLib.Variant.new_boolean(on))
+        if self.window is not None:
+            self.window.show_mute(on)
+        if self.muted() == on:
+            return
+        self.settings.setdefault("voice", {})["muted"] = on
+        try:
+            store.save(self.settings)
+        except OSError as e:  # a booth-voice restart would start Booth Mic as last saved
+            self.send_notification("mute-unsaved", Gio.Notification.new(f"Mute set, but not saved: {e.strerror or e}"))
+        threading.Thread(target=lambda: voice.apply(self.settings, None), daemon=True).start()
 
     def heal_voice(self):
         if not self.healing:  # a slow heal (amixer, pw-dump, systemctl) never overlaps the next tick
@@ -276,6 +340,7 @@ class Application(Adw.Application):
                 self.held = True
             self.window = Window(self, settings, node, ctrls)
             self.window.show_mic(self.mic_source)  # opened on a backup: its sidebar line and banner say so
+            self.window.show_mute(self.muted())
             self.window.connect("close-request", self.on_close)
             self.window.present()
         except Exception:  # no window: release lets Booth exit instead of living on with nothing to show

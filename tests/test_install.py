@@ -73,7 +73,14 @@ class Install(unittest.TestCase):
         for name in ("curl", "apt-get", "dpkg-deb"):
             (stubs / name).write_text('#!/bin/sh\necho "${0##*/} $*" >> "$FETCH_LOG"\nexit 1\n')
             (stubs / name).chmod(0o755)
-        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", STUB_LOG=str(self.calls), FETCH_LOG=str(self.fetches))
+        # gsettings (#21): mic-mute reads as MIC_MUTE (GNOME 46's default [''] when unset), its calls in their own log
+        self.gsettings = Path(tmp.name) / "gsettings.log"
+        (stubs / "gsettings").write_text('#!/bin/sh\necho "gsettings $*" >> "$GSETTINGS_LOG"\n'
+                                         '[ "$1" != get ] || printf "%s\\n" "${MIC_MUTE-[\'\']}"\n'
+                                         'exit "${GSETTINGS_RC:-0}"\n')
+        (stubs / "gsettings").chmod(0o755)
+        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", STUB_LOG=str(self.calls), FETCH_LOG=str(self.fetches),
+                        GSETTINGS_LOG=str(self.gsettings))
         self.app = self.home / ".local/share/booth/booth"
         self.launcher = self.home / ".local/bin/booth"
         self.desktop = self.home / f".local/share/applications/{APP_ID}.desktop"
@@ -228,6 +235,30 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("not saved", r.stderr)
 
+    def test_skeptic_booth_voice_mutes_a_new_booth_mic_when_the_saved_record_is_muted_with_no_booth(self):  # #21
+        """A kept voice-run.conf may carry live gains: the unit's ExecStartPost, the installed booth.mute, mutes the
+        new booth_mic's node by name when the saved record is muted; never unmutes, never fails the start."""
+        self.assertEqual(self.install().returncode, 0)
+        unit = (self.unit.parent / "booth-voice.service").read_text().splitlines()
+        line = next(ln for ln in unit if ln.startswith("ExecStartPost="))
+        self.assertLess(unit.index(next(ln for ln in unit if ln.startswith("ExecStart="))), unit.index(line))
+        argv = shlex.split(line.removeprefix("ExecStartPost=").replace("%%", "%").replace("$$", "$"))
+        self.assertEqual(argv, ["-/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.mute",
+                                "--enforce"])  # "-": a booth_mic left unmuted beats none (the raw mic, unmuted)
+        stubs = Path(self.env["PATH"].split(":")[0])
+        (stubs / "pw-dump").write_text("#!/bin/sh\necho '" + json.dumps([{"id": 106, "info": {
+            "props": {"node.name": "booth_mic", "object.serial": 87}, "params": {"Props": [{"mute": False}]}}}]) + "'\n")
+        (stubs / "wpctl").write_text(STUB)
+        (stubs / "wpctl").chmod(0o755)
+        settings = self.home / ".config/booth/settings.json"
+        for record, want in (({"muted": True}, ["wpctl set-mute 106 1"]), ({"muted": False}, [])):
+            settings.write_text(json.dumps({"voice": record}))
+            self.calls.write_text("")
+            r = subprocess.run([argv[0].removeprefix("-")] + argv[1:], env=self.env, cwd=self.home,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual([c for c in self.calls.read_text().splitlines() if c.startswith("wpctl")], want, record)
+
     def test_the_pre_start_rewrites_the_config_pipewire_loads_whatever_the_units_environment(self):
         self.assertEqual(self.install().returncode, 0)
         conf = self.home / ".config/booth/voice-run.conf"
@@ -371,6 +402,33 @@ class Install(unittest.TestCase):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("couldn't make Booth Mic the default mic", r.stderr)
+
+    def gsettings_calls(self):
+        return self.gsettings.read_text().splitlines() if self.gsettings.exists() else []
+
+    def test_gnomes_mic_mute_gets_ctrl_alt_m_only_when_it_has_no_binding(self):  # #21
+        get = "gsettings get org.gnome.settings-daemon.plugins.media-keys mic-mute"
+        for current in ("['']", "@as []"):
+            self.env["MIC_MUTE"] = current
+            self.gsettings.unlink(missing_ok=True)
+            r = self.install()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.gsettings_calls(),
+                             [get, "gsettings set org.gnome.settings-daemon.plugins.media-keys mic-mute "
+                                   "['<Control><Alt>m']"], current)
+        for current in ("['<Super>m']", "['<Control><Alt>m']"):  # the user's own, or already ours: never rewritten
+            self.env["MIC_MUTE"] = current
+            self.gsettings.unlink(missing_ok=True)
+            self.assertEqual(self.install().returncode, 0)
+            self.assertEqual(self.gsettings_calls(), [get], current)
+
+    def test_an_unreadable_mic_mute_is_never_written_and_the_install_goes_on(self):
+        self.env["GSETTINGS_RC"] = "1"  # no GNOME schema, no session
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.gsettings_calls()), 1)
+        self.assertIn("Ctrl+Alt+M", r.stderr)
+        self.assertTrue(self.launcher.exists())
 
     def test_the_voice_plugins_are_in_place_before_booth_is_quit_and_restarted(self):
         lines = [ln for ln in (REPO / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
@@ -580,6 +638,12 @@ class Install(unittest.TestCase):
         self.assertEqual([re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], w) for w in m.groups()],
                          [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice-run.conf"),
                           str(self.home / ".local/share/booth/plugins")])
+        line = next(ln for ln in voice_unit.read_text().splitlines() if ln.startswith("ExecStartPost="))
+        m = re.fullmatch(r'ExecStartPost=-/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
+                         r'booth\.mute --enforce', line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
+                         str(self.home / ".local/share/booth"))
         line = next(ln for ln in select_unit.read_text().splitlines() if ln.startswith("ExecCondition="))
         m = re.fullmatch(rf'ExecCondition=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
                          rf'booth\.voice --select {word}', line)

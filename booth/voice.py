@@ -30,6 +30,9 @@ record of what it set live); voice-run.conf is what runs. A change in what verif
 fails for a moment, an install's new plugins) never restarts the running chain, which mapped verified code: a stage
 whose plugin stopped verifying goes dry live, one that verifies only since waits for the next start, and the page says
 both are missing (loaded()). A new shape (new code) restarts both services, never starting one the user stopped.
+Mute (#21, booth.mute): muted, the master mixer is silent (both gains 0), live and in every voice-run.conf, so a Booth
+Mic recreated by a restart is silent before Booth puts its node mute back; and a running Booth Mic is never restarted
+while muted (_held), since a call falls back to the raw mic, unmuted, while booth_mic is gone.
     python3 -m booth.voice            write the configs from the saved settings and the Scarlett now, start the services
     python3 -m booth.voice --write [voice-run.conf [plugins folder]]
                                       only voice-run.conf, from the saved settings and the plugins verified now
@@ -39,7 +42,9 @@ both are missing (loaded()). A new shape (new code) restarts both services, neve
     python3 -m booth.voice --select voice-select.conf
                                       booth-mic-select.service's ExecCondition: may_select (exit 0) or not (1)"""
 import copy
+import itertools
 import json
+import math
 import os
 import sys
 import threading
@@ -66,6 +71,8 @@ WAITING = "Booth Mic is waiting for the Scarlett"
 NOT_ROUTED = "Booth Mic has no input: the mic isn't routed to a capture channel"
 STALE = "Booth Mic may still be using the old channel: couldn't stop it"
 STOPPED = "Booth Mic isn't running: see systemctl --user status booth-voice.service"
+HELD = "not restarted while muted: Booth Mic restarts once you unmute"
+HELD_RELOAD = "install.sh: Booth Mic is muted: its new plugins load the next time Booth Mic starts"
 _LOCK = threading.RLock()  # the page's poll, the service's start and heal may run at once
 HEAL_BACKOFF_S = 60
 _HEALED = {}  # (selector config, Scarlett node object.serial) → when heal last restarted the selector for it
@@ -314,6 +321,8 @@ def build(settings, found=None):
             stage(key, [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
                          "control": mapping(v.get(knob, default))}], ins, out)
     nodes.append(_mix("master", v.get("enabled", True)))
+    if v.get("muted"):  # #21: silent from its first sample, whatever its node mute (a recreated Booth Mic has none)
+        nodes[-1]["control"] = {"Gain 1": 0.0, "Gain 2": 0.0}
     links += [{"output": last, "input": "master:In 1"}, {"output": "in:Out", "input": "master:In 2"}]
     chain = {"node.description": "Booth Mic", "media.name": "Booth Mic",
              "filter.graph": {"nodes": nodes, "links": links, "inputs": ["in:In"], "outputs": ["master:Out"]},
@@ -429,13 +438,55 @@ def selecting(dump=None):
     return _node_id(_dump() if dump is None else dump, SELECTOR) is not None
 
 
-def set_params_cmd(dump, cfg):
-    """The live change to every control in `cfg`, on the running chain's input node (by name, now), or None."""
+CHUNK = 12  # controls per pw-cli call: 1.0.5 sends an empty Props above ~25 (prints `Object: size 8`) and exits 0
+
+
+def set_params_cmds(dump, cfg):
+    """The live change to every control in `cfg`, on the running chain's input node (by name, now): pw-cli calls of at
+    most CHUNK controls; or None. Master's gains alone and first when they silence the chain (a mute lands even if a
+    later call fails), else last (the voice goes live only after everything else)."""
     node = _node_id(dump, INPUT)
     if node is None:
         return None
-    params = [x for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items() for x in (f"{n['name']}:{k}", v)]
-    return ["pw-cli", "set-param", str(node), "Props", json.dumps({"params": params})]
+    pairs = [(f"{n['name']}:{k}", v) for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items()]
+    master = [p for p in pairs if p[0].startswith("master:")]
+    rest = [p for p in pairs if p not in master]
+    silent = not any(v for _, v in master)
+    chunks = ([master] if silent else []) + list(itertools.batched(rest if silent else rest + master, CHUNK))
+    return [["pw-cli", "set-param", str(node), "Props", json.dumps({"params": [x for p in c for x in p]})]
+            for c in chunks]
+
+
+def _live_params(dump):
+    """{node:control: value} the chain's input node reports in its Props in `pw-dump` JSON now ({}: none read)."""
+    props = (((_node(dump, INPUT) or {}).get("info") or {}).get("params") or {}).get("Props")
+    return {k: v for p in props if isinstance(p, dict) and isinstance(p.get("params"), list)
+            for k, v in zip(p["params"][::2], p["params"][1::2])} if isinstance(props, list) else {}
+
+
+def _same(want, have):
+    try:  # the chain stores floats: 0.707 reads back as 0.7070000171661377
+        return math.isclose(float(want), float(have), rel_tol=1e-5, abs_tol=1e-6)
+    except (TypeError, ValueError):
+        return want == have
+
+
+def set_live(cfg, run, dump):
+    """Every control in `cfg` set on the running chain (set_params_cmds), then read back from pw-dump, never trusted to
+    pw-cli's exit status; a call whose controls didn't all land is sent once more. → the controls that didn't land
+    ([]: every one did), or None when the chain's input node isn't there (pw-dump failed): nothing sent."""
+    cmds = set_params_cmds(dump(), cfg)
+    if cmds is None:
+        return None
+    sent = [(c, list(itertools.batched(json.loads(c[4])["params"], 2))) for c in cmds]
+    for _ in range(2):
+        for cmd, _pairs in sent:
+            run(cmd)
+        have = _live_params(dump())
+        sent = [(c, ps) for c, ps in sent if not all(k in have and _same(v, have[k]) for k, v in ps)]
+        if not sent:
+            return []
+    return [k for _c, ps in sent for k, v in ps if not (k in have and _same(v, have[k]))]
 
 
 def _text(file):
@@ -492,6 +543,20 @@ def _restarted(key, clock):
     _HEALED[key] = clock()
 
 
+def _held(settings, dump):
+    """#21: muted with Booth Mic running, so no restart: while booth_mic is gone a call falls back to the raw mic,
+    unmuted. A Booth Mic that isn't running has no gap to fall back in, so it still starts. Fail closed: only a pw-dump
+    that read a list without booth_mic says it isn't running, never a failed or empty one."""
+    if not (settings.get("voice") or {}).get("muted"):
+        return False
+    text = dump()
+    try:
+        listed = isinstance(json.loads(text), list)
+    except (TypeError, ValueError):
+        listed = False
+    return not listed or _node_id(text, NODE) is not None
+
+
 def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
     """Bring both configs up to date with the settings and `state`, the Scarlett now (scarlett.read). New control values
     are set live on the chain, then recorded; a new chain shape (new code; never a change in what verifies alone, see
@@ -502,7 +567,7 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
     restarted, only while Booth Mic runs: with it stopped the selector is stopped and its new config kept for its next
     start, never the old channel. Returns what it did, with "not …" when it couldn't: then that change isn't recorded
     (a failed chain restart puts the old voice.conf back; a failed selector restart removes its config), so the next
-    apply retries. A live change is recorded only once set-param took it.
+    apply retries. A live change is recorded only once every control read back as set (set_live).
     A chain change that fails never holds back the selector."""
     file = file or path()
     select_file = file.with_name(SELECT_CONF)
@@ -519,13 +584,17 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             if shape(same) == shape(now):  # nothing else changed: no restart; its next start loads what verifies
                 chain = same
         restart = shape(now) != shape(chain)
+        held = restart and _held(settings, dump)
+        if held:  # not recorded: the first apply after unmuting restarts it; its values (a mute's 0s) still go live
+            said = HELD
         # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
         # kept run conf holds older ones), else voice.conf's, what apply set live since
         # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
         live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
         changed = old != chain or live != chain
-        if live != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
-            said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
+        if live != chain and (held or not restart) and (missed := set_live(chain, run, dump)) != []:
+            # not recorded: the next apply sends every control again
+            said = f"not applied: Booth Mic didn't take {', '.join(missed) if missed else 'the change'}"
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
         kept = mic and not mic["node"] and mic["channel"] == _capture(_load(select_file), CHANNEL)
@@ -695,16 +764,23 @@ def write(file=None, where=None):
             os.utime(file)  # newer than voice.conf: its values may be older than what Booth set live
         except OSError:
             pass
+        master = lambda c: [n.get("control") for n in _graph_nodes(c) if n.get("name") == "master"]  # noqa: E731
+        if (settings.get("voice") or {}).get("muted") and master(on_disk) != master(cfg):
+            return f"kept the last config, {said}; it isn't silent though Booth Mic is muted: booth.mute --enforce " \
+                   "mutes its node"
         return f"kept the last config, {said}"
     return said
 
 
 def reload(run=service.run, file=None):
     """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
-    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
+    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed;
+    HELD_RELOAD: held, muted (_held), so they load at its next start."""
     with _LOCK:
         _VERIFIED.clear()  # an install's fresh plugins: hashed now
-        return _plugins(_running(file or path())) == verified() or run(RESTART)
+        if _plugins(_running(file or path())) == verified():
+            return True
+        return HELD_RELOAD if _held(store.load(), _dump) else run(RESTART)
 
 
 def main():
@@ -715,7 +791,10 @@ def main():
             print(f"booth.voice: {said}", file=sys.stderr)
         return 1 if said and said.startswith("not ") else 0
     if args == ["--reload"]:
-        return 0 if reload() else 1
+        done = reload()
+        if done == HELD_RELOAD:
+            print(done, file=sys.stderr)
+        return 0 if done else 1
     if args[:1] == ["--select"] and len(args) == 2:
         return 0 if may_select(Path(args[1])) else 1
     print(sync(store.load()))

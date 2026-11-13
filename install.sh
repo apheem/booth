@@ -84,7 +84,9 @@ mv "$units/booth.service.new" "$units/booth.service"
 # ExecStart loads and one Booth never writes, with the installed booth.voice from the saved settings and the plugins
 # verified right then (booth.plugins), so a plugin file changed since is left out, never loaded; if it can't write it
 # and the one there names a plugin that doesn't verify now, the unit doesn't start. It is given the paths baked here, so
-# it writes the very file ExecStart loads, whatever the user manager's XDG_*.
+# it writes the very file ExecStart loads, whatever the user manager's XDG_*. ExecStartPost (#21) mutes the new
+# booth_mic's node when the saved record is muted, with no Booth running (a kept voice-run.conf may carry live gains);
+# "-": its failure never stops Booth Mic, since a call would fall back to the raw mic, unmuted.
 voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
 [ -e "$units/booth-voice.service" ] || voice_first=1
 voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
@@ -102,6 +104,7 @@ BindsTo=pipewire.service
 ExecCondition=/usr/bin/test -f "$voice_arg"
 ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write "$run_arg" "$plugins_arg"
 ExecStart=/usr/bin/pipewire -c "$run_arg"
+ExecStartPost=-/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.mute --enforce
 Restart=on-failure
 RestartSec=5
 Slice=session.slice
@@ -155,6 +158,9 @@ mv "$units/booth-monitor.service.new" "$units/booth-monitor.service"
 systemctl --user daemon-reload && systemctl --user enable booth-voice.service booth-mic-select.service ||
   echo "install.sh: couldn't enable booth-voice.service (Booth Mic); from your desktop session run: systemctl --user enable --now booth-voice.service booth-mic-select.service" >&2
 PYTHONPATH=$dest python3 -P -m booth.voice || echo "install.sh: couldn't set up Booth Mic (above); Booth tries again when it starts" >&2
+# GNOME's own mic-mute action (it mutes the default source, Booth Mic) on Ctrl+Alt+M, only while it has no binding:
+# never the user's own (booth.mute.binding). gsettings writes the user's dconf; it never stops the install.
+PYTHONPATH=$dest python3 -P -m booth.mute --bind || true
 if [ -n "$voice_first" ]; then
   pw-metadata -n default 0 default.configured.audio.source '{ "name": "booth_mic" }' Spa:String:JSON >/dev/null 2>&1 ||
     echo "install.sh: couldn't make Booth Mic the default mic; choose Booth Mic in Settings → Sound → Input" >&2
