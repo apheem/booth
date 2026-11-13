@@ -46,7 +46,6 @@ class Window(Adw.ApplicationWindow):
              page("Microphone", self.microphone, banner=self.mic_banner), self.microphone.mini, self.mic_label),
             ("Headphones", "audio-headphones-symbolic", page("Headphones", self.headphones), headphones_status),
         ]
-        self.show_mic(app.mic_source)
 
         sidebar = Gtk.ListBox(css_classes=["navigation-sidebar"])
         for title, icon, _, *subtitles in self.pages:

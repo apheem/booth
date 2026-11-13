@@ -110,13 +110,15 @@ def label(source):
 
 
 def _mic(state, e):
-    """#20: the mic voice.heal chose (or DOWN), after each heal → said once it holds on two heals in a row, so a heal
-    that lands in a flap says nothing. state: {"said": the last source said, the Scarlett at start, "seen": a change
-    seen once}, in memory only (a restart on a backup says it again)."""
+    """#20: the mic voice.heal chose (or DOWN), after each heal. A move to a backup or to no mic is said on the heal
+    that made it: never a mic the user wasn't told of. Only the return to the Scarlett (and DOWN, Booth Mic's restart
+    gap) waits for a second heal in a row, so a flap Scarlett → BRIO → Scarlett is said once each way, never zero times,
+    never a stream. state: {"said": the last source said, the Scarlett at start, "seen": a return seen once}, in memory
+    only (a restart on a backup says it again)."""
     said, source = state.get("said", voice.SCARLETT), e["source"]
     if source == said:
         return {"said": said}, []
-    if "seen" not in state or state["seen"] != source:  # None (no mic) is a source too
+    if source in (voice.SCARLETT, DOWN) and state.get("seen") != source:
         return {"said": said, "seen": source}, []
     return {"said": source}, [("notify", MIC_SAID[source]), ("label", source)]
 

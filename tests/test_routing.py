@@ -241,40 +241,43 @@ def dump(configured=PROX, effective=PROX):
 
 
 class MicRule(unittest.TestCase):
-    """#20: Booth Mic's source, as heal chose it, said once it holds on two heals in a row (flapping says nothing)."""
+    """#20: Booth Mic's source, as heal chose it. A move to a backup or to no mic is said on the heal that made it; only
+    the return to the Scarlett (and DOWN) waits for a second heal in a row, so a flap is said once each way."""
 
     @staticmethod
     def mic(source):
         return {"kind": "mic", "source": source}
 
-    def test_a_change_is_said_on_its_second_sight_and_only_once(self):
-        state, actions = routing.next({}, self.mic(voice.PRO_X_MIC))
-        self.assertEqual(actions, [])  # one heal may land in a flap: looked at again ~2 s later
-        state, actions = routing.next(state, self.mic(voice.PRO_X_MIC))
-        self.assertEqual(actions, [("notify", routing.MIC_SAID[voice.PRO_X_MIC]), ("label", voice.PRO_X_MIC)])
-        self.assertEqual(routing.next(state, self.mic(voice.PRO_X_MIC)), (state, []))
+    def test_a_move_to_a_backup_or_no_mic_is_said_on_the_heal_that_made_it_and_only_once(self):
+        for source in (voice.PRO_X_MIC, voice.BRIO_MIC, None):  # privacy: never a mic the user wasn't told of
+            state, actions = routing.next({}, self.mic(source))
+            self.assertEqual(actions, [("notify", routing.MIC_SAID[source]), ("label", source)])
+            self.assertEqual(routing.next(state, self.mic(source)), (state, []))
+        state, actions = routing.next({"said": voice.PRO_X_MIC, "seen": voice.SCARLETT}, self.mic(voice.BRIO_MIC))
+        self.assertEqual((state, actions[0]), ({"said": voice.BRIO_MIC}, ("notify", routing.MIC_SAID[voice.BRIO_MIC])))
 
     def test_booth_mic_starts_on_the_scarlett_so_nothing_is_said_for_it(self):
         state, actions = routing.next({}, self.mic(voice.SCARLETT))
         self.assertEqual((state, actions), ({"said": voice.SCARLETT}, []))
 
-    def test_the_return_to_the_scarlett_is_said(self):
-        state = {"said": voice.BRIO_MIC}
-        for _ in range(2):
-            state, actions = routing.next(state, self.mic(voice.SCARLETT))
+    def test_the_return_to_the_scarlett_is_said_once_it_holds_on_two_heals(self):
+        state, actions = routing.next({"said": voice.BRIO_MIC}, self.mic(voice.SCARLETT))
+        self.assertEqual((state, actions), ({"said": voice.BRIO_MIC, "seen": voice.SCARLETT}, []))
+        state, actions = routing.next(state, self.mic(voice.SCARLETT))
         self.assertEqual(actions, [("notify", routing.MIC_SAID[voice.SCARLETT]), ("label", voice.SCARLETT)])
 
-    def test_a_flap_back_before_it_settles_says_nothing(self):
+    def test_a_flap_is_said_once_each_way_never_zero_never_a_stream(self):
         state, said = {}, []
-        for source in [voice.PRO_X_MIC, voice.SCARLETT] * 5 + [voice.BRIO_MIC, voice.PRO_X_MIC, None, voice.SCARLETT]:
+        for source in [voice.PRO_X_MIC, voice.SCARLETT] * 5 + [voice.SCARLETT]:
             state, actions = routing.next(state, self.mic(source))
-            said += actions
-        self.assertEqual((state, said), ({"said": voice.SCARLETT}, []))
+            said += [v for k, v in actions if k == "notify"]
+        self.assertEqual(said, [routing.MIC_SAID[voice.PRO_X_MIC], routing.MIC_SAID[voice.SCARLETT]])
+        self.assertEqual(state, {"said": voice.SCARLETT})
 
-    def test_no_mic_and_booth_mic_down_are_said_too(self):
-        for source in (None, routing.DOWN):
-            state, _ = routing.next({}, self.mic(source))
-            self.assertEqual(routing.next(state, self.mic(source))[1][0], ("notify", routing.MIC_SAID[source]))
+    def test_booth_mic_down_is_said_once_it_holds_on_two_heals(self):  # its 5 s restart gap is not a move
+        state, actions = routing.next({}, self.mic(routing.DOWN))
+        self.assertEqual(actions, [])
+        self.assertEqual(routing.next(state, self.mic(routing.DOWN))[1][0], ("notify", routing.MIC_SAID[routing.DOWN]))
 
     def test_the_mic_rule_never_touches_the_mute_or_a_default(self):  # mute lives on booth_mic: nothing to carry over
         state, kinds = {}, set()

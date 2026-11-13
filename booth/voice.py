@@ -234,11 +234,11 @@ def _named(node):
 
 def choose(state, on, dump, current):
     """The one source choice for the selector → (the mic: SCARLETT, PRO_X_MIC, BRIO_MIC or None, what apply() takes).
-    `state`: scarlett.read; `on`: the PRO X headset answers on (HeadsetMonitor); `dump`: pw-dump JSON, read while the
-    Scarlett is absent; `current`: the source the selector config on disk takes. The Scarlett in ALSA is always the
-    Scarlett, its mic routed or not (not routed: apply stops the selector, never another mic). Absent from ALSA and
-    PipeWire: the PRO X mic while on, else the BRIO mic, at its first discovered position (a backup with none is
-    skipped). Neither: a backup's selector is stopped ({"mic": None}); the Scarlett's keeps its config (None: kept)."""
+    `state`: scarlett.read; `on`: the PRO X headset answers on (HeadsetMonitor.on; None: not answered yet); `dump`:
+    pw-dump JSON, read while the Scarlett is absent; `current`: the source the selector config on disk takes. The
+    Scarlett in ALSA is always the Scarlett, its mic routed or not (not routed: apply stops the selector, never another
+    mic). Absent from ALSA and PipeWire: the PRO X mic while on, else the BRIO mic, at its first discovered position (a
+    backup with none is skipped). Neither: a backup's selector is stopped ({"mic": None}); the Scarlett's keeps its config (None: kept)."""
     if state is not None:
         return SCARLETT, state
     try:
@@ -249,6 +249,8 @@ def choose(state, on, dump, current):
         return _named(current), None
     if scarlett._source(dump)[0]:  # amixer failed, or the card is going: still in PipeWire, so not absent yet
         return SCARLETT, None
+    if on is None:  # not answered yet (Booth just started): the PRO X kept; a fresh choice takes the BRIO, a mic that
+        on = _named(current) == PRO_X_MIC  # carries sound, since an off headset's dongle stays in PipeWire, silent
     for name, prefix in BACKUPS:
         if name == PRO_X_MIC and not on:  # off: its dongle stays in PipeWire, its mic carries nothing
             continue
@@ -425,7 +427,7 @@ def _choice(settings):
 def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, clock=time.monotonic, on=lambda: False):
     """Every 10 s (and on a debounced sound-card or headset change): apply() with the mic choose() picks now, from the
     Scarlett read now, so a reroute, a new channel, a renamed Scarlett node or a fallback is followed with or without a
-    window; `on()`: the PRO X headset answers on. The choice is kept in CHOSEN. Then restart the selector when it should
+    window; `on()`: the PRO X headset answers on (None: not yet). The choice is kept in CHOSEN. Then restart the selector when it should
     run, its source and Booth Mic's input are in PipeWire and it isn't: it unloads itself when its source goes, or when
     it started before it at login. Never without Booth Mic's input (BindsTo would pull a stopped booth-voice.service
     back up), and at most once a minute for the same config and source node, so a selector that won't stay up isn't

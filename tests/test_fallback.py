@@ -76,7 +76,15 @@ class Choose(unittest.TestCase):
     def test_a_failed_pw_dump_leaves_the_selector_as_it_is(self):
         for dump in ("", "not json"):
             self.assertEqual(voice.choose(None, True, dump, PROX_MIC), (voice.PRO_X_MIC, None), dump)
+            self.assertEqual(voice.choose(None, True, dump, SCARLETT_SOURCE), (voice.SCARLETT, None), dump)
             self.assertEqual(voice.choose(None, True, dump, None), (None, None), dump)
+
+    def test_the_headset_not_answered_yet_keeps_the_prox_and_a_fresh_choice_takes_the_brio(self):
+        self.assertEqual(voice.choose(None, None, ABSENT, PROX_MIC)[0], voice.PRO_X_MIC)  # a restart on the PRO X
+        self.assertEqual(voice.choose(None, None, ABSENT, BRIO_MIC)[0], voice.BRIO_MIC)
+        # fresh: the dongle stays in PipeWire with the headset off, so the PRO X could be silence said as a mic
+        self.assertEqual(voice.choose(None, None, ABSENT, SCARLETT_SOURCE)[0], voice.BRIO_MIC)
+        self.assertEqual(voice.choose(None, None, ABSENT, None)[0], voice.BRIO_MIC)
 
     def test_a_backup_selector_takes_only_its_mic_never_reconnected_or_heard_from_another(self):
         cfg = json.loads(voice.build_selector(voice.choose(None, True, ABSENT, None)[1]["mic"]))
@@ -138,6 +146,12 @@ class Fallback(unittest.TestCase):
         chosen, cfg = self.heal(None, desk("alsa_input.usb-Focusrite", "alsa_input.usb-046d"), on=False)
         self.assertEqual((chosen, cfg, self.ran), (None, selector(), []))
 
+    def test_booth_restarted_on_the_prox_keeps_it_until_the_headset_answers(self):
+        self.heal(None, ABSENT)  # on the PRO X
+        self.ran.clear()
+        chosen, cfg = self.heal(None, ABSENT, on=None)
+        self.assertEqual((chosen, capture(cfg)["target.object"], self.ran), (voice.PRO_X_MIC, PROX_MIC, []))
+
     def test_the_scarlett_there_with_the_mic_not_routed_stops_never_falls_back(self):
         self.heal(None, ABSENT)  # on the PRO X
         self.ran.clear()
@@ -146,8 +160,8 @@ class Fallback(unittest.TestCase):
 
 
 class Sequences(unittest.TestCase):
-    """The desk through heal and the routing policy's "mic" rule, as the app runs them: a change is said once it holds
-    on two heals in a row (the second one a debounced poke, ~2 s later)."""
+    """The desk through heal and the routing policy's "mic" rule, as the app runs them: a move to a backup or to no mic
+    is said on the heal that made it; the return to the Scarlett once it holds on two heals (a debounced poke, ~2 s)."""
 
     def setUp(self):
         Fallback.setUp(self)
@@ -161,33 +175,44 @@ class Sequences(unittest.TestCase):
         for kind, value in actions:
             (self.notes if kind == "notify" else self.labels).append(value)
 
-    def test_scarlett_out_is_said_once(self):
-        for _ in range(4):
+    def test_scarlett_out_is_said_on_the_heal_that_moved_it_and_once(self):
+        self.tick(None, ABSENT)
+        self.assertEqual((self.notes, self.labels), ([routing.MIC_SAID[voice.PRO_X_MIC]], [voice.PRO_X_MIC]))
+        for _ in range(3):
             self.tick(None, ABSENT)
         self.assertEqual((self.notes, self.labels), ([routing.MIC_SAID[voice.PRO_X_MIC]], [voice.PRO_X_MIC]))
 
-    def test_scarlett_out_with_the_headset_off_is_said_once(self):
-        for _ in range(3):
-            self.tick(None, ABSENT, on=False)
+    def test_scarlett_out_with_the_headset_off_is_said_at_once(self):
+        self.tick(None, ABSENT, on=False)
         self.assertEqual((self.notes, self.labels), ([routing.MIC_SAID[voice.BRIO_MIC]], [voice.BRIO_MIC]))
 
     def test_scarlett_back_is_said_too(self):
-        for state, dump in ((None, ABSENT), (None, ABSENT), (STATE, desk()), (STATE, desk())):
+        for state, dump in ((None, ABSENT), (STATE, desk()), (STATE, desk())):
             self.tick(state, dump)
         self.assertEqual(self.labels, [voice.PRO_X_MIC, voice.SCARLETT])
         self.assertEqual(self.notes[-1], routing.MIC_SAID[voice.SCARLETT])
 
-    def test_flapping_says_nothing_until_it_settles_then_once(self):
+    def test_a_scarlett_replugged_between_two_heals_is_said_both_ways(self):
+        self.tick(None, ABSENT, on=False)
+        self.tick(STATE, desk())
+        self.tick(STATE, desk())
+        self.assertEqual(self.notes, [routing.MIC_SAID[voice.BRIO_MIC], routing.MIC_SAID[voice.SCARLETT]])
+
+    def test_flapping_is_said_once_each_way_once_it_settles(self):
         for _ in range(10):  # unplugged and replugged between every heal
             self.tick(None, ABSENT)
             self.tick(STATE, desk())
-        self.assertEqual(self.notes, [])
-        for _ in range(3):
-            self.tick(None, ABSENT)
-        self.assertEqual(self.labels, [voice.PRO_X_MIC])
+        self.assertEqual(self.notes, [routing.MIC_SAID[voice.PRO_X_MIC]])  # the backup at once, the return not yet
+        self.tick(STATE, desk())
+        self.assertEqual(self.labels, [voice.PRO_X_MIC, voice.SCARLETT])
+
+    def test_the_scarlett_unplugged_while_pw_dump_fails_stays_the_scarlett_never_no_mic(self):
+        for _ in range(2):
+            self.tick(None, "")
+        self.assertEqual((voice.CHOSEN, self.notes), (voice.SCARLETT, []))
 
     def test_mute_is_preserved_booth_mic_is_never_restarted_and_nothing_touches_its_mute(self):
-        for state, dump, on in ((None, ABSENT, True),) * 2 + ((None, ABSENT, False),) * 2 + ((STATE, desk(), True),) * 2:
+        for state, dump, on in ((None, ABSENT, True), (None, ABSENT, False)) + ((STATE, desk(), True),) * 2:
             self.tick(state, dump, on)
         self.assertEqual(self.labels, [voice.PRO_X_MIC, voice.BRIO_MIC, voice.SCARLETT])
         self.assertFalse([c for c in self.ran if UNITS[0] in c and c != ACTIVE])

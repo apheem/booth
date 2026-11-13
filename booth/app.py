@@ -186,7 +186,7 @@ class Application(Adw.Application):
 
     def heal_once(self):
         try:
-            voice.heal(self.settings, on=lambda: self.headset_monitor.on is True)
+            voice.heal(self.settings, on=lambda: self.headset_monitor.on)
             source = voice.CHOSEN if voice.running() else routing.DOWN
             self.mic, actions = routing.next(self.mic, {"kind": "mic", "source": source})
             if "seen" in self.mic:  # a change seen once: looked at again once things settle, not at the next tick
@@ -259,6 +259,7 @@ class Application(Adw.Application):
                 self.hold()
                 self.held = True
             self.window = Window(self, settings, node, ctrls)
+            self.window.show_mic(self.mic_source)  # opened on a backup: its sidebar line and banner say so
             self.window.connect("close-request", self.on_close)
             self.window.present()
         except Exception:  # no window: release lets Booth exit instead of living on with nothing to show

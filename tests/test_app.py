@@ -364,11 +364,9 @@ class BackgroundLaunch(unittest.TestCase):
             threads[0]()
         (settings,), kwargs = heal.call_args  # the chosen input: heal reads the Scarlett's routing itself
         self.assertIs(settings, stub.settings)
-        stub.headset_monitor.on = True  # the PRO X mic is a backup only while the headset answers on
-        self.assertIs(kwargs["on"](), True)
-        for on in (False, None):
+        for on in (True, False, None):  # None: not answered yet, which choose() tells from off
             stub.headset_monitor.on = on
-            self.assertIs(kwargs["on"](), False)
+            self.assertIs(kwargs["on"](), on)
 
     def test_a_slow_heal_is_never_overlapped_by_the_next_tick(self):
         threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False, mic={})
@@ -686,8 +684,8 @@ class HeadsetBattery(unittest.TestCase):
 
 
 class MicFallback(unittest.TestCase):
-    """#20: after each heal the routing policy's mic rule sees what heal chose; a settled change is notified, shown in
-    the sidebar and on the Microphone page's banner; a change not settled yet is looked at again ~2 s later."""
+    """#20: after each heal the routing policy's mic rule sees what heal chose; a move is notified, shown in the sidebar
+    and on the Microphone page's banner at once; a return to the Scarlett not settled yet is looked at again ~2 s later."""
 
     def heal_once(self, mic, chosen, running=True):
         stub, idle = mock.Mock(settings={}, mic=mic, healing=True), []
@@ -699,13 +697,13 @@ class MicFallback(unittest.TestCase):
         self.assertFalse(stub.healing)
         return stub, idle
 
-    def test_a_first_sight_of_a_change_pokes_another_heal_soon(self):
-        stub, idle = self.heal_once({}, voice.PRO_X_MIC)
-        self.assertEqual(stub.mic, {"said": voice.SCARLETT, "seen": voice.PRO_X_MIC})
+    def test_a_first_sight_of_the_return_pokes_another_heal_soon(self):
+        stub, idle = self.heal_once({"said": voice.PRO_X_MIC}, voice.SCARLETT)
+        self.assertEqual(stub.mic, {"said": voice.PRO_X_MIC, "seen": voice.SCARLETT})
         self.assertEqual(idle, [(stub.mic_poke.poke, ())])  # Debounce: a GLib timer, so on the main loop
 
-    def test_a_settled_change_goes_to_the_main_loop(self):
-        stub, idle = self.heal_once({"said": voice.SCARLETT, "seen": voice.PRO_X_MIC}, voice.PRO_X_MIC)
+    def test_a_move_to_a_backup_goes_to_the_main_loop_on_the_heal_that_made_it(self):
+        stub, idle = self.heal_once({}, voice.PRO_X_MIC)
         self.assertEqual(stub.mic, {"said": voice.PRO_X_MIC})
         self.assertEqual(idle, [(stub.mic_moved, ([("notify", routing.MIC_SAID[voice.PRO_X_MIC]),
                                                    ("label", voice.PRO_X_MIC)],))])
@@ -739,9 +737,19 @@ class MicFallback(unittest.TestCase):
         scarlett = Gio.File.new_for_path("/dev/snd/by-id/usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00")
         for event in (Gio.FileMonitorEvent.CREATED, Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.MOVED_OUT):
             app.Application.on_snd_by_id(stub, None, scarlett, None, event)
-        self.assertEqual(stub.mic_poke.poke.call_count, 3)
+        app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path("/dev/snd/by-id/.#tmp"), scarlett,
+                                     Gio.FileMonitorEvent.RENAMED)  # udev's link, made under a temp name
+        app.Application.on_snd_by_id(stub, None, scarlett, Gio.File.new_for_path("/dev/snd/.tmp"),
+                                     Gio.FileMonitorEvent.MOVED_IN)
+        self.assertEqual(stub.mic_poke.poke.call_count, 5)
         app.Application.on_snd_by_id(stub, None, scarlett, None, Gio.FileMonitorEvent.CHANGES_DONE_HINT)
-        self.assertEqual(stub.mic_poke.poke.call_count, 3)
+        self.assertEqual(stub.mic_poke.poke.call_count, 5)
+
+    def test_a_window_opened_while_on_a_backup_shows_it_in_the_sidebar_and_the_banner(self):
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.BRIO_MIC)
+        with mock.patch.object(app, "Window") as window:
+            app.Application.show_window(stub, {"camera": {}}, None, {}, False)
+        window.return_value.show_mic.assert_called_once_with(voice.BRIO_MIC)  # show_mic: the label and the banner
 
     def test_the_window_shows_the_mic_in_the_sidebar_and_a_change_in_the_banner(self):
         win = mock.Mock()
