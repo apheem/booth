@@ -457,10 +457,26 @@ def _owned(run=devices._run):
 
 def may_select(select_file, owned=_owned):
     """booth-mic-select.service's ExecCondition: True when the selector config `select_file` may start. The Scarlett's
-    always; a backup's only while Booth runs to say it, else removed (Booth Mic silent until Booth heals and says it)."""
-    source = _named(_capture(_load(select_file), "target.object"))
+    always; a backup's only while Booth runs to say it, else removed (Booth Mic silent until Booth heals and says it):
+    only the very file read, never one Booth wrote while the bus was asked (store.save: always a new inode)."""
+    try:
+        with open(select_file) as f:
+            cfg, ino = json.loads(f.read()), os.fstat(f.fileno()).st_ino
+    except (OSError, ValueError):
+        return False
+    source = _named(_capture(cfg, "target.object"))
     if source in dict(BACKUPS) and not owned():
-        _put_back(select_file, None)
+        aside = select_file.with_name(f".{select_file.name}.refused")
+        try:  # moved aside atomically, then checked: a newer config goes back unless a newer one still is there
+            os.replace(select_file, aside)
+            if os.stat(aside).st_ino != ino:
+                try:
+                    os.link(aside, select_file)
+                except FileExistsError:
+                    pass
+            os.unlink(aside)
+        except OSError:
+            pass
         return False
     return source is not None
 
