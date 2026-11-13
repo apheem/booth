@@ -41,6 +41,11 @@ def wanted(mapped, suspended):
     return mapped and not suspended
 
 
+def height(width):
+    """The preview's height at `width`: 16:9, the BRIO's frame. Its minimum too (ui.camera.Wide)."""
+    return round(width * 9 / 16)
+
+
 def notice(text, plugged):
     """The problem page's title and description. Unplugged, the controls don't work either: say so."""
     if not plugged:

@@ -12,6 +12,23 @@ ARROWS = [("go-previous-symbolic", "Pan left", camera.PAN, -1), ("go-up-symbolic
           ("go-down-symbolic", "Tilt down", camera.TILT, -1), ("go-next-symbolic", "Pan right", camera.PAN, 1)]
 
 
+class Wide(Gtk.LayoutManager):
+    """The preview's box: 16:9 at the width it is given, as its minimum too. A Gtk.AspectFrame takes its child's minimum
+    (a picture's is 0), which is all the page gives in a window shorter than its controls: a tiny preview."""
+
+    def do_get_request_mode(self, _widget):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, widget, orientation, for_size):
+        low, nat, *_ = widget.get_first_child().measure(orientation, for_size)
+        if orientation == Gtk.Orientation.VERTICAL and for_size >= 0:
+            low = nat = max(low, preview.height(for_size))  # never less than the problem page needs
+        return low, nat, -1, -1
+
+    def do_allocate(self, widget, width, height, baseline):
+        widget.get_first_child().allocate(width, height, baseline, None)
+
+
 class CameraPage(Adw.PreferencesPage):
     def __init__(self, settings, node, ctrls, status=lambda text: None):
         super().__init__()
@@ -53,7 +70,7 @@ class CameraPage(Adw.PreferencesPage):
         box = Gtk.Overlay(child=self.stack, overflow=Gtk.Overflow.HIDDEN, css_classes=["card"])
         box.add_overlay(self.overlay)
         group = Adw.PreferencesGroup()
-        group.add(Gtk.AspectFrame(ratio=16 / 9, obey_child=False, child=box))
+        group.add(Adw.Bin(child=box, layout_manager=Wide()))
         self.preview = preview.Preview(self.node, self.picture.set_paintable, self.preview_failed)
         # mapped = this page is the one shown in a window on screen; leaving it, hiding or closing the window unmaps it.
         # A minimised window stays mapped, so its `suspended` is watched too. A background Booth never builds a page.
