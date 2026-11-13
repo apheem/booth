@@ -69,7 +69,7 @@ class Application(Adw.Application):
         super().__init__(application_id=APP_ID)
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
-        self.snd_monitor, self.dongle = None, None
+        self.snd_monitor, self.dongle, self.healing = None, None, False
         self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # #12 subscribes to its listeners
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
@@ -145,8 +145,16 @@ class Application(Adw.Application):
         threading.Thread(target=lambda: voice.sync(self.settings), daemon=True).start()
 
     def heal_voice(self):
-        threading.Thread(target=lambda: voice.heal(self.settings), daemon=True).start()  # amixer, pw-dump: off the loop
+        if not self.healing:  # a slow heal (amixer, pw-dump, systemctl) never overlaps the next tick
+            self.healing = True
+            threading.Thread(target=self.heal_once, daemon=True).start()  # off the main loop
         return True
+
+    def heal_once(self):
+        try:
+            voice.heal(self.settings)
+        finally:
+            self.healing = False
 
     def low_battery(self, percent):
         note = Gio.Notification.new("Headset battery low")

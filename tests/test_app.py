@@ -310,13 +310,30 @@ class BackgroundLaunch(unittest.TestCase):
         sync.assert_called_once_with(stub.settings)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
-        threads, stub = [], mock.Mock(settings={"voice": {}})
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.voice, "heal") as heal:
             self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
             heal.assert_not_called()
             threads[0]()
         heal.assert_called_once_with(stub.settings)  # the chosen input: heal reads the Scarlett's routing itself
+
+    def test_a_slow_heal_is_never_overlapped_by_the_next_tick(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "heal") as heal:
+            for tick in range(3):  # amixer, pw-dump and systemctl still running: the ticks are skipped
+                self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
+            self.assertEqual(len(threads), 1)
+            threads[0]()
+            heal.side_effect = OSError("boom")  # a heal that fails still lets the next one run
+            app.Application.heal_voice(stub)
+            with self.assertRaises(OSError):
+                threads[1]()
+            app.Application.heal_voice(stub)
+        self.assertEqual((len(threads), heal.call_count), (3, 2))
 
     def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
         stub = self.watch(background=True)

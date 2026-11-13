@@ -278,6 +278,15 @@ class Apply(unittest.TestCase):
             self.assertEqual(self.apply(state=rerouted(item)), "unchanged")  # stopped once
             self.assertEqual(self.ran, [])
 
+    def test_not_routed_stops_a_selector_whose_old_config_has_no_channel_recorded(self):
+        self.apply()
+        cfg = json.loads(self.select.read_text())  # written before booth.mic.channel existed
+        del module(cfg, "libpipewire-module-loopback")["capture.props"][voice.CHANNEL]
+        self.select.write_text(json.dumps(cfg))
+        self.ran.clear()
+        self.apply(state=rerouted("PCM 1"))  # no mic at all: nothing to keep it for
+        self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False))
+
     def test_a_mic_with_no_channel_to_take_stops_the_selector(self):
         self.apply()
         self.ran.clear()
@@ -611,6 +620,16 @@ class Heal(unittest.TestCase):
                        clock=lambda: 1000.0 + 10 * tick)
             self.assertFalse(position() == ["FL"] and running[0] == ["FR"], f"tick {tick}: saved FL, running FR")
         self.assertEqual((position(), running[0]), (["FL"], ["FL"]))
+
+    def test_a_selector_the_page_just_restarted_is_left_to_come_up(self):
+        self.saved()
+        instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
+        with mock.patch.object(voice.time, "monotonic", return_value=1000.0):  # the Microphone page's poll moves the mic
+            said = voice.apply(ON, instrument, run=lambda cmd: self.ran.append(cmd) or True,
+                               dump=lambda: SCARLETT_BACK, file=self.file)
+        self.assertEqual(said, "selector restarted")
+        self.assertFalse(self.heal(SCARLETT_BACK, state=instrument, t=1010.0))  # its node isn't there yet
+        self.assertEqual(self.ran, [RESTART_SELECT])  # one dropout per mic move, never two
 
     def test_heal_takes_the_chosen_input(self):
         self.saved()

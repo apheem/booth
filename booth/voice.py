@@ -194,7 +194,20 @@ def _put_back(file, text):
         pass
 
 
-def apply(settings, state, run=service.run, dump=_dump, file=None):
+def _key(sel, dump, name):
+    """heal's backoff key: (selector config text, the Scarlett node's object.serial, never reused as a node id is: tells
+    a replug, restart now, from the same selector failing again), the serial None when the node isn't in `dump`."""
+    scarlett_node = _node(dump, name)
+    return sel, scarlett_node and scarlett_node["info"]["props"].get("object.serial", scarlett_node["id"])
+
+
+def _restarted(key, clock):
+    """Every selector restart, apply's or heal's: heal leaves it to come up for HEAL_BACKOFF_S."""
+    _HEALED.clear()
+    _HEALED[key] = clock()
+
+
+def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
     """Bring both configs up to date with the settings and `state`, the Scarlett now (scarlett.read). New control values
     are set live on the chain, then recorded; a new chain shape (a new stage) restarts both services; a new mic channel
     or node restarts only the selector. Unplugged (None) keeps the last selector: it unloaded itself and heal() brings
@@ -206,8 +219,8 @@ def apply(settings, state, run=service.run, dump=_dump, file=None):
     A chain change that fails never holds back the selector."""
     file = file or path()
     select_file = file.with_name(SELECT_CONF)
-    chain, sel = json.loads(build(settings)), build_selector(state["mic"]) if state else None
-    sel = sel and json.loads(sel)
+    chain, sel_text = json.loads(build(settings)), build_selector(state["mic"]) if state else None
+    sel = sel_text and json.loads(sel_text)
     with _LOCK:
         old, old_text, old_sel_text, said = _load(file), _text(file), _text(select_file), None
         restart = shape(old) != shape(chain)
@@ -235,6 +248,8 @@ def apply(settings, state, run=service.run, dump=_dump, file=None):
             if moved:
                 _put_back(select_file, old_sel_text)
             return "not restarted: Booth Mic's service didn't start"
+        if sel is not None:  # RESTART restarts the selector too; shortcut: a pw-dump blip here keys it without the node
+            _restarted(_key(sel_text, dump(), state["mic"]["node"]), clock)
         return ("restarted" if restart else "selector restarted") + (f", but {said}" if said else "")
 
 
@@ -253,24 +268,21 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
     if state is None:
         return False  # unplugged: the selector keeps its config for the Scarlett's return
     with _LOCK:
-        said = apply(settings, state, run, dump, file)
+        said = apply(settings, state, run, dump, file, clock)
         sel = build_selector(state["mic"])
         # only the selector's own config on disk: never revived on an old channel, whatever the chain's save did
         if sel is None or _load((file or path()).with_name(SELECT_CONF)) != json.loads(sel):
             return False
+        if said.startswith(("restarted", "selector restarted")):
+            return True  # by apply, which recorded it: it is coming up
         now = dump()
-        scarlett_node = _node(now, state["mic"]["node"])
-        # object.serial, never reused as a node id is: tells a replug (restart now) from the same selector failing again
-        key = (sel, scarlett_node and scarlett_node["info"]["props"].get("object.serial", scarlett_node["id"]))
-        restarted = said.startswith(("restarted", "selector restarted"))  # by apply: it is coming up
-        if not restarted:
-            if key[1] is None or _node_id(now, INPUT) is None or _node_id(now, SELECTOR) is not None:
-                return False
-            if key in _HEALED and clock() - _HEALED[key] < HEAL_BACKOFF_S:
-                return False
-            restarted = run(RESTART_SELECT)
-        _HEALED.clear()
-        _HEALED[key] = clock()
+        key = _key(sel, now, state["mic"]["node"])
+        if key[1] is None or _node_id(now, INPUT) is None or _node_id(now, SELECTOR) is not None:
+            return False
+        if key in _HEALED and clock() - _HEALED[key] < HEAL_BACKOFF_S:
+            return False
+        restarted = run(RESTART_SELECT)
+        _restarted(key, clock)
         return restarted
 
 
