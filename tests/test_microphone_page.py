@@ -7,7 +7,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import scarlett
+from booth import meter, scarlett
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
@@ -90,12 +90,44 @@ class _W:
         return lambda *_args: None
 
 
+class _Meter(_W):
+    """A LevelMeter stand-in: what it was last told to show."""
+
+    def set_level(self, peak, decay):
+        self.level, self.said = (peak, decay), None
+
+    def idle(self, text):
+        self.level, self.said = None, text
+
+
+class _Gst:
+    """A meter.Meter stand-in: every want(record, visible) it was given."""
+
+    def __init__(self, post, failed):
+        self.post, self.failed, self.wants, self.stopped = post, failed, [], 0
+
+    def want(self, record, visible):
+        self.wants.append((record, visible))
+
+    def stop(self):
+        self.stopped += 1
+
+
+class _Root(_W):
+    suspended = False
+
+    def is_suspended(self):
+        return self.suspended
+
+
 Page = type("MicrophoneStandIn", (GObject.Object,), {
     **{k: v for k, v in vars(microphone.MicrophonePage).items() if callable(v) and not k.startswith("__")},
-    "add": lambda self, _group: None, "poll": lambda self: True})
+    "add": lambda self, _group: None, "poll": lambda self: True, "mapped": False,
+    "connect": lambda self, signal, handler, *a: vars(self).setdefault("handlers", {}).update({signal: (handler, a)}),
+    "emit": _W.emit, "get_mapped": lambda self: self.mapped, "get_root": lambda self: self.root_})
 
 
-class ScarlettGroup(unittest.TestCase):
+class PageCase(unittest.TestCase):
     def setUp(self):
         self.ran, self.saved, self.dialogs = [], [], []
         self.settings = {"microphone": {}}
@@ -119,10 +151,13 @@ class ScarlettGroup(unittest.TestCase):
                 mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: f(*a)),
                 mock.patch.object(microphone.threading, "Thread", Inline),
                 mock.patch.object(microphone.scarlett, "send", send),
-                mock.patch.object(microphone.store, "save", self.saved.append)):
+                mock.patch.object(microphone.store, "save", self.saved.append),
+                mock.patch.object(microphone, "LevelMeter", _Meter),
+                mock.patch.object(microphone.meter, "Meter", _Gst)):
             patch.start()
             self.addCleanup(patch.stop)
         self.page = Page()
+        self.page.root_ = _Root()
         microphone.MicrophonePage.__init__(self.page, self.settings)
         self.assertEqual([n for n in vars(self.page) if hasattr(microphone.MicrophonePage, n)], [])  # none shadowed
 
@@ -140,6 +175,8 @@ class ScarlettGroup(unittest.TestCase):
     def cset(self, name, value):
         return ["amixer", "-c", "Gen", "cset", f"name={name}", value]
 
+
+class ScarlettGroup(PageCase):
     def test_turning_48v_on_asks_first_writes_nothing_and_leaves_the_switch_off(self):
         self.show(state())
         self.click(self.page.phantom, True)
@@ -289,6 +326,72 @@ class ScarlettGroup(unittest.TestCase):
         self.assertEqual(removed, [self.page.timer])
 
 
+class Meters(PageCase):
+    """The before-meter and the sidebar meter: what they say, and when the Scarlett is metered."""
+
+    def setUp(self):
+        super().setUp()
+        self.meters, self.gst = (self.page.bar, self.page.mini), self.page.meter
+
+    def map(self, widget, on=True):
+        widget.mapped = on
+        widget.emit("map" if on else "unmap")
+
+    def test_the_page_and_the_sidebar_meter_both_show_the_mic_channel(self):
+        self.page.meter.post(-14.0, -10.0)
+        self.assertEqual([m.level for m in self.meters], [(-14.0, -10.0)] * 2)
+
+    def test_a_routed_mic_is_metered_with_the_coaching_text(self):
+        s = state()
+        self.show(s)
+        self.assertEqual(self.gst.wants[-1], (s["mic"], False))  # not on screen yet
+        self.assertEqual(self.page.levels.description, meter.COACHING)
+
+    def test_unplugged_says_so_and_runs_nothing(self):
+        self.show(None)
+        self.assertEqual(self.gst.wants[-1][0], None)
+        self.assertEqual([m.said for m in self.meters], [scarlett.UNPLUGGED] * 2)
+        self.assertEqual(self.page.levels.description, scarlett.UNPLUGGED)
+
+    def test_not_routed_says_so_and_runs_nothing(self):
+        self.show(state(**{"PCM 02 Capture Enum": 5}))
+        self.assertEqual(self.gst.wants[-1][0], None)
+        self.assertEqual([m.said for m in self.meters], [meter.NOT_ROUTED] * 2)
+
+    def test_runs_while_the_page_is_on_screen(self):
+        s = state()
+        self.show(s)
+        self.map(self.page)
+        self.assertEqual(self.gst.wants[-1], (s["mic"], True))
+        self.map(self.page, False)
+        self.assertEqual(self.gst.wants[-1], (s["mic"], False))
+
+    def test_runs_while_only_the_sidebar_meter_is_on_screen(self):
+        self.show(state())
+        self.page.mini.get_mapped = lambda: self.page.mini.mapped
+        self.page.mini.get_root = lambda: self.page.root_
+        self.map(self.page.mini)
+        self.assertTrue(self.gst.wants[-1][1])
+        self.map(self.page.mini, False)
+        self.assertFalse(self.gst.wants[-1][1])
+
+    def test_a_minimised_window_stops_it(self):
+        self.show(state())
+        self.map(self.page)
+        self.page.root_.suspended = True
+        self.page.root_.emit("notify::suspended", None)
+        self.assertFalse(self.gst.wants[-1][1])
+
+    def test_a_failure_says_so_on_both_meters(self):
+        self.page.meter.failed(meter.UNAVAILABLE)
+        self.assertEqual([m.said for m in self.meters], [meter.UNAVAILABLE] * 2)
+
+    def test_closing_the_window_stops_the_meter(self):
+        with mock.patch.object(microphone.GLib, "source_remove", lambda _t: None):
+            self.page.stop()
+        self.assertEqual(self.gst.stopped, 1)
+
+
 class WindowClose(unittest.TestCase):
     def test_closing_the_window_stops_the_microphone_pages_poll(self):
         ns, win, booth = types.SimpleNamespace, mock.Mock(), mock.Mock()
@@ -301,6 +404,7 @@ class WindowClose(unittest.TestCase):
             if c.args[0] == "close-request":
                 c.args[1](win)
         mic.return_value.stop.assert_called_once_with()
+        self.assertIs(win.pages[1][3], mic.return_value.mini)  # the sidebar's Microphone row shows its meter
 
     def test_closing_the_window_stops_the_headphones_pages_poll(self):
         ns, win, booth = types.SimpleNamespace, mock.Mock(), mock.Mock()
