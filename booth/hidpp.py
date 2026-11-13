@@ -1,5 +1,5 @@
-"""The PRO X Wireless's battery over HID++, through its hidraw node. No answer within TIMEOUT_S, or an error answer,
-means the headset is off: its USB dongle stays plugged in (and in PipeWire) when the headset is off.
+"""The PRO X Wireless's battery over HID++, through its hidraw node. An error answer means the headset is off (its USB
+dongle stays plugged in, and in PipeWire, when the headset is off); no answer within TIMEOUT_S is only a miss.
 
 The battery request, the reply's layout and the voltage → percentage curve are ported from HeadsetControl
 (https://github.com/Sapd/HeadsetControl, GPL-3.0-or-later, commit 0c8a76fa019cd02263a1c69e00e18e229b16d87f):
@@ -9,9 +9,12 @@ charging bytes), lib/devices/protocols/logitech_calibrations.hpp (the G PRO curv
 (spline_battery_level). Booth is GPL-3.0 too. HeadsetControl itself is not used.
 
 Only this one request is ever sent, and only to the node whose sysfs ids are 046d:0aba and whose report descriptor
-declares the HID++ usage page; the node is resolved on every query (hidraw numbers change on replug)."""
+declares the HID++ usage page, and whose open fd still says 046d:0aba; the node is resolved on every query (hidraw
+numbers change on replug)."""
+import fcntl
 import os
 import select
+import struct
 import time
 
 VENDOR, PRODUCT = 0x046D, 0x0ABA
@@ -24,6 +27,8 @@ REQUEST = bytes([LONG, RECEIVER]) + FEATURE + bytes(LENGTH - 4)
 PERCENTAGES = (100, 50, 30, 20, 5, 0)  # calibrations::LOGITECH_GPRO
 VOLTAGES = (4150, 3830, 3780, 3740, 3670, 3320)
 OFF = "off"
+# _IOR('H', 0x03, struct hidraw_devinfo {u32 bustype; s16 vendor; s16 product}), read as unsigned: the same bits
+HIDIOCGRAWINFO = 2 << 30 | 8 << 16 | ord("H") << 8 | 0x03
 
 
 def usage_pages(descriptor):
@@ -95,7 +100,8 @@ def estimate(mv):
 
 
 def read_reply(fd, timeout):
-    """Read reports from the non-blocking `fd` until the battery answer → (mV, charging), or OFF at `timeout` s."""
+    """Read reports from the non-blocking `fd` until the battery answer → (mV, charging) or OFF, or None (no answer,
+    a miss) at `timeout` s."""
     deadline = time.monotonic() + timeout
     while (left := deadline - time.monotonic()) > 0:
         if not select.select([fd], [], [], left)[0]:
@@ -106,24 +112,28 @@ def read_reply(fd, timeout):
             continue
         if got is not None:
             return got
-    return OFF
+    return None
 
 
-def battery(find=find_node, open_=os.open, write=os.write, timeout=TIMEOUT_S):
-    """Ask the PRO X for its battery now → (mV, charging), or None when it is off, unplugged or doesn't answer.
-    Blocks up to ~`timeout` s: call it off the main loop."""
+def battery(find=find_node, open_=os.open, write=os.write, ioctl=fcntl.ioctl, timeout=TIMEOUT_S):
+    """Ask the PRO X for its battery now → (mV, charging); OFF when the dongle answers "headset off" or is unplugged;
+    None when nothing answers (a miss: HeadsetMonitor calls it off only after two in a row). Blocks up to ~`timeout`
+    s: call it off the main loop."""
     node = find()
     if node is None:
-        return None
+        return OFF
     try:
         fd = open_(node, os.O_RDWR | os.O_NONBLOCK)
     except OSError:
         return None
     try:
+        # the number may have gone to another device since the sysfs scan (a replug): ask the open fd who it is
+        _bus, vendor, product = struct.unpack("=IHH", ioctl(fd, HIDIOCGRAWINFO, bytes(8)))
+        if (vendor, product) != (VENDOR, PRODUCT):
+            return None
         write(fd, REQUEST)
-        got = read_reply(fd, timeout)
+        return read_reply(fd, timeout)
     except OSError:  # unplugged mid-query
         return None
     finally:
         os.close(fd)
-    return None if got == OFF else got

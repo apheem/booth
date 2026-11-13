@@ -8,7 +8,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import headset
+from booth import headset, hidpp
 from booth.ui import headphones
 from tests.test_app import Inline
 from tests.test_headset import DUMP, PRO_X, SCARLETT, default_sink, dump
@@ -182,14 +182,14 @@ class Battery(unittest.TestCase):
         monitor.update((3990, False))
         page, sidebar = self.page(monitor)  # opened while on: shown at once, no event needed
         self.assertEqual(sidebar[-1], "~75 % · Volume 63 %")
-        monitor.update(None)
+        monitor.update(hidpp.OFF)
         self.assertEqual(page.group.set["set_title"], ("PRO X Wireless — Off",))
         self.assertEqual(page.battery.set["set_visible"], (False,))
         self.assertEqual(sidebar[-1], "Off · Volume 63 %")
 
     def test_the_dongle_unplugged_is_not_connected(self):
         monitor = headset.HeadsetMonitor()
-        monitor.update(None)
+        monitor.update(hidpp.OFF)
         _, sidebar = self.page(monitor, state=None)
         self.assertEqual(sidebar[-1], "Not connected")
 

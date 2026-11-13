@@ -123,6 +123,7 @@ def card(monitor):
     return "PRO X Wireless — Connected", f"~{monitor.percent} % (est.)" + (", charging" if monitor.charging else "")
 
 
+MISSES = 2  # no answer this many polls in a row (~20 s) is off; orchestrator adjudication on #9
 SMOOTHING = 0.3  # each 10 s reading moves the voltage this far: a load spike barely shows, a real drop in ~a minute
 WARN_AT, REARM_ABOVE = 15, 30
 
@@ -139,7 +140,8 @@ class HeadsetMonitor:
 
     For subscribers (the Headphones page; the routing policy, #12): append a callable to `listeners`; it is called on
     the main loop with "on", "off" or "battery" (level or charging changed) after the state below is updated:
-      on        True, False (no answer: off, or the dongle unplugged), or None before the first poll
+      on        True, False (the off reply, the dongle unplugged, or MISSES polls unanswered), or None before
+                the first answer
       percent   the smoothed estimate, 0..100, or None when off
       charging  True while charging
     `notify(percent)` is called once per discharge at <= WARN_AT %. `spawn(work, done)` runs work() off the main loop
@@ -148,6 +150,7 @@ class HeadsetMonitor:
     def __init__(self, notify=lambda percent: None, spawn=None):
         self.notify, self.spawn, self.listeners = notify, spawn, []
         self.on, self.percent, self.charging, self.mv, self.armed, self.busy = None, None, False, None, True, False
+        self.misses = 0
 
     def poll(self):
         """A GLib timeout callback: ask the headset, unless the last ask hasn't answered yet."""
@@ -161,9 +164,16 @@ class HeadsetMonitor:
         self.update(reading)
 
     def update(self, reading):
-        """A battery reading, (mV, charging) or None for no answer → the new state and its events."""
+        """A battery reading → the new state and its events: (mV, charging); hidpp.OFF, off at once; None for no
+        answer, a miss: off only after MISSES in a row, and a single one changes nothing (smoothing included)."""
         events = []
         if reading is None:
+            self.misses += 1
+            if self.misses < MISSES:  # one dropped reply on a marginal radio link must not flap off → on
+                return
+        else:
+            self.misses = 0
+        if reading is None or reading == hidpp.OFF:
             if self.on is not False:
                 self.on, self.percent, self.mv = False, None, None
                 events.append("off")

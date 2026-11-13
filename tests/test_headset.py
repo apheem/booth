@@ -5,7 +5,7 @@ import io
 import json
 import unittest
 
-from booth import devices, headset
+from booth import devices, headset, hidpp
 from tests.fixture import read
 
 CGET, CONTENTS = read("headset/amixer-cget-pcm.txt"), read("headset/amixer-contents.txt")
@@ -183,7 +183,7 @@ class State(unittest.TestCase):
         self.assertEqual(headset.status(None), "Not connected")
 
     def test_sidebar_subtitle_with_the_battery(self):
-        on, off = monitor((3990, False)), monitor(None)
+        on, off = monitor((3990, False)), monitor(hidpp.OFF)
         self.assertEqual(headset.status({"volume": 0.63, "default": False}, on), "~75 % · Volume 63 %")
         self.assertEqual(headset.status({"volume": 0.63, "default": False}, off), "Off · Volume 63 %")
         self.assertEqual(headset.status(None, off), "Not connected")  # the dongle itself is gone
@@ -207,12 +207,39 @@ class Battery(unittest.TestCase):
         m = monitor((3990, False))
         self.assertEqual((m.on, m.percent, m.charging, m.log), (True, 75, False, ["on", "battery"]))
 
-    def test_no_answer_is_off(self):
-        m = monitor(None)
+    def test_the_error_reply_is_off_at_once(self):
+        m = monitor(hidpp.OFF)
         self.assertEqual((m.on, m.percent, m.log), (False, None, ["off"]))
+        m = monitor((3990, False), hidpp.OFF)
+        self.assertEqual((m.on, m.log[-1]), (False, "off"))
+
+    def test_one_missed_reply_does_not_flap_off_and_on(self):  # adjudication: a single ~1 s timeout is a miss
+        m = monitor((3990, False), None, (3990, False))
+        self.assertEqual((m.on, m.percent, m.log), (True, 75, ["on", "battery"]))
+
+    def test_one_missed_reply_keeps_the_smoothing(self):
+        m = monitor((3990, False), None, (3830, False))  # a load spike after a miss still moves only part of the way
+        self.assertEqual(m.percent, monitor((3990, False), (3830, False)).percent)
+        self.assertGreater(m.percent, 50)
+
+    def test_two_missed_replies_in_a_row_are_off(self):
+        m = monitor((3990, False), None)
+        self.assertEqual((m.on, m.percent), (True, 75))
+        m.update(None)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
+
+    def test_misses_count_only_in_a_row(self):
+        m = monitor((3990, False), None, (3990, False), None)
+        self.assertEqual((m.on, m.log), (True, ["on", "battery"]))
+
+    def test_no_answer_before_the_first_reply_is_off_after_two_misses(self):
+        m = monitor(None)
+        self.assertEqual((m.on, m.log), (None, []))
+        m.update(None)
+        self.assertEqual((m.on, m.log), (False, ["off"]))
 
     def test_going_off_drops_the_last_level(self):  # no stale percent for a headset that no longer answers
-        m = monitor((3990, False), None)
+        m = monitor((3990, False), hidpp.OFF)
         self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
 
     def test_on_off_on_emits_each_change_once(self):
@@ -243,7 +270,7 @@ class Battery(unittest.TestCase):
     def test_charging_or_coming_back_on_starts_the_smoothing_afresh(self):
         m = monitor((3830, False), (4150, True))  # plugged in: the voltage jumps, and that is the truth
         self.assertEqual((m.percent, m.charging), (100, True))
-        m = monitor((3830, False), None, (4150, False))  # swapped/charged while off
+        m = monitor((3830, False), hidpp.OFF, (4150, False))  # swapped/charged while off
         self.assertEqual(m.percent, 100)
 
     def test_a_charging_change_alone_is_a_battery_event(self):
@@ -278,7 +305,7 @@ class Battery(unittest.TestCase):
         self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 2)
 
     def test_off_and_on_again_low_is_the_same_discharge(self):
-        m = monitor((3710, False), None, (3710, False))
+        m = monitor((3710, False), hidpp.OFF, (3710, False))
         self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 1)
 
     def test_no_warning_while_charging(self):
@@ -296,7 +323,7 @@ class Battery(unittest.TestCase):
     def test_card_texts(self):
         self.assertEqual(headset.card(monitor((3990, False))), ("PRO X Wireless — Connected", "~75 % (est.)"))
         self.assertEqual(headset.card(monitor((3990, True))), ("PRO X Wireless — Connected", "~75 % (est.), charging"))
-        self.assertEqual(headset.card(monitor(None)), ("PRO X Wireless — Off", None))
+        self.assertEqual(headset.card(monitor(hidpp.OFF)), ("PRO X Wireless — Off", None))
         self.assertEqual(headset.card(headset.HeadsetMonitor()), ("PRO X Wireless", None))  # before the first poll
 
 

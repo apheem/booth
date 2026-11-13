@@ -1,9 +1,11 @@
 """The PRO X's HID++ battery query: the hidraw node found by vendor/product and usage page in sysfs, the request and
-reply bytes ported from HeadsetControl, voltage → an estimated percentage, and no answer within ~1 s meaning off.
+reply bytes ported from HeadsetControl, voltage → an estimated percentage, the dongle's error reply meaning off and no
+answer within ~1 s being a miss (None).
 Descriptors, uevents and the off reply are captured from this desk's devices."""
 import errno
 import os
 import socket
+import struct
 import tempfile
 import time
 import unittest
@@ -17,6 +19,14 @@ OFF = bytes.fromhex(read("headset/hidpp-battery-off.hex"))  # captured: the dong
 # shortcut: constructed from the ported reply layout (bytes 4-5 mV big-endian, byte 6 state), not captured, because the
 # headset was off at capture time; replace with a live capture when the headset is on.
 ON = bytes.fromhex("11ff060d0f3c01") + bytes(13)  # 3900 mV, discharging
+
+
+def info(vendor=0x046D, product=0x0ABA):
+    """An injected ioctl answering HIDIOCGRAWINFO for a USB device with these ids."""
+    return lambda fd, request, buf: struct.pack("=Ihh", 3, vendor, product)
+
+
+PRO_X = info()
 
 
 def node(root, name, device):
@@ -97,6 +107,9 @@ class Reply(unittest.TestCase):
     def test_a_reply_for_another_device_index_is_not_the_answer(self):
         self.assertIsNone(hidpp.answer(bytes.fromhex("1101060d0f3c01") + bytes(13)))
 
+    def test_an_unsolicited_event_of_the_same_feature_index_is_not_a_level(self):  # function 0, not getBattery's 0x0d
+        self.assertIsNone(hidpp.answer(bytes.fromhex("11ff06000f3c01") + bytes(13)))
+
 
 class Estimate(unittest.TestCase):
     def test_the_gpro_curve_points(self):
@@ -122,9 +135,9 @@ class Exchange(unittest.TestCase):
         self.addCleanup(self.ours.close)
         self.addCleanup(self.dev.close)
 
-    def test_no_reply_within_the_timeout_is_off_and_returns_in_time(self):
+    def test_no_reply_within_the_timeout_is_a_miss_not_off_and_returns_in_time(self):
         t0 = time.monotonic()
-        self.assertIs(hidpp.read_reply(self.ours.fileno(), 0.2), hidpp.OFF)
+        self.assertIsNone(hidpp.read_reply(self.ours.fileno(), 0.2))
         self.assertLess(time.monotonic() - t0, 0.6)
 
     def test_unrelated_reports_are_skipped_until_the_answer(self):
@@ -136,7 +149,7 @@ class Exchange(unittest.TestCase):
         for _ in range(50):
             self.dev.send(bytes.fromhex("010200"))
         t0 = time.monotonic()
-        self.assertIs(hidpp.read_reply(self.ours.fileno(), 0.2), hidpp.OFF)
+        self.assertIsNone(hidpp.read_reply(self.ours.fileno(), 0.2))
         self.assertLess(time.monotonic() - t0, 0.6)
 
     def test_a_wake_up_with_nothing_to_read_keeps_waiting_for_the_answer(self):
@@ -158,52 +171,76 @@ class Exchange(unittest.TestCase):
 
 
 class Battery(unittest.TestCase):
+    def setUp(self):
+        self.ours, self.dev = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(self.ours.close)
+        self.addCleanup(self.dev.close)
+        self.fds, self.sent = [], []
+
+    def open_(self, path, flags):
+        self.fds.append(os.dup(self.ours.fileno()))
+        return self.fds[-1]
+
+    def write(self, fd, data):
+        self.sent.append(data)
+        return len(data)
+
+    def query(self, **kw):
+        return hidpp.battery(**{"find": lambda: "/dev/hidraw0", "open_": self.open_, "write": self.write,
+                                "ioctl": PRO_X, "timeout": 0.1, **kw})
+
+    def assertClosed(self):
+        self.assertEqual(len(self.fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(self.fds[0])
+
     def test_the_node_is_resolved_on_every_query(self):
         found = []
         hidpp.battery(find=lambda: found.append(1))
         hidpp.battery(find=lambda: found.append(1))
         self.assertEqual(found, [1, 1])
 
-    def test_no_node_is_off(self):
-        self.assertIsNone(hidpp.battery(find=lambda: None))
+    def test_no_node_is_off(self):  # the dongle is unplugged: nothing could ever answer
+        self.assertIs(hidpp.battery(find=lambda: None), hidpp.OFF)
 
-    def test_a_node_that_fails_to_open_is_off(self):  # unplugged after the scan, or permissions tightened
+    def test_a_node_that_fails_to_open_is_a_miss(self):  # unplugged after the scan, or permissions tightened
         self.assertIsNone(hidpp.battery(find=lambda: "/nonexistent/hidraw9"))
 
     def test_the_request_is_written_and_the_reply_read_with_a_timeout(self):
-        ours, dev = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self.addCleanup(dev.close)
-        sent = []
-
         def opener(path, flags):
             self.assertEqual(path, "/dev/hidraw7")
             self.assertTrue(flags & os.O_NONBLOCK and flags & os.O_RDWR)
-            dev.send(ON)
-            return os.dup(ours.fileno())
-        try:
-            reading = hidpp.battery(find=lambda: "/dev/hidraw7", open_=opener,
-                                    write=lambda fd, data: sent.append(data) or len(data))
-        finally:
-            ours.close()
-        self.assertEqual((reading, sent), ((3900, False), [hidpp.REQUEST]))
+            self.dev.send(ON)
+            return self.open_(path, flags)
+        reading = self.query(find=lambda: "/dev/hidraw7", open_=opener, timeout=1)
+        self.assertEqual((reading, self.sent), ((3900, False), [hidpp.REQUEST]))
+        self.assertClosed()
 
-    def test_an_unplug_mid_query_is_off(self):  # EIO from the write: the node went away after it was opened
-        ours, dev = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self.addCleanup(dev.close)
-        self.addCleanup(ours.close)
+    def test_the_opened_fd_is_rechecked_as_the_pro_x_before_the_write(self):  # another device took the number
+        requests = []
 
+        def brio(fd, request, buf):
+            requests.append((fd, request, len(buf)))
+            return info(0x046D, 0x085E)(fd, request, buf)
+        self.assertIsNone(self.query(ioctl=brio))
+        self.assertEqual((self.sent, requests), ([], [(self.fds[0], 0x80084803, 8)]))  # _IOR('H', 0x03, 8 bytes)
+        self.assertClosed()
+
+    def test_no_reply_is_a_miss_and_closes_the_fd(self):
+        self.assertIsNone(self.query())
+        self.assertEqual(self.sent, [hidpp.REQUEST])
+        self.assertClosed()
+
+    def test_an_unplug_mid_query_is_a_miss_and_closes_the_fd(self):  # EIO from the write: the node went away
         def write(fd, data):
             raise OSError(errno.EIO, "Input/output error")
-        self.assertIsNone(hidpp.battery(find=lambda: "/dev/hidraw0", open_=lambda p, f: os.dup(ours.fileno()),
-                                        write=write))
+        self.assertIsNone(self.query(write=write))
+        self.assertClosed()
 
-    def test_an_off_reply_is_none(self):
-        ours, dev = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self.addCleanup(dev.close)
-        self.addCleanup(ours.close)
-        dev.send(OFF)
-        self.assertIsNone(hidpp.battery(find=lambda: "/dev/hidraw0", open_=lambda p, f: os.dup(ours.fileno()),
-                                        write=lambda fd, data: len(data)))
+    def test_the_captured_error_reply_is_off_not_a_miss(self):
+        self.dev.send(OFF)
+        self.assertIs(self.query(), hidpp.OFF)
+        self.assertClosed()
 
 
 if __name__ == "__main__":
