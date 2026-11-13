@@ -3,8 +3,6 @@ channels unmixed, in node order → level every 50 ms → only the mic channel's
 the main loop. Nothing is recorded or kept. It runs only while the page or the sidebar meter is on screen, so the
 Scarlett is held open only while someone is looking. The scale and the target zone are pure helpers here."""
 import math
-import queue
-import threading
 
 import gi
 
@@ -12,6 +10,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 from booth import scarlett  # noqa: E402
+from booth.preview import JOBS  # noqa: E402  one state-change worker per process, shared with the preview
 
 Gst.init(None)
 FLOOR = -60.0  # dB at the bottom of the bar
@@ -21,15 +20,6 @@ NOT_ROUTED = "The mic isn't routed to a capture channel"
 NO_SOURCE = "The Scarlett's input isn't in PipeWire"
 UNAVAILABLE = "Level meter unavailable"
 TAIL = f"level name=level interval={50 * Gst.MSECOND} post-messages=true ! fakesink sync=false"
-JOBS = queue.Queue()  # every pipeline's state changes, in order, on one worker: never on the main loop
-
-
-def work():
-    while True:
-        JOBS.get()()
-
-
-threading.Thread(target=work, daemon=True, name="meter-state").start()
 
 
 def position(db):

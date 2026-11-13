@@ -195,6 +195,23 @@ class Running(unittest.TestCase):
         self.meter.on_message(p.get_bus(), Gst.Message.new_element(p.get_by_name("level"), loud))
         self.assertEqual(self.levels, [])
 
+    def test_a_level_from_the_old_pipeline_after_a_retarget_is_never_shown(self):
+        self.meter.want(XLR, True)
+        old = self.meter.pipeline
+        self.meter.want(dict(XLR, channel=1), True)  # a new pipeline now runs
+        self.assertIsNotNone(self.meter.pipeline)
+        loud = Pick.message(None, [-1.0, -1.0], [-1.0, -1.0])
+        self.meter.on_message(old.get_bus(), Gst.Message.new_element(old.get_by_name("level"), loud))
+        self.assertNotIn((-1.0, -1.0), self.levels)
+
+    def test_a_start_that_fails_says_so(self):
+        self.meter.on_error = lambda *_: None  # only set_state's FAILURE may report it, not the bus error
+        self.meter.launch = lambda n, c: f"filesrc location=/nonexistent/booth-meter ! {meter.TAIL}"
+        self.meter.want(XLR, True)
+        self.assertTrue(until(lambda: self.failures), "a failed start never reached failed()")
+        self.assertEqual(self.failures, [meter.UNAVAILABLE])
+        self.assertIsNone(self.meter.pipeline)
+
     def test_an_error_stops_and_says_so(self):
         self.meter.want(XLR, True)
         p = self.meter.pipeline
