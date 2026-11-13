@@ -27,6 +27,14 @@ class Store(unittest.TestCase):
         self.assertEqual(store.load(self.path)["camera"], {"zoom_absolute": 250})
         self.assertEqual(json.loads(self.path.read_text())["version"], store.VERSION)
 
+    def test_the_config_folder_is_never_group_writable_whatever_the_umask(self):
+        old = os.umask(0o002)  # Ubuntu's default for a user with a private group
+        try:
+            store.save(store.defaults(), self.path)
+        finally:
+            os.umask(old)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o077, 0)  # it holds the config Booth Mic's pipewire loads
+
     def test_save_leaves_no_temp_file(self):
         store.save(store.defaults(), self.path)
         self.assertEqual(os.listdir(self.path.parent), ["settings.json"])
@@ -136,6 +144,28 @@ class Store(unittest.TestCase):
         # the Voice processing switches show and apply them as booleans
         self.path.parent.mkdir(parents=True)
         for text in ('{"voice": []}', '{"voice": {"enabled": 1}}', '{"voice": {"rumble": "off"}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
+    def test_the_voice_stages_and_knobs_round_trip(self):
+        settings = store.load(self.path)
+        settings["voice"].update(noise=False, leveling=True, limiter=False, noise_strength=0, leveling_amount=100,
+                                 limiter_ceiling=-20.0)
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], settings["voice"])
+        settings["voice"].update(noise_strength=100, leveling_amount=0, limiter_ceiling=0)
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], settings["voice"])
+
+    def test_a_bad_stage_or_knob_value_counts_as_corrupt(self):
+        # the stage rows show and apply them; a knob out of range would reach the plugin
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"voice": {"noise": 1}}', '{"voice": {"leveling": "on"}}', '{"voice": {"limiter": null}}',
+                     '{"voice": {"noise_strength": 101}}', '{"voice": {"noise_strength": -1}}',
+                     '{"voice": {"noise_strength": 50.5}}', '{"voice": {"leveling_amount": true}}',
+                     '{"voice": {"leveling_amount": 200}}', '{"voice": {"limiter_ceiling": 0.5}}',
+                     '{"voice": {"limiter_ceiling": -20.5}}', '{"voice": {"limiter_ceiling": NaN}}',
+                     '{"voice": {"limiter_ceiling": false}}', '{"voice": {"limiter_ceiling": "-1"}}'):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
