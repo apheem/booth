@@ -6,15 +6,20 @@ while the window exists, as on the Headphones page: the card is found by name an
 A poll only ever shows what it read; writes come from the user's own clicks, and 48V on only after the dialog.
 
 On top, the raw before-meter (booth.meter) on the mic channel, with the gain coaching; `mini` is the same meter for the
-sidebar. Each poll says which channel and node to meter; it runs while either is on screen (see meter.wanted)."""
+sidebar. Each poll says which channel and node to meter; it runs while either is on screen (see meter.wanted).
+
+Below, Voice processing (booth.voice): the master switch and the rumble filter. A switch is saved and applied live to
+Booth Mic; each poll also brings Booth Mic's config up to date with the mic it found (a no-op when nothing changed)."""
 import threading
 
 from gi.repository import Adw, GLib, Gtk
 
-from booth import headset, meter, scarlett, store
+from booth import headset, meter, scarlett, store, voice
 from booth.ui.levelmeter import LevelMeter
 
 POLL_S = 2
+MASTER = "Off sends your mic to Booth Mic untouched"
+RUMBLE = "Cuts low rumble and desk thumps below 80 Hz"
 
 
 class MicrophonePage(Adw.PreferencesPage):
@@ -50,8 +55,22 @@ class MicrophonePage(Adw.PreferencesPage):
         for widget in (self, self.mini):
             widget.connect("map", self.on_map)
             widget.connect("unmap", self.meter_update)
+        v = settings.setdefault("voice", {})
+        self.voice = Adw.PreferencesGroup(title="Voice Processing", description=voice.WAITING)
+        self.master = Adw.SwitchRow(title="Voice Processing", subtitle=MASTER)
+        self.rumble = Adw.SwitchRow(title="Rumble Filter", subtitle=RUMBLE)
+        self.master.connect("notify::active", self.on_voice, "enabled", MASTER)
+        self.rumble.connect("notify::active", self.on_voice, "rumble", RUMBLE)
+        self.quiet = True  # showing the saved state is no change
+        self.master.set_active(v.get("enabled", True))
+        self.rumble.set_active(v.get("rumble", True))
+        self.quiet = False
+        self.rumble.set_sensitive(self.master.get_active())
+        self.voice.add(self.master)
+        self.voice.add(self.rumble)
         self.add(self.levels)
         self.add(self.group)
+        self.add(self.voice)
         self.poll()
         self.timer = GLib.timeout_add_seconds(POLL_S, self.poll)
 
@@ -70,19 +89,23 @@ class MicrophonePage(Adw.PreferencesPage):
         return GLib.SOURCE_CONTINUE
 
     def read(self, since):
-        state = None
+        state, selecting, said = None, True, ""
         try:
             state = scarlett.read(self.choice())
+            if state:  # unplugged: the running chain keeps its last config
+                said = voice.apply(self.settings, state)  # not routed: the selector stops
+                selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
         finally:  # always: show() clears polling, else the page stops following outside changes
-            GLib.idle_add(self.show, state, since)
+            GLib.idle_add(self.show, state, since, selecting, said)
 
-    def show(self, state, since):
+    def show(self, state, since, selecting=True, said=""):
         self.polling = False
         self.record, problem = meter.source(state)
         self.levels.set_description(problem or meter.COACHING)
         if problem:
             self.on_meter_failed(problem)
         self.meter_update()
+        self.voice.set_description(voice.describe(state, selecting, said))
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
             ctrls = state["ctrls"] if state else {}
@@ -171,6 +194,23 @@ class MicrophonePage(Adw.PreferencesPage):
             self.unsaved = f"Set, but not saved: {e.strerror or e}"
             self.input.set_subtitle(self.unsaved)
         self.poll()  # the subtitle shows the new input's channel
+
+    def on_voice(self, row, _param, key, subtitle):
+        if self.quiet:
+            return
+        self.settings["voice"][key] = row.get_active()
+        self.rumble.set_sensitive(self.master.get_active())
+        try:
+            store.save(self.settings)
+            row.set_subtitle(subtitle)
+        except OSError as e:  # applied anyway: the user must know it won't last
+            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
+
+        def apply():
+            said = voice.apply(self.settings, None)  # a switch never moves the selector: the polls do
+            if said.startswith("not "):  # not recorded: the next poll's apply tries again
+                GLib.idle_add(row.set_subtitle, f"Set, but {said}")
+        threading.Thread(target=apply, daemon=True).start()
 
     def spawn(self, make, done):
         threading.Thread(target=lambda: self.write(make, done), daemon=True).start()

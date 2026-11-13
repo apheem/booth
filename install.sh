@@ -74,6 +74,61 @@ RestartSec=5
 WantedBy=graphical-session.target
 EOF
 mv "$units/booth.service.new" "$units/booth.service"
+
+# booth-voice.service runs Booth Mic, the voice chain, as its own PipeWire client from the config Booth writes beside
+# its settings, so Booth Mic stays in a call with Booth closed or crashed. It lives with the user's PipeWire. No config
+# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above.
+voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
+[ -e "$units/booth-voice.service" ] || voice_first=1
+voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+select_arg=$(printf '%s' "$config/booth/voice-select.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+cat > "$units/booth-voice.service.new" <<EOF
+[Unit]
+Description=Booth Mic: the voice chain (a PipeWire filter-chain)
+After=pipewire.service pipewire-session-manager.service
+BindsTo=pipewire.service
+
+[Service]
+ExecCondition=/usr/bin/test -f "$voice_arg"
+ExecStart=/usr/bin/pipewire -c "$voice_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+
+[Install]
+WantedBy=pipewire.service
+EOF
+mv "$units/booth-voice.service.new" "$units/booth-voice.service"
+# booth-mic-select.service runs Booth Mic's source selector (the Scarlett's mic channel into Booth Mic's input) as a
+# separate process, so a new mic channel or Scarlett node restarts only it, never Booth Mic. It never runs without
+# booth-voice.service (BindsTo) and starts with it (WantedBy).
+cat > "$units/booth-mic-select.service.new" <<EOF
+[Unit]
+Description=Booth Mic's source: the Scarlett's mic channel (a PipeWire loopback)
+After=booth-voice.service
+BindsTo=booth-voice.service
+
+[Service]
+ExecCondition=/usr/bin/test -f "$select_arg"
+ExecStart=/usr/bin/pipewire -c "$select_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+
+[Install]
+WantedBy=booth-voice.service
+EOF
+mv "$units/booth-mic-select.service.new" "$units/booth-mic-select.service"
+# Enabled whatever the Run in Background switch says. booth.voice writes the configs from the Scarlett now and starts
+# them (restarts what changed). The first install then makes Booth Mic the default mic by name: WirePlumber picks it
+# as soon as it appears. None of this stops the install: Booth writes the configs and starts the services each run.
+systemctl --user daemon-reload && systemctl --user enable booth-voice.service booth-mic-select.service ||
+  echo "install.sh: couldn't enable booth-voice.service (Booth Mic); from your desktop session run: systemctl --user enable --now booth-voice.service booth-mic-select.service" >&2
+PYTHONPATH=$dest python3 -P -m booth.voice || echo "install.sh: couldn't set up Booth Mic (above); Booth tries again when it starts" >&2
+if [ -n "$voice_first" ]; then
+  pw-metadata -n default 0 default.configured.audio.source '{ "name": "booth_mic" }' Spa:String:JSON >/dev/null 2>&1 ||
+    echo "install.sh: couldn't make Booth Mic the default mic; choose Booth Mic in Settings → Sound → Input" >&2
+fi
 # A running Booth owns its bus name, so the restarted unit's --background would find it and exit 0 with the old code
 # still running: ask it to quit (app.quit; "not running" errors ignored) and wait up to 5 s for the name to go.
 closed=

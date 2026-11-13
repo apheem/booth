@@ -286,7 +286,8 @@ class BackgroundLaunch(unittest.TestCase):
                 mock.patch.object(app.GLib, "timeout_add_seconds") as every:
             app.Application.watch(stub)
         stub.headset_monitor.poll.assert_called_once_with()  # the battery now, in every primary instance
-        every.assert_called_once_with(10, stub.headset_monitor.poll)  # then every 10 s, window or not
+        # then every 10 s, window or not: the battery, and Booth Mic's selector restarted if its Scarlett is back
+        self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll), mock.call(10, stub.heal_voice)])
         monitor = folders["/dev/v4l/by-id"].monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
@@ -296,7 +297,26 @@ class BackgroundLaunch(unittest.TestCase):
         dongle.connect.assert_called_once_with("changed", stub.on_snd_by_id)
         self.assertIsInstance(stub.dongle, service.Debounce)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
+        stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
         return stub
+
+    def test_sync_voice_writes_booth_mics_config_and_starts_its_service_off_the_main_loop(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}})
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync") as sync:
+            app.Application.sync_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+        sync.assert_called_once_with(stub.settings)
+
+    def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}})
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "heal") as heal:
+            self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
+            heal.assert_not_called()
+            threads[0]()
+        heal.assert_called_once_with(stub.settings)  # the chosen input: heal reads the Scarlett's routing itself
 
     def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
         stub = self.watch(background=True)

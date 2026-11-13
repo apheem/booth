@@ -17,7 +17,8 @@ def defaults():
     # headphones: {"previous_default": the sink's node name "Use for all sound" replaced, put back when it is turned off;
     #   "sidetone": 0..128 and "auto_off": minutes 0..90 (0 = never), sent to the PRO X whenever it turns on}
     # microphone: {"input": "XLR" or "Instrument", the Scarlett input that is the mic; XLR when absent}. Never 48V.
-    return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}}
+    # voice: {"enabled": the Voice processing master switch, "rumble": the rumble filter}, booleans, True when absent.
+    return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}, "voice": {}}
 
 
 def _whole(value, top):
@@ -52,6 +53,9 @@ def load(file=None):
             raise ValueError("not a settings object")
         microphone = data.get("microphone", {})
         if not isinstance(microphone, dict) or microphone.get("input", "XLR") not in ("XLR", "Instrument"):
+            raise ValueError("not a settings object")
+        voice = data.get("voice", {})
+        if not isinstance(voice, dict) or not all(isinstance(voice.get(k, True), bool) for k in ("enabled", "rumble")):
             raise ValueError("not a settings object")
         json.dumps(data, indent=2)  # as save() writes it: nested too deep to save would fail every save after
     except (ValueError, RecursionError):  # bad JSON or UTF-8, wrong shape, nested too deep

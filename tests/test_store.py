@@ -109,6 +109,20 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_the_voice_switches_round_trip(self):
+        settings = store.load(self.path)
+        self.assertEqual(settings["voice"], {})  # nothing saved: processing and the rumble filter on
+        settings["voice"].update(enabled=False, rumble=True)
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], {"enabled": False, "rumble": True})
+
+    def test_a_bad_voice_value_counts_as_corrupt(self):
+        # the Voice processing switches show and apply them as booleans
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"voice": []}', '{"voice": {"enabled": 1}}', '{"voice": {"rumble": "off"}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
     def test_failed_save_keeps_the_previous_file(self):
         old = store.defaults()
         old["camera"]["zoom_absolute"] = 250

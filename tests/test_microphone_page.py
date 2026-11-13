@@ -7,7 +7,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import meter, scarlett
+from booth import meter, scarlett, voice
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
@@ -129,7 +129,8 @@ Page = type("MicrophoneStandIn", (GObject.Object,), {
 
 class PageCase(unittest.TestCase):
     def setUp(self):
-        self.ran, self.saved, self.dialogs = [], [], []
+        self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
+        self.said, self.selecting = "live", True  # what voice.apply returns; whether Booth Mic's selector runs
         self.settings = {"microphone": {}}
 
         real_send = scarlett.send
@@ -152,6 +153,9 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.threading, "Thread", Inline),
                 mock.patch.object(microphone.scarlett, "send", send),
                 mock.patch.object(microphone.store, "save", self.saved.append),
+                mock.patch.object(microphone.voice, "apply",
+                                  lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
+                mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst)):
             patch.start()
@@ -326,6 +330,91 @@ class ScarlettGroup(PageCase):
         self.assertEqual(removed, [self.page.timer])
 
 
+class VoiceGroup(PageCase):
+    """The Voice processing group: the master switch and the rumble filter, saved and applied live to Booth Mic."""
+
+    def test_both_switches_start_on(self):
+        self.assertEqual((self.page.master.active, self.page.rumble.active), (True, True))
+        self.assertEqual(self.settings["voice"], {})
+
+    def test_saved_switches_are_shown_at_start_and_rumble_waits_on_the_master(self):
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {"enabled": False, "rumble": False}})
+        self.assertEqual((page.master.active, page.rumble.active, page.rumble.sensitive), (False, False, False))
+
+    def test_a_switch_is_saved_and_applied_never_moving_the_selector(self):
+        self.show(state())
+        self.click(self.page.rumble, False)
+        self.assertEqual((self.settings["voice"], self.saved), ({"rumble": False}, [self.settings]))
+        self.assertEqual(self.applied, [({"rumble": False}, None)])  # the selector follows the polls, not a switch
+        self.click(self.page.master, False)
+        self.assertEqual(self.applied[-1], ({"rumble": False, "enabled": False}, None))
+        self.assertFalse(self.page.rumble.sensitive)
+        self.assertEqual(self.ran, [])  # never the Scarlett
+
+    def test_a_failed_save_says_so_on_the_row_and_still_applies(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.click(self.page.master, False)
+        self.assertEqual(self.page.master.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(len(self.applied), 1)
+        self.click(self.page.master, True)
+        self.assertEqual(self.page.master.subtitle, microphone.MASTER)
+
+    def test_a_change_booth_mic_didnt_take_says_so_on_the_row(self):
+        self.said = "not applied: Booth Mic didn't take the change"
+        self.click(self.page.rumble, False)
+        self.assertEqual(self.page.rumble.subtitle, "Set, but not applied: Booth Mic didn't take the change")
+        self.said = "live"
+        self.click(self.page.rumble, True)
+        self.assertEqual(self.page.rumble.subtitle, microphone.RUMBLE)
+
+    def test_a_poll_with_the_selector_down_says_booth_mic_is_waiting_for_the_scarlett(self):
+        s, self.selecting = state(), False  # the Scarlett just came back: Booth restarts the selector within 10 s
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.page.voice.description, voice.WAITING)
+
+    def test_each_poll_says_where_booth_mic_takes_its_input(self):
+        self.show(state())
+        self.assertEqual(self.page.voice.description, voice.describe(state()))
+        self.show(state(**{"PCM 02 Capture Enum": 5}))
+        self.assertEqual(self.page.voice.description, voice.NOT_ROUTED)
+        self.show(None)
+        self.assertEqual(self.page.voice.description, voice.WAITING)
+
+    def test_each_poll_brings_booth_mics_config_up_to_date(self):
+        s = state()
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        self.assertEqual(self.applied, [({}, s)])
+        self.assertEqual(len(idle), 1)
+
+    def test_a_not_routed_poll_reaches_apply_with_the_scarlett_there(self):
+        s = state(**{"PCM 02 Capture Enum": 5})  # capture 2 rerouted: Booth Mic's selector must stop
+        self.assertIsNone(s["mic"])
+        self.real_poll(lambda choice: s)
+        self.page.poll()
+        self.assertEqual(self.applied, [({}, s)])
+
+    def test_a_selector_that_wont_stop_says_booth_mic_may_still_take_the_old_channel(self):
+        s = state(**{"PCM 02 Capture Enum": 5})  # rerouted, and systemctl stop failed: the old selector still feeds
+        self.said = "not stopped: Booth Mic's source still takes the mic's old channel"
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.page.voice.description, voice.STALE)
+
+    def test_an_unplugged_poll_applies_nothing(self):
+        self.real_poll(lambda choice: None)
+        self.page.poll()
+        self.assertEqual(self.applied, [])
+
+    real_poll = ScarlettGroup.real_poll
+
+
 class Meters(PageCase):
     """The before-meter and the sidebar meter: what they say, and when the Scarlett is metered."""
 
@@ -441,7 +530,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4))])
+        self.assertEqual(self.idle, [(page.show, (None, 4, True, ""))])
 
 
 if __name__ == "__main__":
