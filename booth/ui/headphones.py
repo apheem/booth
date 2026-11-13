@@ -13,6 +13,7 @@ from booth import headset, store
 
 POLL_S = 2
 SWITCH_SUBTITLE = "Play all sound through the headset"
+SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
 
 
 class HeadphonesPage(Adw.PreferencesPage):
@@ -25,8 +26,6 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.group = Adw.PreferencesGroup(title="PRO X Wireless")
         self.battery = Adw.ActionRow(title="Battery")
         self.group.add(self.battery)
-        monitor.listeners.append(self.on_headset)
-        self.on_headset()
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.scale.set_hexpand(True)
         self.scale.set_draw_value(True)
@@ -40,6 +39,24 @@ class HeadphonesPage(Adw.PreferencesPage):
         for row in self.rows:
             self.group.add(row)
             row.set_sensitive(False)  # until the first poll finds the sink
+        # HID++ settings: the values set before connecting, so showing them sends nothing; visible per on_headset
+        saved = settings["headphones"]
+        self.sidetone = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 128, 1)
+        self.sidetone.set_hexpand(True)
+        self.sidetone.set_value(saved.get("sidetone", headset.DEFAULTS["sidetone"]))
+        self.sidetone.connect("value-changed", lambda s: self.on_setting("sidetone", round(s.get_value())))
+        sidetone = Adw.ActionRow(title="Sidetone", subtitle=SUBTITLES["sidetone"])
+        sidetone.add_suffix(self.sidetone)
+        auto_off = Adw.SpinRow.new_with_range(0, 90, 5)
+        auto_off.set_title("Auto power-off")
+        auto_off.set_subtitle(SUBTITLES["auto_off"])
+        auto_off.set_value(saved.get("auto_off", headset.DEFAULTS["auto_off"]))
+        auto_off.connect("notify::value", lambda r, _p: self.on_setting("auto_off", round(r.get_value())))
+        self.hidpp_rows = {"sidetone": sidetone, "auto_off": auto_off}
+        for row in self.hidpp_rows.values():
+            self.group.add(row)
+        monitor.listeners.append(self.on_headset)
+        self.on_headset()
         self.add(self.group)
         self.poll()
         self.timer = GLib.timeout_add_seconds(POLL_S, self.poll)
@@ -55,7 +72,21 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.group.set_title(title)
         self.battery.set_subtitle(battery or "")
         self.battery.set_visible(battery is not None)
+        for kind, row in self.hidpp_rows.items():  # only once the headset acknowledged it: never half-working
+            row.set_visible(self.monitor.acked.get(kind, False))
         self.status(headset.status(self.state, self.monitor))
+
+    def on_setting(self, kind, value):
+        """Sidetone or Auto power-off changed: sent through the service's monitor (one HID++ exchange at a time with
+        its battery poll) and saved, so it is re-sent whenever the headset turns on."""
+        self.monitor.set(kind, value)
+        self.settings["headphones"][kind] = value
+        row = self.hidpp_rows[kind]
+        try:  # on the main loop, like the page's other saves of the same dict
+            store.save(self.settings)
+            row.set_subtitle(SUBTITLES[kind])
+        except OSError as e:  # disk full, read-only: set, but the user must know it won't last
+            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
 
     def poll(self):
         if not self.polling:  # a slow pw-dump never piles up threads

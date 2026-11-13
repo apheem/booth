@@ -342,6 +342,102 @@ class Poll(unittest.TestCase):
         self.assertEqual(len(spawned), 2)
 
 
+class Settings(unittest.TestCase):
+    """Sidetone and auto power-off through the monitor: one HID++ exchange at a time with the battery poll, the saved
+    values (or the defaults) re-sent on every "on", and `acked` true only for a command the headset echoed."""
+
+    def setUp(self):
+        self.spawned, self.log, self.saved = [], [], {}
+        self.m = headset.HeadsetMonitor(spawn=lambda work, done: self.spawned.append((work, done)),
+                                        settings={"headphones": self.saved})
+        self.m.listeners.append(self.log.append)
+
+    def sent(self):
+        """The requests of every settings exchange spawned so far."""
+        return [work.args[0] for work, _ in self.spawned if getattr(work, "func", None) is hidpp.setting]
+
+    def finish(self, result):
+        self.spawned[-1][1](result)
+
+    def on(self):
+        self.m.poll()
+        self.finish((3990, False))
+
+    def test_on_sends_the_saved_values_one_exchange_at_a_time(self):
+        self.saved.update(sidetone=64, auto_off=10)
+        self.on()
+        self.assertEqual(len(self.sent()), 1)  # the second waits for the first's reply
+        self.finish(True)
+        self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(64), hidpp.auto_off_request(10)]))
+        self.finish(True)
+        self.assertFalse(self.m.busy)
+
+    def test_nothing_saved_sends_sidetone_off_and_30_minutes(self):
+        self.on()
+        self.finish(True)
+        self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(0), hidpp.auto_off_request(30)]))
+        self.assertEqual(self.saved, {})  # a probe, not the user's choice: nothing is saved
+
+    def test_every_on_sends_them_again(self):  # they may reset at power-on
+        self.on()
+        self.assertEqual(len(self.sent()), 1)
+        self.finish(True)
+        self.finish(True)
+        self.m.poll()
+        self.finish(hidpp.OFF)
+        self.on()
+        self.assertEqual(len(self.sent()), 3)
+        self.finish(True)
+        self.assertEqual(len(self.sent()), 4)
+
+    def test_a_battery_poll_waits_while_a_setting_is_in_flight(self):
+        self.on()
+        self.m.poll()
+        self.assertEqual(len(self.spawned), 2)  # the battery query, then one setting: no second thread on the node
+
+    def test_a_setting_asked_during_a_battery_query_waits_for_its_reply(self):
+        self.m.poll()
+        self.m.set("sidetone", 10)
+        self.assertEqual(self.sent(), [])
+        self.finish(None)  # a miss: still off is unknown, nothing re-sent, the user's ask goes now
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)])
+
+    def test_a_drag_sends_only_the_last_value_and_kinds_never_drop_each_other(self):
+        self.m.poll()
+        for level in (10, 20, 30):
+            self.m.set("sidetone", level)
+        self.m.set("auto_off", 5)
+        self.finish(None)
+        self.finish(True)
+        self.finish(True)
+        self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(30), hidpp.auto_off_request(5)]))
+
+    def test_only_an_acknowledged_command_is_acked(self):
+        self.m.set("sidetone", 10)
+        self.finish(True)
+        self.assertEqual((self.m.acked, self.log), ({"sidetone": True}, ["ack"]))
+        for result in (False, None):  # refused (the captured error reply), or no answer / the exchange raised
+            self.m.set("sidetone", 10)
+            self.finish(result)
+            self.assertEqual(self.m.acked, {"sidetone": False})
+        self.assertFalse(self.m.busy)
+
+    def test_off_forgets_every_acknowledgement(self):
+        self.on()
+        self.finish(True)
+        self.finish(True)
+        self.assertEqual(self.m.acked, {"sidetone": True, "auto_off": True})
+        self.m.poll()
+        self.finish(hidpp.OFF)
+        self.assertEqual((self.m.acked, self.log[-1]), ({}, "off"))
+
+    def test_without_the_settings_nothing_is_sent(self):  # the monitor before the app loaded them
+        m = headset.HeadsetMonitor(spawn=lambda work, done: self.spawned.append((work, done)))
+        m.poll()
+        self.finish((3990, False))
+        self.assertEqual(self.sent(), [])
+
+
 class WriterTest(unittest.TestCase):
     def setUp(self):
         self.spawned = []

@@ -14,9 +14,14 @@ VERSION = 1
 
 def defaults():
     # camera: {control name: value}, v4l2 names plus the extension units' "fov" and "led_mode"; re-applied at startup.
-    # headphones: {"previous_default": the sink's node name "Use for all sound" replaced, put back when it is turned off}
+    # headphones: {"previous_default": the sink's node name "Use for all sound" replaced, put back when it is turned off;
+    #   "sidetone": 0..128 and "auto_off": minutes 0..90 (0 = never), sent to the PRO X whenever it turns on}
     # microphone: {"input": "XLR" or "Instrument", the Scarlett input that is the mic; XLR when absent}. Never 48V.
     return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}}
+
+
+def _whole(value, top):
+    return type(value) is int and 0 <= value <= top  # not a bool (JSON true), not a float (64.0)
 
 
 def path():
@@ -42,7 +47,8 @@ def load(file=None):
         if not isinstance(camera, dict) or not all(isinstance(v, int) for v in camera.values()):
             raise ValueError("not a settings object")
         headphones = data.get("headphones", {})
-        if not isinstance(headphones, dict) or not isinstance(headphones.get("previous_default", ""), str):
+        if not isinstance(headphones, dict) or not isinstance(headphones.get("previous_default", ""), str) \
+                or not _whole(headphones.get("sidetone", 0), 128) or not _whole(headphones.get("auto_off", 0), 90):
             raise ValueError("not a settings object")
         microphone = data.get("microphone", {})
         if not isinstance(microphone, dict) or microphone.get("input", "XLR") not in ("XLR", "Instrument"):

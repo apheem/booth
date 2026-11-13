@@ -92,7 +92,8 @@ class Application(Adw.Application):
     def do_activate(self):
         if self.monitor is None:  # the primary instance's first activate
             self.settings = store.load()  # once: every window, page, Setter and restore shares this dict, so a save
-            self.watch()  # never drops another writer's value
+            self.headset_monitor.settings = self.settings  # never drops another writer's value
+            self.watch()
             if self.background:
                 return
         if self.window is not None:

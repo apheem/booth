@@ -1,14 +1,18 @@
-"""The PRO X Wireless's battery over HID++, through its hidraw node. An error answer means the headset is off (its USB
-dongle stays plugged in, and in PipeWire, when the headset is off); no answer within TIMEOUT_S is only a miss.
+"""The PRO X Wireless's battery, sidetone and auto power-off over HID++, through its hidraw node. An error answer
+means the headset is off (its USB dongle stays plugged in, and in PipeWire, when the headset is off); no answer within
+TIMEOUT_S is only a miss.
 
-The battery request, the reply's layout and the voltage → percentage curve are ported from HeadsetControl
+The requests, the replies' layout and the voltage → percentage curve are ported from HeadsetControl
 (https://github.com/Sapd/HeadsetControl, GPL-3.0-or-later, commit 0c8a76fa019cd02263a1c69e00e18e229b16d87f):
-lib/devices/logitech_gpro.hpp (the request 0x06 0x0d and usage page 0xff43), lib/devices/protocols/hidpp_protocol.hpp
-(sendHIDPPCommand and requestBatteryHIDPP: the long-report framing, the 0xff "offline" byte, the reply's mV and
-charging bytes), lib/devices/protocols/logitech_calibrations.hpp (the G PRO curve) and lib/utility.cpp
-(spline_battery_level). Booth is GPL-3.0 too. HeadsetControl itself is not used.
+lib/devices/logitech_gpro.hpp (the battery request 0x06 0x0d, usage page 0xff43, setSidetone's 0x05 0x1a with 0..128
+mapped onto 0..100), lib/devices/protocols/hidpp_protocol.hpp (sendHIDPPCommand and requestBatteryHIDPP: the
+long-report framing, the 0xff "offline" byte, the reply's mV and charging bytes; setInactiveTimeHIDPP's 0x07 0x21
+minutes), lib/devices/device_utils.hpp (map: clamp, then truncate), lib/devices/protocols/logitech_calibrations.hpp
+(the G PRO curve) and lib/utility.cpp (spline_battery_level). Booth is GPL-3.0 too. HeadsetControl itself is not used.
+HeadsetControl sends sidetone without reading a reply; Booth reads the HID++ 2.0 echo of its feature index and
+function byte as the headset's acknowledgement.
 
-Only this one request is ever sent, and only to the node whose sysfs ids are 046d:0aba and whose report descriptor
+Only these requests are ever sent, and only to the node whose sysfs ids are 046d:0aba and whose report descriptor
 declares the HID++ usage page, and whose open fd still says 046d:0aba; the node is resolved on every query (hidraw
 numbers change on replug)."""
 import fcntl
@@ -23,6 +27,8 @@ SYSFS = "/sys/class/hidraw"
 TIMEOUT_S = 1.0
 LONG, RECEIVER, LENGTH = 0x11, 0xFF, 20  # HIDPP_LONG_MESSAGE, HIDPP_DEVICE_RECEIVER, HIDPP_LONG_MESSAGE_LENGTH
 FEATURE = bytes([0x06, 0x0D])  # LogitechGPro::getBattery
+SIDETONE = bytes([0x05, 0x1A])  # LogitechGPro::setSidetone
+AUTO_OFF = bytes([0x07, 0x21])  # HIDPPDevice::setInactiveTimeHIDPP
 REQUEST = bytes([LONG, RECEIVER]) + FEATURE + bytes(LENGTH - 4)
 PERCENTAGES = (100, 50, 30, 20, 5, 0)  # calibrations::LOGITECH_GPRO
 VOLTAGES = (4150, 3830, 3780, 3740, 3670, 3320)
@@ -88,6 +94,30 @@ def answer(report):
     return OFF if mv < VOLTAGES[-1] else (mv, report[6] == 0x03)
 
 
+def _request(feature, value):
+    return bytes([LONG, RECEIVER]) + feature + bytes([value]) + bytes(LENGTH - 5)
+
+
+def sidetone_request(level):
+    """Sidetone 0..128 (HeadsetControl's scale) → its request; the headset takes 0..100."""
+    return _request(SIDETONE, min(max(level, 0), 128) * 100 // 128)
+
+
+def auto_off_request(minutes):
+    """Auto power-off after `minutes` idle, 0..90 (0 = never) → its request."""
+    return _request(AUTO_OFF, min(max(minutes, 0), 90))
+
+
+def acked(report, feature):
+    """One report read from the node → True when it echoes the settings command `feature` (the headset's
+    acknowledgement), False for the HID++ error reply that echoes it (off, or refused), None for any other report."""
+    if len(report) < 5 or report[0] != LONG or report[1] != RECEIVER:
+        return None
+    if report[2] == 0xFF:
+        return False if report[3:5] == feature else None
+    return True if report[2:4] == feature else None
+
+
 def estimate(mv):
     """Battery voltage in mV → an estimated percentage on the G PRO curve (spline_battery_level)."""
     for i, v in enumerate(VOLTAGES):
@@ -99,15 +129,15 @@ def estimate(mv):
     return 0
 
 
-def read_reply(fd, timeout):
-    """Read reports from the non-blocking `fd` until the battery answer → (mV, charging) or OFF, or None (no answer,
-    a miss) at `timeout` s."""
+def read_reply(fd, timeout, parse=answer):
+    """Read reports from the non-blocking `fd` until parse(report) is not None → that (by default the battery answer:
+    (mV, charging) or OFF), or None (no answer, a miss) at `timeout` s."""
     deadline = time.monotonic() + timeout
     while (left := deadline - time.monotonic()) > 0:
         if not select.select([fd], [], [], left)[0]:
             break
         try:
-            got = answer(os.read(fd, 64))
+            got = parse(os.read(fd, 64))
         except BlockingIOError:
             continue
         if got is not None:
@@ -115,13 +145,25 @@ def read_reply(fd, timeout):
     return None
 
 
-def battery(find=find_node, open_=os.open, write=os.write, ioctl=fcntl.ioctl, timeout=TIMEOUT_S):
+def battery(**kw):
     """Ask the PRO X for its battery now → (mV, charging); OFF when the dongle answers "headset off" or is unplugged;
-    None when nothing answers (a miss: HeadsetMonitor calls it off only after two in a row). Blocks up to ~`timeout`
-    s: call it off the main loop."""
+    None when nothing answers (a miss: HeadsetMonitor calls it off only after two in a row). Blocks up to ~TIMEOUT_S
+    s: call it off the main loop. `kw`: exchange()'s injectables."""
+    return exchange(REQUEST, answer, OFF, **kw)
+
+
+def setting(request, **kw):
+    """Send a sidetone_request or auto_off_request now → True when the headset acknowledged it, False when the dongle
+    refused it (headset off) or is unplugged, None when nothing answered. Blocks like battery()."""
+    return exchange(request, lambda report: acked(report, request[2:4]), False, **kw)
+
+
+def exchange(request, parse, gone, find=find_node, open_=os.open, write=os.write, ioctl=fcntl.ioctl, timeout=TIMEOUT_S):
+    """One HID++ request and its reply on the PRO X's node, resolved now → read_reply's result with `parse`; `gone`
+    when there is no node; None when it can't be opened or is unplugged mid-exchange."""
     node = find()
     if node is None:
-        return OFF
+        return gone
     try:
         fd = open_(node, os.O_RDWR | os.O_NONBLOCK)
     except OSError:
@@ -131,8 +173,8 @@ def battery(find=find_node, open_=os.open, write=os.write, ioctl=fcntl.ioctl, ti
         _bus, vendor, product = struct.unpack("=IHH", ioctl(fd, HIDIOCGRAWINFO, bytes(8)))
         if (vendor, product) != (VENDOR, PRODUCT):
             return None
-        write(fd, REQUEST)
-        return read_reply(fd, timeout)
+        write(fd, request)
+        return read_reply(fd, timeout, parse)
     except OSError:  # unplugged mid-query
         return None
     finally:

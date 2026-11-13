@@ -145,7 +145,8 @@ def stand_ins():
     """The page's widgets as _W, its threads inline, and the main loop's idle_add run at once."""
     ns = types.SimpleNamespace
     with mock.patch.object(headphones, "super", lambda *a: ns(__init__=lambda: None), create=True), \
-            mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W)), \
+            mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W,
+                                                    SpinRow=ns(new_with_range=_W))), \
             mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0))), \
             mock.patch.object(headphones.GLib, "timeout_add_seconds", lambda *a: 1), \
             mock.patch.object(headphones.GLib, "idle_add", lambda f, *a: f(*a)), \
@@ -200,6 +201,70 @@ class Battery(unittest.TestCase):
             page.stop()
         monitor.update((3990, False))
         self.assertEqual(sidebar[-1], "Volume 63 %")
+
+
+class Settings(unittest.TestCase):
+    """Sidetone and Auto power-off through the page's real __init__: shown only once the headset acknowledged its
+    command, sent through the service's monitor and saved."""
+
+    def setUp(self):
+        self.spawned, self.settings = [], {"headphones": {"sidetone": 64}}
+        self.monitor = headset.HeadsetMonitor(spawn=lambda work, done: self.spawned.append((work, done)),
+                                              settings=self.settings)
+        self.page = Page()
+        with stand_ins():
+            headphones.HeadphonesPage.__init__(self.page, self.settings, lambda text: None, self.monitor)
+        self.sidetone, self.auto_off = self.page.hidpp_rows["sidetone"], self.page.hidpp_rows["auto_off"]
+
+    def visible(self):
+        return self.sidetone.set["set_visible"], self.auto_off.set["set_visible"]
+
+    def test_the_saved_values_are_shown_and_nothing_is_sent_for_them(self):
+        self.assertEqual(self.page.sidetone.set["set_value"], (64,))
+        self.assertEqual(self.auto_off.set["set_value"], (headset.DEFAULTS["auto_off"],))
+        self.assertEqual(self.spawned, [])
+
+    def test_hidden_until_the_headset_acknowledges_each_command(self):
+        self.assertEqual(self.visible(), ((False,), (False,)))
+        self.monitor.poll()
+        self.spawned[-1][1]((3990, False))  # on: both are sent, one at a time
+        kinds = [k for k in ("sidetone", "auto_off") if k not in self.monitor.queue]
+        self.spawned[-1][1](True)
+        self.assertEqual(self.page.hidpp_rows[kinds[0]].set["set_visible"], (True,))
+        self.spawned[-1][1](False)  # the other one refused: it stays hidden
+        self.assertEqual(self.visible(), tuple((k == kinds[0],) for k in ("sidetone", "auto_off")))
+
+    def test_off_hides_them_again(self):
+        self.monitor.poll()
+        self.spawned[-1][1]((3990, False))
+        self.spawned[-1][1](True)
+        self.spawned[-1][1](True)
+        self.assertEqual(self.visible(), ((True,), (True,)))
+        self.monitor.poll()
+        self.spawned[-1][1](hidpp.OFF)
+        self.assertEqual(self.visible(), ((False,), (False,)))
+
+    def test_a_change_is_sent_through_the_monitor_and_saved(self):
+        with mock.patch.object(headphones.store, "save") as save:
+            self.page.on_setting("auto_off", 10)
+        self.assertEqual(self.spawned[-1][0].args, (hidpp.auto_off_request(10),))
+        self.assertEqual(self.settings["headphones"], {"sidetone": 64, "auto_off": 10})
+        save.assert_called_once_with(self.settings)
+        self.assertEqual(self.auto_off.set["set_subtitle"], (headphones.SUBTITLES["auto_off"],))
+
+    def test_the_widgets_signals_reach_on_setting(self):
+        with mock.patch.object(headphones.store, "save"):
+            self.page.sidetone.get_value = lambda: 99.6
+            self.page.sidetone.handlers["value-changed"](self.page.sidetone)
+            self.auto_off.get_value = lambda: 45.0
+            self.auto_off.handlers["notify::value"](self.auto_off, None)
+        self.assertEqual(self.settings["headphones"], {"sidetone": 100, "auto_off": 45})
+
+    def test_a_failed_save_says_so_on_the_row(self):
+        with mock.patch.object(headphones.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.page.on_setting("sidetone", 10)
+        self.assertEqual(self.sidetone.set["set_subtitle"], ("Set, but not saved: No space left on device",))
+        self.assertEqual(self.spawned[-1][0].args, (hidpp.sidetone_request(10),))  # sent all the same
 
 
 class Click(unittest.TestCase):
