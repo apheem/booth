@@ -404,6 +404,41 @@ class Verification(unittest.TestCase):
         (where / names[0]).symlink_to(real)
         self.assertNotIn(names[0], self.found(where, manifest))
 
+    def hashed(self, call):
+        """The plugin files call() hashed (plugins.verify ran on)."""
+        names, real = [], plugins.verify
+        with mock.patch.object(voice.plugins, "verify", lambda name, *a: names.append(name) or real(name, *a)):
+            call()
+        return names
+
+    def test_an_unchanged_plugin_is_hashed_once_across_polls_and_a_changed_one_again(self):
+        names = list(plugins.MANIFEST)
+        where, manifest = plugin_folder(self, good=names, bad=())
+        every = {n: str(where / n) for n in names}
+        self.assertEqual(sorted(self.hashed(lambda: self.assertEqual(self.found(where, manifest), every))), sorted(names))
+        self.assertEqual(self.hashed(lambda: self.assertEqual(self.found(where, manifest), every)), [])  # 5.7 MB: once
+        (where / names[0]).write_bytes(b"changed")
+        (where / names[0]).chmod(0o644)
+        (where / names[1]).chmod(0o664)  # group-writable: refused, its bytes unchanged
+        self.assertEqual(self.found(where, manifest), {names[2]: every[names[2]]})
+        (where / names[1]).chmod(0o644)
+        where.chmod(0o775)  # its folder group-writable: everything in it refused
+        self.assertEqual(self.found(where, manifest), {})
+
+    def test_the_pre_start_hashes_every_plugin_every_time_never_a_cached_verdict(self):
+        names = list(plugins.MANIFEST)
+        where, manifest = plugin_folder(self, good=names, bad=())
+        run = self.tmp_file().with_name(voice.RUN_CONF)
+        with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
+                mock.patch.object(voice.store, "load", lambda: ON):
+            REAL_VERIFIED(where, manifest)  # a poll's: cached
+            for _ in range(2):
+                self.assertEqual(sorted(self.hashed(lambda: voice.write(run, where))), sorted(names))
+            with mock.patch.object(voice.plugins, "folder", lambda: where):
+                REAL_VERIFIED()
+                self.assertEqual(sorted(self.hashed(lambda: voice.reload(run=lambda cmd: True, file=run))),
+                                 sorted(names))
+
     def test_every_build_verifies_again(self):
         calls = []
         with mock.patch.object(voice, "verified", lambda: calls.append(1) or FOUND):

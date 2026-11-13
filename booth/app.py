@@ -203,7 +203,7 @@ class Application(Adw.Application):
     def heal_once(self):
         try:
             voice.heal(self.settings, on=lambda: self.headset_monitor.on)
-            source = voice.CHOSEN if voice.running() else routing.DOWN
+            source = voice.CHOSEN if voice.running(voice.SEEN) else routing.DOWN  # heal's pw-dump when it read one
             self.mic, actions = routing.next(self.mic, {"kind": "mic", "source": source})
             if "seen" in self.mic:  # a change seen once: looked at again once things settle, not at the next tick
                 GLib.idle_add(self.mic_poke.poke)

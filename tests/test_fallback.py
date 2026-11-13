@@ -54,6 +54,7 @@ def desk(*gone, positions=None):
 
 
 ABSENT = desk("alsa_input.usb-Focusrite", "alsa_output.usb-Focusrite")  # the Scarlett unplugged: gone from PipeWire
+SCARLETT_BACK_DUMP = json.dumps([node(71, voice.INPUT), node(40, MIC["node"])])  # the selector unloaded itself
 
 
 def capture(cfg):
@@ -220,6 +221,12 @@ class Fallback(unittest.TestCase):
         voice.heal(ON, read=lambda choice: held.append(locked()) or None, run=lambda cmd: True, dump=lambda: ABSENT,
                    file=self.file, clock=lambda: 1000.0, on=lambda: True)
         self.assertEqual(held, [True])
+
+    def test_heal_keeps_the_pw_dump_it_read_for_running_and_none_when_it_read_none(self):  # one pw-dump less a tick
+        self.heal(STATE, SCARLETT_BACK_DUMP)
+        self.assertEqual(voice.SEEN, SCARLETT_BACK_DUMP)
+        self.heal(None, "[]")  # unplugged, nothing to choose: no revive check
+        self.assertIsNone(voice.SEEN)
 
     def test_a_scarlett_read_with_its_node_is_never_judged_by_a_second_pw_dump(self):  # read just now: no blip
         dumps = []

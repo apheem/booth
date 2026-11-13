@@ -715,6 +715,14 @@ class MicFallback(unittest.TestCase):
         self.assertEqual(idle, [(stub.mic_moved, ([("notify", routing.MIC_SAID[voice.PRO_X_MIC]),
                                                    ("label", voice.PRO_X_MIC)],))])
 
+    def test_running_reads_the_pw_dump_heal_just_read(self):  # never a third pw-dump on an idle tick
+        with mock.patch.object(app.voice, "SEEN", "heal's dump", create=True), \
+                mock.patch.object(app.voice, "heal"), mock.patch.object(app.monitor, "sync"), \
+                mock.patch.object(app.voice, "running", return_value=True) as running, \
+                mock.patch.object(app.GLib, "idle_add"):
+            app.Application.heal_once(mock.Mock(settings={}, mic={}, healing=True))
+        running.assert_called_once_with("heal's dump")
+
     def test_booth_mic_not_running_is_its_own_source(self):  # #15's seam: a call may have moved to another mic
         stub, _ = self.heal_once({}, voice.SCARLETT, running=False)
         self.assertEqual(stub.mic["seen"], routing.DOWN)

@@ -72,6 +72,8 @@ NO_INPUT = "no input"  # the Scarlett's card there, its source not in PipeWire (
 # the backups in order, by their PipeWire source's name: then the serial and profile
 BACKUPS = ((PRO_X_MIC, "alsa_input." + devices.PRO_X_USB), (BRIO_MIC, "alsa_input.usb-046d_Logitech_BRIO_"))
 CHOSEN = SCARLETT  # the mic heal() chose last, for the routing policy's notice
+SEEN = None  # the pw-dump heal() read last for its revive check, for running(); None when it read none
+_VERIFIED = {}  # plugin path → the stat of it and its folder when it last verified: unchanged, it isn't hashed again
 CLOSED = False  # Booth is shutting down (release()): no heal moves the selector again
 
 
@@ -137,14 +139,34 @@ STAGES = (("noise", "librnnoise_ladspa.so", "noise_suppressor_mono", ("Input",),
            "limiter_ceiling", -1.0, ceiling))
 
 
+def _stat(path, pin):
+    """What verify() checked that can change: the file (inode, size, times, never through a symlink) and its folder."""
+    try:
+        f, d = os.stat(path, follow_symlinks=False), os.stat(path.parent)
+    except OSError:
+        return None
+    return (pin, f.st_ino, f.st_size, f.st_mtime_ns, f.st_ctime_ns, f.st_mode, f.st_uid,
+            d.st_ino, d.st_mode, d.st_uid, d.st_ctime_ns)
+
+
 def verified(where=None, manifest=plugins.MANIFEST):
-    """{plugin file: its path} for each plugin that verifies now (plugins.verify): the only paths a config may hold."""
+    """{plugin file: its path} for each plugin that verifies now (plugins.verify): the only paths a config may hold. A
+    file and folder unchanged since they last verified aren't hashed again (the polls); write() and reload() clear that
+    first, so voice-run.conf is always written from a fresh hash."""
     found = {}
     for name in manifest:
+        path = Path(where or plugins.folder()) / name
+        key = _stat(path, manifest[name])
+        if key is not None and _VERIFIED.get(str(path)) == key:
+            found[name] = str(path)
+            continue
+        _VERIFIED.pop(str(path), None)
         try:
             found[name] = str(plugins.verify(name, where, manifest))
         except (plugins.Refused, OSError):
-            pass
+            continue
+        if key is not None:  # taken before the hash: a change since misses on the next call, so it is hashed again
+            _VERIFIED[str(path)] = key
     return found
 
 
@@ -501,9 +523,10 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
     it started before it at login. Never without Booth Mic's input (BindsTo would pull a stopped booth-voice.service
     back up), and at most once a minute for the same config and source node, so a selector that won't stay up isn't
     restarted every tick. True when it restarted it."""
-    global CHOSEN
+    global CHOSEN, SEEN
     select_file = (file or path()).with_name(SELECT_CONF)
     with _LOCK:  # read, chosen and applied as one: a page poll's apply never lands between
+        SEEN = None
         if CLOSED:
             return False
         state = read(_choice(settings))
@@ -521,7 +544,7 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
             return False
         if said.startswith(("restarted", "selector restarted")):
             return True  # by apply, which recorded it: it is coming up
-        now = dump()
+        now = SEEN = dump()
         key = _key(sel, now, state["mic"]["node"])
         if key[1] is None or _node_id(now, INPUT) is None or _node_id(now, SELECTOR) is not None:
             return False
@@ -564,6 +587,7 @@ def write(file=None, where=None):
     Scarlett: the unit is starting. None; "kept …" when it can't be written but the one there loads only plugins
     verified now, at their verified paths, in the shape this code builds from them (else every apply would restart it):
     Booth Mic starts on it, touched so apply sends it the saved values live; "not …": then the unit doesn't start."""
+    _VERIFIED.clear()  # what pipewire loads: hashed now, never a poll's cached verdict
     file, found, settings = file or path().with_name(RUN_CONF), verified(where), store.load()
     cfg = json.loads(build(settings, found))
     said = None if _load(file) == cfg else _save(cfg, file)
@@ -583,6 +607,7 @@ def reload(run=service.run, file=None):
     """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
     when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
     with _LOCK:
+        _VERIFIED.clear()  # an install's fresh plugins: hashed now
         return _plugins(_running(file or path())) == verified() or run(RESTART)
 
 
