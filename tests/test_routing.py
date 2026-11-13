@@ -256,6 +256,12 @@ class MicRule(unittest.TestCase):
         state, actions = routing.next({"said": voice.PRO_X_MIC, "seen": voice.SCARLETT}, self.mic(voice.BRIO_MIC))
         self.assertEqual((state, actions[0]), ({"said": voice.BRIO_MIC}, ("notify", routing.MIC_SAID[voice.BRIO_MIC])))
 
+    def test_no_mic_or_no_input_is_said_at_once_even_with_a_return_pending(self):
+        for source in (None, voice.NO_INPUT):  # Booth Mic went silent: said on the heal that made it, whatever was seen
+            state, actions = routing.next({"said": voice.BRIO_MIC, "seen": voice.SCARLETT}, self.mic(source))
+            self.assertEqual((state, actions), ({"said": source}, [("notify", routing.MIC_SAID[source]),
+                                                                   ("label", source)]))
+
     def test_booth_mic_starts_on_the_scarlett_so_nothing_is_said_for_it(self):
         state, actions = routing.next({}, self.mic(voice.SCARLETT))
         self.assertEqual((state, actions), ({"said": voice.SCARLETT}, []))
@@ -292,6 +298,8 @@ class MicRule(unittest.TestCase):
         self.assertEqual(routing.label(voice.BRIO_MIC), "Booth Mic · from BRIO mic")
         self.assertEqual(routing.label(voice.SCARLETT), "Booth Mic · from the Scarlett")
         self.assertEqual(routing.label(None), "Booth Mic · no mic")
+        self.assertEqual(routing.label(voice.NO_INPUT), "Booth Mic · no input")
+        self.assertEqual(routing.MIC_SAID[voice.NO_INPUT], "Booth Mic has no input: the Scarlett's input isn't in PipeWire")
         self.assertEqual(routing.label(routing.DOWN), "Booth Mic · not running")
 
 

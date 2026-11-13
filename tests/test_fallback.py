@@ -3,6 +3,7 @@ BRIO mic, each by name and its own discovered position, and goes back to the Sca
 ever restarts, so Booth Mic (booth_mic) and its node mute stay; the routing policy says each settled change once."""
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,30 @@ from tests.test_voice import (ACTIVE, MIC, ON, RESTART_SELECT, STATE, STOP_SELEC
 PROX_MIC = "alsa_input.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.mono-fallback"  # the fixture's, MONO
 BRIO_MIC = "alsa_input.usb-046d_Logitech_BRIO_FAKESER1-03.analog-stereo"  # the fixture's, FL,FR
 SCARLETT_SOURCE = MIC["node"]
+C920 = "alsa_input.usb-046d_HD_Pro_Webcam_C920_FAKESER1-02.analog-stereo"  # another Logitech webcam's mic
+NO_NODE = {"ctrls": STATE["ctrls"], "mic": dict(MIC, node=None, position=None, channels=None)}  # card there, no source
+RealThread = threading.Thread  # the page tests swap threading.Thread for an inline one
+
+
+def locked():
+    """True when another thread holds voice._LOCK now (tried from a fresh thread, so an RLock's owner can't pass)."""
+    out = []
+
+    def probe():
+        got = voice._LOCK.acquire(blocking=False)
+        out.append(not got)
+        if got:
+            voice._LOCK.release()
+    t = RealThread(target=probe)
+    t.start()
+    t.join()
+    return out[0]
+
+
+def with_node(dump, name, media_class):
+    """`dump` plus a node named `name` of `media_class`, at FL,FR."""
+    return json.dumps(json.loads(dump) + [{"id": 99, "type": "PipeWire:Interface:Node", "info": {"props": {
+        "node.name": name, "media.class": media_class, "audio.position": "FL,FR"}}}])
 
 
 def desk(*gone, positions=None):
@@ -73,6 +98,24 @@ class Choose(unittest.TestCase):
     def test_the_scarlett_still_in_pipewire_is_never_absent(self):  # amixer failed, or the card is going
         self.assertEqual(voice.choose(None, True, desk(), SCARLETT_SOURCE), (voice.SCARLETT, None))
 
+    def test_the_scarlett_in_pipewire_but_not_alsa_names_the_backup_that_still_feeds(self):  # kept: what runs
+        self.assertEqual(voice.choose(None, False, desk(), BRIO_MIC), (voice.BRIO_MIC, None))
+        self.assertEqual(voice.choose(None, True, desk(), PROX_MIC), (voice.PRO_X_MIC, None))
+
+    def test_another_logitech_capture_device_is_never_taken_as_the_brio(self):
+        dump = with_node(desk("alsa_input.usb-Focusrite", "alsa_input.usb-046d"), C920, "Audio/Source")
+        self.assertEqual(voice.choose(None, False, dump, None), (None, None))
+
+    def test_a_stream_named_like_a_backup_is_never_taken_as_its_mic(self):
+        dump = with_node(desk("alsa_input.usb-Focusrite", "alsa_input.usb-046d"), BRIO_MIC, "Stream/Input/Audio")
+        self.assertEqual(voice.choose(None, False, dump, None), (None, None))
+
+    def test_the_scarlett_card_there_with_no_source_in_pipewire_is_no_input_never_a_backup(self):
+        self.assertEqual(voice.choose(NO_NODE, True, ABSENT, SCARLETT_SOURCE), (voice.NO_INPUT, NO_NODE))
+        self.assertEqual(voice.choose(NO_NODE, True, "", SCARLETT_SOURCE)[0], voice.SCARLETT)  # pw-dump failed
+        self.assertEqual(voice.choose(NO_NODE, True, desk(), SCARLETT_SOURCE)[0], voice.SCARLETT)  # back since
+        self.assertEqual(voice.choose(rerouted("PCM 1"), True, ABSENT, None)[0], voice.SCARLETT)  # not routed
+
     def test_a_failed_pw_dump_leaves_the_selector_as_it_is(self):
         for dump in ("", "not json"):
             self.assertEqual(voice.choose(None, True, dump, PROX_MIC), (voice.PRO_X_MIC, None), dump)
@@ -108,9 +151,9 @@ class Fallback(unittest.TestCase):
         self.addCleanup(voice._HEALED.clear)
         voice.apply(ON, STATE, run=lambda cmd: True, dump=lambda: "[]", file=self.file)  # on the Scarlett
 
-    def heal(self, state, dump, on=True):
-        voice.heal(ON, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or True, dump=lambda: dump,
-                   file=self.file, clock=lambda: 1000.0, on=lambda: on)
+    def heal(self, state, dump, on=True, fail=None):
+        voice.heal(ON, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or cmd != fail,
+                   dump=lambda: dump, file=self.file, clock=lambda: 1000.0, on=lambda: on)
         return voice.CHOSEN, json.loads(self.select.read_text()) if self.select.exists() else None
 
     def test_scarlett_out_then_headset_off_then_scarlett_back(self):
@@ -151,6 +194,32 @@ class Fallback(unittest.TestCase):
         self.ran.clear()
         chosen, cfg = self.heal(None, ABSENT, on=None)
         self.assertEqual((chosen, capture(cfg)["target.object"], self.ran), (voice.PRO_X_MIC, PROX_MIC, []))
+
+    def test_scarlett_in_pipewire_not_alsa_while_on_a_backup_names_the_brio_that_feeds(self):
+        self.heal(None, ABSENT, on=False)  # on the BRIO
+        chosen, cfg = self.heal(None, desk(), on=False)  # amixer empty or timed out, the Scarlett's node still there
+        self.assertEqual((chosen, capture(cfg)["target.object"]), (voice.BRIO_MIC, BRIO_MIC))
+
+    def test_a_failed_stop_on_return_unrouted_names_the_brio_that_still_feeds(self):
+        self.heal(None, ABSENT, on=False)  # on the BRIO
+        chosen, cfg = self.heal(rerouted("PCM 1"), desk(), fail=STOP_SELECT)
+        self.assertEqual((chosen, capture(cfg)["target.object"]), (voice.BRIO_MIC, BRIO_MIC))
+        chosen, cfg = self.heal(rerouted("PCM 1"), desk())  # stopped this time
+        self.assertEqual((chosen, cfg), (voice.SCARLETT, None))
+
+    def test_a_failed_restart_onto_a_backup_names_no_mic(self):
+        chosen, cfg = self.heal(None, ABSENT, on=False, fail=RESTART_SELECT)
+        self.assertEqual((chosen, cfg), (None, None))  # its config removed for the retry: nothing feeds Booth Mic
+
+    def test_the_scarlett_card_there_with_no_source_keeps_its_selector_and_names_no_input(self):
+        chosen, cfg = self.heal(NO_NODE, ABSENT)
+        self.assertEqual((chosen, cfg, self.ran), (voice.NO_INPUT, selector(), []))  # never a backup: it is there
+
+    def test_heal_reads_and_applies_under_the_lock_so_a_page_poll_never_lands_in_between(self):
+        held = []
+        voice.heal(ON, read=lambda choice: held.append(locked()) or None, run=lambda cmd: True, dump=lambda: ABSENT,
+                   file=self.file, clock=lambda: 1000.0, on=lambda: True)
+        self.assertEqual(held, [True])
 
     def test_the_scarlett_there_with_the_mic_not_routed_stops_never_falls_back(self):
         self.heal(None, ABSENT)  # on the PRO X
@@ -211,12 +280,84 @@ class Sequences(unittest.TestCase):
             self.tick(None, "")
         self.assertEqual((voice.CHOSEN, self.notes), (voice.SCARLETT, []))
 
+    def test_the_scarlett_card_there_but_no_pipewire_source_is_said_once_as_no_input(self):
+        for _ in range(3):
+            self.tick(NO_NODE, ABSENT)
+        self.assertEqual((self.notes, self.labels), ([routing.MIC_SAID[voice.NO_INPUT]], [voice.NO_INPUT]))
+
     def test_mute_is_preserved_booth_mic_is_never_restarted_and_nothing_touches_its_mute(self):
         for state, dump, on in ((None, ABSENT, True), (None, ABSENT, False)) + ((STATE, desk(), True),) * 2:
             self.tick(state, dump, on)
         self.assertEqual(self.labels, [voice.PRO_X_MIC, voice.BRIO_MIC, voice.SCARLETT])
         self.assertFalse([c for c in self.ran if UNITS[0] in c and c != ACTIVE])
         self.assertFalse([c for c in self.ran if "wpctl" in c or "set-mute" in c])
+
+
+class Release(unittest.TestCase):
+    """A backup selector runs only while a Booth primary instance runs to watch it and say it: Booth's shutdown stops it
+    and removes its config, and booth-mic-select.service's ExecCondition (may_select) never starts one without Booth."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.file = Path(tmp.name) / "voice.conf"
+        self.select = self.file.with_name(voice.SELECT_CONF)
+        self.ran = []
+        self.addCleanup(setattr, voice, "CLOSED", False)
+        self.backups = [voice.choose(None, on, ABSENT, None)[1]["mic"] for on in (True, False)]  # PRO X, BRIO
+
+    def on(self, mic):
+        self.select.write_text(voice.build_selector(mic))
+
+    def test_booth_quitting_stops_a_backup_selector_and_removes_its_config(self):
+        for mic in self.backups:
+            self.on(mic)
+            self.ran.clear()
+            voice.release(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
+            self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False), mic["node"])
+
+    def test_booth_quitting_leaves_the_scarlett_selector_running(self):
+        self.on(MIC)
+        voice.release(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
+        self.assertEqual((self.ran, self.select.read_text()), ([], voice.build_selector(MIC)))
+
+    def test_no_heal_after_booth_quit_moves_the_selector_again(self):  # a heal still running as Booth shuts down
+        self.on(MIC)
+        voice.release(run=lambda cmd: True, file=self.file)
+        voice.heal(ON, read=lambda choice: None, run=lambda cmd: self.ran.append(cmd) or True, dump=lambda: ABSENT,
+                   file=self.file, clock=lambda: 1000.0, on=lambda: False)
+        self.assertEqual((self.ran, self.select.read_text()), ([], voice.build_selector(MIC)))
+
+    def test_the_selector_unit_starts_a_backup_only_while_booth_runs_else_removes_it(self):
+        for mic in self.backups:
+            self.on(mic)
+            self.assertTrue(voice.may_select(self.select, owned=lambda: True))
+            self.assertTrue(self.select.exists())
+            self.assertFalse(voice.may_select(self.select, owned=lambda: False))  # logout, reboot, Booth closed
+            self.assertFalse(self.select.exists())  # Booth Mic silent until Booth heals and says it
+
+    def test_the_selector_unit_always_starts_the_scarlett_and_never_no_config(self):
+        self.on(MIC)
+        self.assertTrue(voice.may_select(self.select, owned=lambda: False))
+        self.assertTrue(self.select.exists())
+        for text in ("not json", "{}"):
+            self.select.write_text(text)
+            self.assertFalse(voice.may_select(self.select, owned=lambda: True), text)
+        self.select.unlink()
+        self.assertFalse(voice.may_select(self.select, owned=lambda: True))
+
+    def test_booth_runs_while_its_bus_name_is_owned(self):
+        asked = []
+        for answer, owned in (("(true,)\n", True), ("(false,)\n", False), ("", False)):  # "": no bus, no gdbus
+            self.assertIs(voice._owned(run=lambda *cmd: asked.append(cmd) or answer), owned, answer)
+        self.assertEqual(asked[0][-2:], ("org.freedesktop.DBus.NameHasOwner", "io.github.apheem.Booth"))
+
+    def test_the_running_selector_is_named_from_its_config(self):
+        for mic, name in ((MIC, voice.SCARLETT), (self.backups[0], voice.PRO_X_MIC), (self.backups[1], voice.BRIO_MIC)):
+            self.on(mic)
+            self.assertEqual(voice.current(self.file), name)
+        self.select.unlink()
+        self.assertIsNone(voice.current(self.file))
 
 
 if __name__ == "__main__":

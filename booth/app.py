@@ -4,6 +4,7 @@ Every primary instance keeps the camera's saved settings applied: at launch, and
 `booth --background` (booth.service, at login) does it with no window. A plain launch while Booth runs shows the window
 in that same process (GApplication is single-instance over D-Bus). With "Run in background" on, the process is held:
 closing the window leaves it running."""
+import signal
 import sys
 import threading
 import traceback
@@ -17,7 +18,7 @@ from gi.repository import Adw, Gio, GLib  # noqa: E402
 from booth import camera, devices, headset, monitor, routing, service, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
-APP_ID = "io.github.apheem.Booth"
+APP_ID = service.APP_ID
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
 RESTORING = camera.WRITING  # the startup, replug and window-open restores and the page's writes never interleave
 BATTERY_S = 10  # the PRO X battery poll: also how soon "headset off" is noticed
@@ -132,7 +133,10 @@ class Application(Adw.Application):
         # Booth Mic's mic fallback (#20) within seconds, not at the next tick: a heal once a sound card's (the
         # Scarlett's, the BRIO's, the dongle's) burst of links settles, or the PRO X turns on or off
         self.mic_poke = service.Debounce(REPLUG_MS, self.heal_voice, GLib.timeout_add, GLib.source_remove)
+        # logout stops booth.service with SIGTERM: quit, so do_shutdown stops a backup selector no Booth would say
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.quit)
         self.fix_headset()
+        self.mic_at_start()  # before sync_voice, which may move the selector
         self.sync_voice()
         # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
         # before the first poll, whose reading is the startup transition
@@ -149,6 +153,18 @@ class Application(Adw.Application):
             self.hold()
             self.held = True
             self.restore_saved()
+
+    def mic_at_start(self):
+        """#20: the mic rule starts from the selector that runs: a backup left running (a Booth that crashed, or started
+        after the selector) is said now and shown, and a later return to the Scarlett is said."""
+        running = voice.current()
+        if running in dict(voice.BACKUPS):
+            self.mic, actions = routing.next(self.mic, {"kind": "mic", "source": running})
+            self.mic_moved(actions)
+
+    def do_shutdown(self):
+        voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
+        Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):
         # the entry now in by-id: RENAMED's new name is `other`; MOVED_IN's `other` is its old path, outside the folder

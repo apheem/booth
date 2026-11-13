@@ -99,9 +99,10 @@ MIC_SAID = {voice.SCARLETT: "Booth Mic is back on the Scarlett",
             voice.PRO_X_MIC: "Scarlett not connected — Booth Mic now uses the PRO X mic",
             voice.BRIO_MIC: "Scarlett not connected — Booth Mic now uses the BRIO mic",
             None: "Booth Mic has no mic — connect the Scarlett or turn on the PRO X",
+            voice.NO_INPUT: "Booth Mic has no input: the Scarlett's input isn't in PipeWire",
             DOWN: "Booth Mic isn't running — a call may have switched to another mic"}
 LABELS = {voice.SCARLETT: "from the Scarlett", voice.PRO_X_MIC: "from PRO X mic", voice.BRIO_MIC: "from BRIO mic",
-          None: "no mic", DOWN: "not running"}
+          None: "no mic", voice.NO_INPUT: "no input", DOWN: "not running"}
 
 
 def label(source):

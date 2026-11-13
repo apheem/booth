@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import signal
 import tempfile
 import threading
 import unittest
@@ -290,8 +291,11 @@ class BackgroundLaunch(unittest.TestCase):
         with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get), \
                 mock.patch.object(app.GLib, "timeout_add_seconds") as every, \
                 mock.patch.object(app.routing, "Executor") as executor, \
+                mock.patch.object(app.GLib, "unix_signal_add") as signal_add, \
                 mock.patch.object(app.GLib, "idle_add", idle_add):
             app.Application.watch(stub)
+            # logout stops booth.service with SIGTERM: quit, so shutdown stops a backup selector (#20)
+            signal_add.assert_called_once_with(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stub.quit)
             # the routing policy follows the PRO X in every primary instance, subscribed before the first poll, from
             # the saved move (a restart while moved still puts it back); its notifications and saves go to the main loop
             (settings, notify, save), = [c.args for c in executor.call_args_list]
@@ -322,6 +326,8 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertIs(stub.mic_poke.fire, stub.heal_voice)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
         stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
+        calls = [c[0] for c in stub.mock_calls]  # the mic running now said before sync_voice may move the selector
+        self.assertLess(calls.index("mic_at_start"), calls.index("sync_voice"))
         return stub
 
     def test_sync_voice_writes_booth_mics_config_and_starts_its_service_off_the_main_loop(self):
@@ -722,6 +728,33 @@ class MicFallback(unittest.TestCase):
         stub.window.show_mic.assert_called_once_with(voice.BRIO_MIC, True)
         stub.window = None
         app.Application.mic_moved(stub, [("label", voice.SCARLETT)])  # no window: nothing else to show
+
+    def test_a_backup_left_running_is_said_and_shown_at_start(self):  # the rule starts from what runs
+        for backup in (voice.PRO_X_MIC, voice.BRIO_MIC):
+            stub = mock.Mock(mic={})
+            with mock.patch.object(app.voice, "current", return_value=backup, create=True):
+                app.Application.mic_at_start(stub)
+            self.assertEqual(stub.mic, {"said": backup})  # a later return to the Scarlett is said
+            stub.mic_moved.assert_called_once_with([("notify", routing.MIC_SAID[backup]), ("label", backup)])
+
+    def test_the_scarlett_or_no_selector_at_start_says_nothing(self):
+        for running in (voice.SCARLETT, None):
+            stub = mock.Mock(mic={})
+            with mock.patch.object(app.voice, "current", return_value=running, create=True):
+                app.Application.mic_at_start(stub)
+            self.assertEqual(stub.mic, {})
+            stub.mic_moved.assert_not_called()
+
+    def test_quitting_stops_a_backup_selector_in_every_primary_instance(self):
+        stub = mock.Mock()
+        with mock.patch.object(app.voice, "release", create=True) as release, \
+                mock.patch.object(app.Adw.Application, "do_shutdown") as shutdown:
+            app.Application.do_shutdown(stub)
+        release.assert_called_once_with()
+        shutdown.assert_called_once_with(stub)
+
+    def test_the_bus_name_the_selector_unit_asks_for_is_the_apps(self):
+        self.assertEqual(app.APP_ID, service.APP_ID)
 
     def test_the_headset_on_or_off_pokes_a_heal(self):
         stub = mock.Mock()

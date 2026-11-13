@@ -12,6 +12,7 @@ from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_app import Inline
+from tests.test_fallback import locked
 from tests.test_headset import DUMP
 
 CONTENTS = read("scarlett/amixer-contents.txt")
@@ -325,6 +326,12 @@ class ScarlettGroup(PageCase):
             self.addCleanup(patch.stop)
         self.page.poll = types.MethodType(microphone.MicrophonePage.poll, self.page)
         return idle
+
+    def test_page_poll_reads_and_applies_under_the_voice_lock_so_a_heal_never_lands_in_between(self):
+        held = []  # a stale read applied after heal moved to a backup would put the Scarlett's config back on a gone node
+        self.real_poll(lambda choice: held.append(locked()) or state())
+        self.page.poll()
+        self.assertEqual((held, len(self.applied)), ([True], 1))
 
     def test_an_overlapping_poll_is_refused_and_the_next_one_after_show_runs(self):
         reads = []
