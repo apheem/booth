@@ -280,11 +280,23 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertEqual(len(threads), 1)  # and start(): the launch restore, then the window
 
     def watch(self, background):
-        stub = mock.Mock(held=False, background=background)
-        folders = {path: mock.Mock(name=path) for path in ("/dev/v4l/by-id", "/dev/snd/by-id")}
+        stub = mock.Mock(held=False, background=background, settings={"routing": {"moved": True, "direct": False}})
+        folders, idle = {path: mock.Mock(name=path) for path in ("/dev/v4l/by-id", "/dev/snd/by-id")}, []
         with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get), \
-                mock.patch.object(app.GLib, "timeout_add_seconds") as every:
+                mock.patch.object(app.GLib, "timeout_add_seconds") as every, \
+                mock.patch.object(app.routing, "Executor") as executor, \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
             app.Application.watch(stub)
+            # the routing policy follows the PRO X in every primary instance, subscribed before the first poll, from
+            # the saved move (a restart while moved still puts it back); its notifications and saves go to the main loop
+            (state, notify, save), = [c.args for c in executor.call_args_list]
+            self.assertIs(stub.routing, executor.return_value)
+            self.assertEqual(stub.headset_monitor.mock_calls[:2],
+                             [mock.call.listeners.append(executor.return_value.listener), mock.call.poll()])
+            notify("PRO X off")
+            save({})
+        self.assertEqual(state, {"moved": True, "direct": False})
+        self.assertEqual(idle, [(stub.routed, ("PRO X off",)), (stub.save_routing, ({},))])
         stub.headset_monitor.poll.assert_called_once_with()  # the battery now, in every primary instance
         # then every 10 s, window or not: the battery, and Booth Mic's selector restarted if its Scarlett is back
         self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll), mock.call(10, stub.heal_voice)])
@@ -594,6 +606,20 @@ class HeadsetBattery(unittest.TestCase):
         (nid, note), = [c.args for c in send.call_args_list]
         self.assertEqual(nid, "headset-battery")
         self.assertIsInstance(note, Gio.Notification)
+
+    def test_a_routing_notification_replaces_the_last_one(self):
+        with mock.patch.object(app.Gio, "Notification") as notification:
+            stub = mock.Mock()
+            self.assertIs(app.Application.routed(stub, "PRO X off — sound moved to the Scarlett"), GLib.SOURCE_REMOVE)
+        notification.new.assert_called_once_with("PRO X off — sound moved to the Scarlett")
+        stub.send_notification.assert_called_once_with("routing", notification.new.return_value)
+
+    def test_the_routing_state_is_saved_in_the_shared_settings(self):
+        stub = mock.Mock(settings={"version": 1, "routing": {}})
+        with mock.patch.object(app.store, "save") as save:
+            self.assertIs(app.Application.save_routing(stub, {"moved": True, "direct": False}), GLib.SOURCE_REMOVE)
+        self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
+        save.assert_called_once_with(stub.settings)
 
     def test_the_low_battery_notification_says_the_estimate(self):
         with mock.patch.object(app.Gio, "Notification") as notification:
