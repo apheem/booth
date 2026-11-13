@@ -42,7 +42,7 @@ def dump(*extra, props=None):
     Props {node:control: value}, as a filter-chain reports them."""
     objects = json.loads(DUMP) + [json.loads(json.dumps(o)) for o in extra]
     for o in objects:
-        if props is not None and o["info"].get("props", {}).get("node.name") == stereo.VOICE:
+        if props is not None and ((o.get("info") or {}).get("props") or {}).get("node.name") == stereo.VOICE:
             o["info"]["params"] = {"Props": [{"volume": 1.0}, {"params": [x for p in props.items() for x in p]}]}
     return json.dumps(objects)
 

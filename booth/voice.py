@@ -441,11 +441,11 @@ def selecting(dump=None):
 CHUNK = 12  # controls per pw-cli call: 1.0.5 sends an empty Props above ~25 (prints `Object: size 8`) and exits 0
 
 
-def set_params_cmds(dump, cfg):
-    """The live change to every control in `cfg`, on the running chain's input node (by name, now): pw-cli calls of at
-    most CHUNK controls; or None. Master's gains alone and first when they silence the chain (a mute lands even if a
+def set_params_cmds(dump, cfg, node=INPUT):
+    """The live change to every control in `cfg`, on the running chain's input node (`node`, by name, now): pw-cli
+    calls of at most CHUNK controls; or None. Master's gains alone and first when they silence the chain (a mute lands even if a
     later call fails), else last (the voice goes live only after everything else)."""
-    node = _node_id(dump, INPUT)
+    node = _node_id(dump, node)
     if node is None:
         return None
     pairs = [(f"{n['name']}:{k}", v) for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items()]
@@ -457,9 +457,9 @@ def set_params_cmds(dump, cfg):
             for c in chunks]
 
 
-def _live_params(dump):
-    """{node:control: value} the chain's input node reports in its Props in `pw-dump` JSON now ({}: none read)."""
-    props = (((_node(dump, INPUT) or {}).get("info") or {}).get("params") or {}).get("Props")
+def _live_params(dump, node=INPUT):
+    """{node:control: value} the chain's input node `node` reports in its Props in `pw-dump` JSON now ({}: none read)."""
+    props = (((_node(dump, node) or {}).get("info") or {}).get("params") or {}).get("Props")
     return {k: v for p in props if isinstance(p, dict) and isinstance(p.get("params"), list)
             for k, v in zip(p["params"][::2], p["params"][1::2])} if isinstance(props, list) else {}
 
@@ -471,18 +471,19 @@ def _same(want, have):
         return want == have
 
 
-def set_live(cfg, run, dump):
+def set_live(cfg, run, dump, node=INPUT):
     """Every control in `cfg` set on the running chain (set_params_cmds), then read back from pw-dump, never trusted to
     pw-cli's exit status; a call whose controls didn't all land is sent once more. → the controls that didn't land
-    ([]: every one did), or None when the chain's input node isn't there (pw-dump failed): nothing sent."""
-    cmds = set_params_cmds(dump(), cfg)
+    ([]: every one did), or None when the chain's input node isn't there (pw-dump failed): nothing sent. `node`: the
+    chain's input node, Booth Mic's or Booth Stereo's (#19), which runs its own copy of the chain."""
+    cmds = set_params_cmds(dump(), cfg, node)
     if cmds is None:
         return None
     sent = [(c, list(itertools.batched(json.loads(c[4])["params"], 2))) for c in cmds]
     for _ in range(2):
         for cmd, _pairs in sent:
             run(cmd)
-        have = _live_params(dump())
+        have = _live_params(dump(), node)
         sent = [(c, ps) for c, ps in sent if not all(k in have and _same(v, have[k]) for k, v in ps)]
         if not sent:
             return []
