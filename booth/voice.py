@@ -163,10 +163,11 @@ def _running(file):
     return _load(run if run.exists() else file)
 
 
-def loaded(file=None):
-    """verified() narrowed to the plugins the running chain loaded: the stages that process the voice now."""
+def loaded(file=None, found=None):
+    """`found` (verified() now when not given) narrowed to the plugins the running chain loaded: the stages that process
+    the voice now."""
     kept = _plugins(_running(file or path())) or {}
-    return {k: v for k, v in verified().items() if kept.get(k) == v}
+    return {k: v for k, v in (verified() if found is None else found).items() if kept.get(k) == v}
 
 
 def missing(found):

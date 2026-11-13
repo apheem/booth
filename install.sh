@@ -177,8 +177,12 @@ done
 # Booth Mic restarted (only if it runs) when its plugins aren't the ones verified now, so a new stage loads at once. Not
 # with an old Booth still running: its poll would write its own chain back and restart Booth Mic, whose pre-start writes
 # the new one, every few seconds until Booth is closed (the hint below). Left as is, its next start loads them.
-[ -n "$stale" ] || PYTHONPATH=$dest python3 -P -m booth.voice --reload ||
-  echo "install.sh: couldn't restart Booth Mic for its new plugins; they load at its next start" >&2
+if [ -n "$stale" ]; then
+  echo "install.sh: Booth didn't quit, so Booth Mic wasn't restarted for its new plugins; once Booth is closed, run: systemctl --user restart booth-voice.service" >&2
+else
+  PYTHONPATH=$dest python3 -P -m booth.voice --reload ||
+    echo "install.sh: couldn't restart Booth Mic for its new plugins; they load at its next start" >&2
+fi
 state=new
 [ -n "$first" ] || state=$(systemctl --user is-enabled booth.service 2>/dev/null) || true
 # restart, not start: a re-install must run the new copy. Only an explicit "disabled" is the switch turned off; no

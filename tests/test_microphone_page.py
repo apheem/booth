@@ -187,7 +187,7 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "running", lambda: self.running, create=True),
                 # every plugin verifies; self.found: those also in the running chain (voice.loaded), the page's rows
                 mock.patch.object(microphone.voice, "verified", lambda: dict.fromkeys(plugins.MANIFEST, "/verified")),
-                mock.patch.object(microphone.voice, "loaded", lambda: self.found, create=True),
+                mock.patch.object(microphone.voice, "loaded", lambda found=None: self.found, create=True),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst),
                 mock.patch.object(microphone.monitor, "LAST", None, create=True),  # no sync yet this run
@@ -546,25 +546,40 @@ class StageRows(PageCase):
         self.assertEqual(len(self.applied), 1)
 
     def test_a_plugin_missing_or_changed_says_so_and_the_stage_is_bypassed(self):
-        self.page.show(state(), self.page.writer.writes, True, "", ["leveling"])
+        self.page.show(state(), self.page.writer.writes, True, "", {"leveling": microphone.MISSING})
         row = self.stage("leveling")
         self.assertEqual(row.switch.subtitle, microphone.MISSING)
         self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (False, False, False))
         self.assertEqual((self.settings["voice"], self.saved, self.applied), ({}, [], []))  # shown, never saved
         self.assertTrue(self.stage("noise").switch.sensitive)
-        self.page.show(state(), self.page.writer.writes, True, "", [])  # ./install.sh fetched it again
+        self.page.show(state(), self.page.writer.writes, True, "", {})  # ./install.sh fetched it again
         self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (True, True, True))
         self.assertNotEqual(row.switch.subtitle, microphone.MISSING)
 
-    def test_each_poll_checks_the_plugins(self):
-        # RNNoise verifies, but Booth Mic started without it (or it changed since and is bypassed): missing
-        self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
+    def poll_plugins(self):
         idle = ScarlettGroup.real_poll(self, lambda choice: state())
         self.page.poll()
         f, a = idle[0]
         f(*a)
-        self.assertEqual(self.stage("noise").switch.subtitle, microphone.MISSING)
-        self.assertNotEqual(self.stage("limiter").switch.subtitle, microphone.MISSING)
+        return {key: stage.switch.subtitle for key, stage in self.page.stages.items()}
+
+    def test_each_poll_checks_the_plugins(self):
+        # RNNoise doesn't verify (missing, or changed since): bypassed, ./install.sh fetches it again
+        self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
+        with mock.patch.object(microphone.voice, "verified", lambda: self.found):
+            subtitles = self.poll_plugins()
+        self.assertEqual(subtitles["noise"], microphone.MISSING)
+        self.assertEqual(subtitles["limiter"], microphone.STAGES["limiter"][1])
+
+    def test_a_plugin_that_verifies_but_booth_mic_hasnt_loaded_yet_says_it_loads_at_its_restart(self):
+        # an install while an old Booth ran: the plugins are in place, Booth Mic still runs the old chain
+        self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
+        subtitles = self.poll_plugins()
+        self.assertEqual(subtitles["noise"], microphone.PENDING)
+        self.assertIn("loads when Booth Mic restarts", microphone.PENDING)
+        self.assertNotIn("missing", microphone.PENDING.lower())
+        row = self.stage("noise")
+        self.assertEqual((row.switch.active, row.switch.sensitive), (False, False))  # not in the chain yet: dry
 
     def test_the_master_switch_off_greys_every_stage(self):
         self.click(self.page.master, False)

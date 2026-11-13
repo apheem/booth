@@ -255,6 +255,7 @@ class Install(unittest.TestCase):
         calls = self.calls.read_text().splitlines()
         reload = f"systemctl --user try-restart {VOICE_UNITS}"  # only if it runs: its pre-start writes the new chain
         self.assertEqual(calls.count(reload), 1, calls)
+        self.assertNotIn("Booth didn't quit", r.stderr)
         self.assertGreater(calls.index(reload), len(calls) - 1 - calls[::-1].index(OWNER))  # after the old Booth left
         self.assertLess(calls.index(reload), calls.index("systemctl --user restart booth.service"))
 
@@ -271,6 +272,9 @@ class Install(unittest.TestCase):
         self.assertEqual([n["name"] for n in json.loads(conf.read_text())["context.modules"][-1]["args"]["filter.graph"]
                           ["nodes"] if n["type"] == "ladspa"], ["leveling"])  # the running chain's shape, kept
         self.assertIn(STALE + " — close Booth", r.stderr)
+        # never skipped silently: the new plugins wait for Booth Mic's next start, and the user is told how
+        self.assertIn("Booth didn't quit, so Booth Mic wasn't restarted for its new plugins; once Booth is closed, run: "
+                      "systemctl --user restart booth-voice.service", r.stderr)
 
     def test_installs_booth_mic_select_which_runs_the_selector_bound_to_booth_voice(self):
         r = self.install()
