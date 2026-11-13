@@ -7,7 +7,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import meter, scarlett
+from booth import meter, scarlett, voice
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
@@ -129,7 +129,7 @@ Page = type("MicrophoneStandIn", (GObject.Object,), {
 
 class PageCase(unittest.TestCase):
     def setUp(self):
-        self.ran, self.saved, self.dialogs = [], [], []
+        self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
         self.settings = {"microphone": {}}
 
         real_send = scarlett.send
@@ -152,6 +152,8 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.threading, "Thread", Inline),
                 mock.patch.object(microphone.scarlett, "send", send),
                 mock.patch.object(microphone.store, "save", self.saved.append),
+                mock.patch.object(microphone.voice, "apply",
+                                  lambda s, mic: self.applied.append((dict(s["voice"]), mic))),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst)):
             patch.start()
@@ -324,6 +326,60 @@ class ScarlettGroup(PageCase):
         with mock.patch.object(microphone.GLib, "source_remove", removed.append):
             self.page.stop()
         self.assertEqual(removed, [self.page.timer])
+
+
+class VoiceGroup(PageCase):
+    """The Voice processing group: the master switch and the rumble filter, saved and applied live to Booth Mic."""
+
+    def test_both_switches_start_on(self):
+        self.assertEqual((self.page.master.active, self.page.rumble.active), (True, True))
+        self.assertEqual(self.settings["voice"], {})
+
+    def test_saved_switches_are_shown_at_start_and_rumble_waits_on_the_master(self):
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {"enabled": False, "rumble": False}})
+        self.assertEqual((page.master.active, page.rumble.active, page.rumble.sensitive), (False, False, False))
+
+    def test_a_switch_is_saved_and_applied_to_the_mic_the_last_poll_found(self):
+        s = state()
+        self.show(s)
+        self.click(self.page.rumble, False)
+        self.assertEqual((self.settings["voice"], self.saved), ({"rumble": False}, [self.settings]))
+        self.assertEqual(self.applied, [({"rumble": False}, s["mic"])])
+        self.click(self.page.master, False)
+        self.assertEqual(self.applied[-1], ({"rumble": False, "enabled": False}, s["mic"]))
+        self.assertFalse(self.page.rumble.sensitive)
+        self.assertEqual(self.ran, [])  # never the Scarlett
+
+    def test_a_failed_save_says_so_on_the_row_and_still_applies(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.click(self.page.master, False)
+        self.assertEqual(self.page.master.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(len(self.applied), 1)
+        self.click(self.page.master, True)
+        self.assertEqual(self.page.master.subtitle, microphone.MASTER)
+
+    def test_each_poll_says_where_booth_mic_takes_its_input(self):
+        self.show(state())
+        self.assertEqual(self.page.voice.description, voice.describe(state()))
+        self.show(state(**{"PCM 02 Capture Enum": 5}))
+        self.assertEqual(self.page.voice.description, voice.NOT_ROUTED)
+        self.show(None)
+        self.assertEqual(self.page.voice.description, voice.WAITING)
+
+    def test_each_poll_brings_booth_mics_config_up_to_date(self):
+        s = state()
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        self.assertEqual(self.applied, [({}, s["mic"])])
+        self.assertEqual(len(idle), 1)
+
+    def test_an_unplugged_poll_applies_nothing(self):
+        self.real_poll(lambda choice: None)
+        self.page.poll()
+        self.assertEqual(self.applied, [])
+
+    real_poll = ScarlettGroup.real_poll
 
 
 class Meters(PageCase):

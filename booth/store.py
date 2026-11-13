@@ -16,7 +16,8 @@ def defaults():
     # camera: {control name: value}, v4l2 names plus the extension units' "fov" and "led_mode"; re-applied at startup.
     # headphones: {"previous_default": the sink's node name "Use for all sound" replaced, put back when it is turned off}
     # microphone: {"input": "XLR" or "Instrument", the Scarlett input that is the mic; XLR when absent}. Never 48V.
-    return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}}
+    # voice: {"enabled": the Voice processing master switch, "rumble": the rumble filter}, booleans, True when absent.
+    return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}, "voice": {}}
 
 
 def path():
@@ -46,6 +47,9 @@ def load(file=None):
             raise ValueError("not a settings object")
         microphone = data.get("microphone", {})
         if not isinstance(microphone, dict) or microphone.get("input", "XLR") not in ("XLR", "Instrument"):
+            raise ValueError("not a settings object")
+        voice = data.get("voice", {})
+        if not isinstance(voice, dict) or not all(isinstance(voice.get(k, True), bool) for k in ("enabled", "rumble")):
             raise ValueError("not a settings object")
         json.dumps(data, indent=2)  # as save() writes it: nested too deep to save would fail every save after
     except (ValueError, RecursionError):  # bad JSON or UTF-8, wrong shape, nested too deep

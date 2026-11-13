@@ -25,6 +25,9 @@ keeps the open Booth running after its window closes.
 Re-running it replaces the previous install and keeps your "Run in Background" choice: it restarts the service only if
 it is enabled, and never enables one you switched off. A Booth it had to close and didn't restart is named, as is a
 service state it couldn't read (no user bus), with the command to restart it by hand.
+It also writes and enables `~/.config/systemd/user/booth-voice.service`, which runs **Booth Mic** (`pipewire -c
+~/.config/booth/voice.conf`, a config Booth writes from the Scarlett's mic channel) with your PipeWire, whether Booth
+runs or not, and makes Booth Mic the default mic. With no Scarlett seen yet, Booth Mic appears once Booth finds it.
 To check an install matches the repo:
 
     diff -rq -x __pycache__ booth ~/.local/share/booth/booth

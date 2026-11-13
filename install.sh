@@ -74,6 +74,36 @@ RestartSec=5
 WantedBy=graphical-session.target
 EOF
 mv "$units/booth.service.new" "$units/booth.service"
+
+# booth-voice.service runs Booth Mic, the voice chain, as its own PipeWire client from the config Booth writes beside
+# its settings, so Booth Mic stays in a call with Booth closed or crashed. It lives with the user's PipeWire. No config
+# yet (the Scarlett never seen): ExecCondition skips it cleanly. Quoting as for ExecStart above.
+voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+cat > "$units/booth-voice.service.new" <<EOF
+[Unit]
+Description=Booth Mic: the voice chain (a PipeWire filter-chain)
+After=pipewire.service pipewire-session-manager.service
+BindsTo=pipewire.service
+
+[Service]
+ExecCondition=/usr/bin/test -f "$voice_arg"
+ExecStart=/usr/bin/pipewire -c "$voice_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+
+[Install]
+WantedBy=pipewire.service
+EOF
+mv "$units/booth-voice.service.new" "$units/booth-voice.service"
+# Enabled whatever the Run in Background switch says. booth.voice writes the config from the Scarlett now and starts
+# it (restarts it when the config changed). Then Booth Mic is made the default mic by name: WirePlumber picks it as
+# soon as it appears. None of this stops the install: Booth writes the config and starts the service each time it runs.
+systemctl --user daemon-reload && systemctl --user enable booth-voice.service ||
+  echo "install.sh: couldn't enable booth-voice.service (Booth Mic); from your desktop session run: systemctl --user enable --now booth-voice.service" >&2
+PYTHONPATH=$dest python3 -P -m booth.voice || echo "install.sh: couldn't set up Booth Mic (above); Booth tries again when it starts" >&2
+pw-metadata -n default 0 default.configured.audio.source '{ "name": "booth_mic" }' Spa:String:JSON >/dev/null 2>&1 ||
+  echo "install.sh: couldn't make Booth Mic the default mic; choose Booth Mic in Settings → Sound → Input" >&2
 # A running Booth owns its bus name, so the restarted unit's --background would find it and exit 0 with the old code
 # still running: ask it to quit (app.quit; "not running" errors ignored) and wait up to 5 s for the name to go.
 closed=

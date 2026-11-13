@@ -295,7 +295,17 @@ class BackgroundLaunch(unittest.TestCase):
         dongle.connect.assert_called_once_with("changed", stub.on_snd_by_id)
         self.assertIsInstance(stub.dongle, service.Debounce)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
+        stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
         return stub
+
+    def test_sync_voice_writes_booth_mics_config_and_starts_its_service_off_the_main_loop(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}})
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync") as sync:
+            app.Application.sync_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+        sync.assert_called_once_with(stub.settings)
 
     def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
         stub = self.watch(background=True)
