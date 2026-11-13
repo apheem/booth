@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from booth import store
+from booth import store, voice
 
 
 class Store(unittest.TestCase):
@@ -135,8 +135,8 @@ class Store(unittest.TestCase):
 
     def test_the_voice_switches_round_trip(self):
         settings = store.load(self.path)
-        self.assertEqual(settings["voice"], {})  # nothing saved: processing and the rumble filter on
-        settings["voice"].update(enabled=False, rumble=True)
+        self.assertEqual(settings["voice"], voice.PRESETS["Broadcast"])  # nothing saved: the default preset
+        settings["voice"] = {"enabled": False, "rumble": True}
         store.save(settings, self.path)
         self.assertEqual(store.load(self.path)["voice"], {"enabled": False, "rumble": True})
 
@@ -161,7 +161,7 @@ class Store(unittest.TestCase):
         settings = store.load(self.path)
         settings["voice"]["monitor"] = True
         store.save(settings, self.path)
-        self.assertEqual(store.load(self.path)["voice"], {"monitor": True})
+        self.assertEqual(store.load(self.path)["voice"], dict(voice.PRESETS["Broadcast"], monitor=True))
         for text in ('{"voice": {"monitor": 1}}', '{"voice": {"monitor": "on"}}', '{"voice": {"monitor": null}}'):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)  # never a truthy value read as on
@@ -177,6 +177,26 @@ class Store(unittest.TestCase):
                      '{"voice": {"limiter_ceiling": false}}', '{"voice": {"limiter_ceiling": "-1"}}'):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
+
+    def test_the_tone_switch_and_knobs_round_trip(self):
+        settings = store.load(self.path)
+        for warmth, presence, air in ((-12, 0.5, 12), (12.0, -12.0, 0)):
+            settings["voice"].update(tone=False, tone_warmth=warmth, tone_presence=presence, tone_air=air)
+            store.save(settings, self.path)
+            self.assertEqual(store.load(self.path)["voice"], settings["voice"])
+
+    def test_a_bad_tone_value_counts_as_corrupt(self):
+        # the Tone row shows and applies them; a gain out of range would reach the biquad
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"voice": {"tone": 1}}', '{"voice": {"tone": "on"}}', '{"voice": {"tone_warmth": 12.5}}',
+                     '{"voice": {"tone_presence": -12.5}}', '{"voice": {"tone_air": NaN}}',
+                     '{"voice": {"tone_air": true}}', '{"voice": {"tone_warmth": "3"}}',
+                     '{"voice": {"tone_presence": null}}', '{"voice": {"tone_air": Infinity}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
+    def test_fresh_settings_start_on_the_broadcast_preset(self):  # #2: the user's mic is dynamic
+        self.assertEqual(store.load(self.path)["voice"], voice.PRESETS["Broadcast"])
 
     def test_failed_save_keeps_the_previous_file(self):
         old = store.defaults()

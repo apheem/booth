@@ -39,7 +39,7 @@ class _W:
 
     def __init__(self, *_args, **kwargs):
         self.handlers, self.active, self.selected, self.sensitive = {}, False, 0, True
-        self.description, self.subtitle, self.model = None, kwargs.get("subtitle"), None
+        self.description, self.subtitle, self.model = None, kwargs.get("subtitle"), kwargs.get("model")
         self.title, self.adjustment = kwargs.get("title"), kwargs.get("adjustment")
         self.value, self.rows = (self.adjustment or {}).get("value"), []
         self.responses = []
@@ -520,22 +520,29 @@ class VoiceGroup(PageCase):
 
 
 class StageRows(PageCase):
-    """Noise suppression, leveling and the limiter: a switch, one knob and the raw controls each, saved and applied live;
-    a plugin missing or changed shows so and is bypassed."""
+    """Noise suppression, Tone, leveling and the limiter: a switch, its knobs and the raw controls each, saved and
+    applied live; a plugin missing or changed shows so and is bypassed."""
 
     def stage(self, key):
         return self.page.stages[key]
 
-    def test_each_stage_has_a_switch_a_knob_and_its_raw_controls_in_chain_order(self):
-        self.assertEqual(list(self.page.stages), ["noise", "leveling", "limiter"])
-        self.assertEqual([(s.switch.title, s.knob.title) for s in self.page.stages.values()],
-                         [("Noise Suppression", "Strength"), ("Leveling", "Amount"), ("Limiter", "Ceiling (dB)")])
-        self.assertEqual([s.details.title for s in self.page.stages.values()], ["Show details"] * 3)
+    def knob(self, key):
+        return self.page.knobs[key].row
+
+    def test_each_stage_has_a_switch_its_knobs_and_its_raw_controls_in_chain_order(self):
+        self.assertEqual(list(self.page.stages), ["noise", "tone", "leveling", "limiter"])
+        self.assertEqual([s.switch.title for s in self.page.stages.values()],
+                         ["Noise Suppression", "Tone", "Leveling", "Limiter"])
+        self.assertEqual({k: (n.stage, n.row.title) for k, n in self.page.knobs.items()},
+                         {"noise_strength": ("noise", "Strength"), "tone_warmth": ("tone", "Warmth (dB)"),
+                          "tone_presence": ("tone", "Presence (dB)"), "tone_air": ("tone", "Air (dB)"),
+                          "leveling_amount": ("leveling", "Amount"), "limiter_ceiling": ("limiter", "Ceiling (dB)")})
+        self.assertEqual([s.details.title for s in self.page.stages.values()], ["Show details"] * 4)
         self.assertEqual([r.title for r in self.stage("leveling").details.rows], list(voice.amount(50)))
 
     def test_stages_start_on_with_the_default_knobs(self):
-        self.assertEqual([s.switch.active for s in self.page.stages.values()], [True] * 3)
-        self.assertEqual([s.knob.value for s in self.page.stages.values()], [50, 50, -1.0])
+        self.assertEqual([s.switch.active for s in self.page.stages.values()], [True, False, True, True])  # Tone: off
+        self.assertEqual([n.row.value for n in self.page.knobs.values()], [50, 0.0, 0.0, 0.0, 50, -1.0])
         self.assertEqual([r.subtitle for r in self.stage("limiter").details.rows], ["0", "-1", "0.05"])
         self.assertEqual(self.settings["voice"], {})  # nothing saved by showing them
 
@@ -543,13 +550,14 @@ class StageRows(PageCase):
         page = Page()
         microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {
             "noise": False, "noise_strength": 80, "limiter_ceiling": -3.5}})
-        self.assertEqual((page.stages["noise"].switch.active, page.stages["noise"].knob.value,
-                          page.stages["limiter"].knob.value), (False, 80, -3.5))
+        self.assertEqual((page.stages["noise"].switch.active, page.knobs["noise_strength"].row.value,
+                          page.knobs["limiter_ceiling"].row.value), (False, 80, -3.5))
         self.assertEqual(page.stages["noise"].details.rows[0].subtitle, "76")
 
     def test_the_knob_ranges_stay_inside_what_the_settings_accept(self):
-        for s, (lo, hi) in zip(self.page.stages.values(), ((0, 100), (0, 100), (-12, 0))):
-            self.assertEqual((s.knob.adjustment["lower"], s.knob.adjustment["upper"]), (lo, hi))
+        ranges = ((0, 100), (-12, 12), (-12, 12), (-12, 12), (0, 100), (-12, 0))
+        for n, (lo, hi) in zip(self.page.knobs.values(), ranges):
+            self.assertEqual((n.row.adjustment["lower"], n.row.adjustment["upper"]), (lo, hi))
 
     def test_a_stage_switch_is_saved_and_applied_live_never_moving_the_selector(self):
         self.click(self.stage("noise").switch, False)
@@ -557,30 +565,32 @@ class StageRows(PageCase):
         self.assertEqual(self.applied, [({"noise": False}, None)])
 
     def test_a_knob_is_saved_applied_and_its_raw_controls_follow(self):
-        self.stage("noise").knob.set_value(80.0)
+        self.knob("noise_strength").set_value(80.0)
         self.assertEqual(self.settings["voice"], {"noise_strength": 80})
         self.assertIs(type(self.settings["voice"]["noise_strength"]), int)  # the settings accept whole numbers only
         self.assertEqual(self.applied, [({"noise_strength": 80}, None)])
         self.assertEqual(self.stage("noise").details.rows[0].subtitle, "76")
-        self.stage("limiter").knob.set_value(-2.5)
+        self.knob("limiter_ceiling").set_value(-2.5)
         self.assertEqual(self.settings["voice"]["limiter_ceiling"], -2.5)
         self.assertEqual(self.stage("limiter").details.rows[1].subtitle, "-2.5")
 
     def test_a_knob_that_cant_be_saved_says_so_and_still_applies(self):
         with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
-            self.stage("leveling").knob.set_value(70.0)
-        self.assertEqual(self.stage("leveling").knob.subtitle, "Set, but not saved: No space left on device")
+            self.knob("leveling_amount").set_value(70.0)
+        self.assertEqual(self.knob("leveling_amount").subtitle, "Set, but not saved: No space left on device")
         self.assertEqual(len(self.applied), 1)
 
     def test_a_plugin_missing_or_changed_says_so_and_the_stage_is_bypassed(self):
         self.page.show(state(), self.page.writer.writes, True, "", {"leveling": microphone.MISSING})
         row = self.stage("leveling")
         self.assertEqual(row.switch.subtitle, microphone.MISSING)
-        self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (False, False, False))
+        self.assertEqual((row.switch.active, row.switch.sensitive, self.knob("leveling_amount").sensitive),
+                         (False, False, False))
         self.assertEqual((self.settings["voice"], self.saved, self.applied), ({}, [], []))  # shown, never saved
         self.assertTrue(self.stage("noise").switch.sensitive)
         self.page.show(state(), self.page.writer.writes, True, "", {})  # ./install.sh fetched it again
-        self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (True, True, True))
+        self.assertEqual((row.switch.active, row.switch.sensitive, self.knob("leveling_amount").sensitive),
+                         (True, True, True))
         self.assertNotEqual(row.switch.subtitle, microphone.MISSING)
 
     def poll_plugins(self):
@@ -610,11 +620,105 @@ class StageRows(PageCase):
 
     def test_the_master_switch_off_greys_every_stage(self):
         self.click(self.page.master, False)
-        self.assertEqual([(s.switch.sensitive, s.knob.sensitive) for s in self.page.stages.values()],
-                         [(False, False)] * 3)
+        rows = [s.switch for s in self.page.stages.values()] + [n.row for n in self.page.knobs.values()]
+        self.assertEqual([r.sensitive for r in rows], [False] * 10)
         self.click(self.page.master, True)
-        self.assertEqual([(s.switch.sensitive, s.knob.sensitive) for s in self.page.stages.values()],
-                         [(True, True)] * 3)
+        self.assertEqual([r.sensitive for r in rows], [True] * 10)
+
+    def test_the_tone_row_shows_each_bands_raw_biquad_controls_by_node_and_control(self):
+        self.assertEqual([r.title for r in self.stage("tone").details.rows],
+                         [k + ":" + c for k in ("tone_warmth", "tone_presence", "tone_air") for c in ("Freq", "Q", "Gain")])
+        self.assertEqual([r.subtitle for r in self.stage("tone").details.rows[:3]], ["150", "0.707", "0"])
+
+    def test_a_tone_knob_and_switch_are_saved_and_applied_live(self):
+        self.click(self.stage("tone").switch, True)
+        self.knob("tone_presence").set_value(3.5)
+        self.assertEqual(self.settings["voice"], {"tone": True, "tone_presence": 3.5})
+        self.assertIs(type(self.settings["voice"]["tone_presence"]), float)
+        self.assertEqual(self.applied, [({"tone": True}, None), ({"tone": True, "tone_presence": 3.5}, None)])
+        self.assertEqual(self.stage("tone").details.rows[5].subtitle, "3.5")  # tone_presence:Gain
+
+    def test_a_missing_plugin_never_greys_out_tone(self):  # builtin: no plugin to miss
+        self.page.show(state(), self.page.writer.writes, True, "", {"noise": microphone.MISSING})
+        self.assertEqual((self.stage("tone").switch.sensitive, self.knob("tone_air").sensitive), (True, True))
+        self.assertEqual(self.knob("noise_strength").sensitive, False)
+
+
+class Presets(PageCase):
+    """The preset picker: Natural, Broadcast and Noisy room set every stage at once; a knob moved after shows Custom."""
+
+    def pick(self, name):
+        self.select(self.page.preset, microphone.PRESETS.index(name))
+
+    def test_it_lists_the_three_presets_then_custom(self):
+        self.assertEqual(microphone.PRESETS, ["Natural", "Broadcast", "Noisy room", "Custom"])
+        self.assertEqual(self.page.preset.model, microphone.PRESETS)
+
+    def test_it_shows_custom_for_values_no_preset_has_and_the_preset_fresh_settings_hold(self):
+        self.assertEqual(self.page.preset.selected, 3)  # {}: an upgrade's absent values
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": dict(voice.PRESETS["Broadcast"])})
+        self.assertEqual(page.preset.selected, 1)
+
+    def test_a_preset_sets_every_stage_in_one_save_and_one_apply_and_the_rows_show_it(self):
+        self.pick("Noisy room")
+        p = voice.PRESETS["Noisy room"]
+        self.assertEqual((self.settings["voice"], self.saved), (p, [self.settings]))
+        self.assertEqual(self.applied, [(p, None)])
+        self.assertEqual({k: n.row.value for k, n in self.page.knobs.items()}, {k: p[k] for k in self.page.knobs})
+        self.assertEqual({k: s.switch.active for k, s in self.page.stages.items()}, {k: p[k] for k in self.page.stages})
+        self.assertEqual(self.page.rumble.active, p["rumble"])
+        self.assertEqual(self.page.stages["noise"].details.rows[0].subtitle, "81")  # raw follows
+        self.assertEqual(self.page.preset.selected, 2)
+
+    def test_a_preset_never_touches_the_master_switch_or_monitoring(self):
+        self.click(self.page.master, False)
+        self.applied.clear()
+        self.pick("Broadcast")
+        self.assertEqual((self.settings["voice"]["enabled"], self.page.master.active), (False, False))
+        self.assertNotIn("monitor", self.settings["voice"])
+        self.assertEqual(self.monitored, [])
+
+    def test_a_knob_moved_after_a_preset_shows_custom_and_back_on_the_preset_shows_it_again(self):
+        self.pick("Broadcast")
+        self.page.knobs["tone_air"].row.set_value(2.0)
+        self.assertEqual(self.page.preset.selected, 3)
+        self.assertEqual(self.settings["voice"]["tone_air"], 2.0)  # the knob kept, never the preset put back
+        self.page.knobs["tone_air"].row.set_value(4.0)
+        self.assertEqual(self.page.preset.selected, 1)
+
+    def test_picking_custom_changes_nothing(self):
+        self.pick("Broadcast")
+        self.applied.clear()
+        self.saved.clear()
+        self.pick("Custom")
+        self.assertEqual((self.applied, self.saved), ([], []))
+        self.assertEqual(self.settings["voice"], voice.PRESETS["Broadcast"])
+
+    def test_a_preset_with_a_missing_plugin_shows_that_stage_off_and_bypassed(self):
+        self.page.show(state(), self.page.writer.writes, True, "", {"noise": microphone.MISSING})
+        self.pick("Broadcast")
+        self.assertEqual((self.page.stages["noise"].switch.active, self.page.stages["tone"].switch.active),
+                         (False, True))
+
+
+class Throttled(PageCase):
+    """Knob, switch and preset changes reach Booth Mic through one throttle, in a worker: never on the main loop."""
+
+    def test_changes_coalesce_into_one_apply_of_the_latest_in_a_worker(self):
+        workers = []
+        with mock.patch.object(microphone.threading, "Thread",
+                               lambda target, daemon: types.SimpleNamespace(start=lambda: workers.append(target))):
+            for v in (10.0, 20.0, 30.0):
+                self.page.knobs["noise_strength"].row.set_value(v)
+        self.assertEqual((len(workers), self.applied), (1, []))  # nothing applied on the main loop
+        workers[0]()
+        self.assertEqual(self.applied, [({"noise_strength": 30}, None)])
+
+    def test_a_failed_live_change_says_so_on_the_row_that_changed(self):
+        self.said = "not applied: Booth Mic didn't take the change"
+        self.page.knobs["tone_air"].row.set_value(1.5)
+        self.assertEqual(self.page.knobs["tone_air"].row.subtitle, "Set, but " + self.said)
 
 
 class Meters(PageCase):

@@ -20,7 +20,9 @@ longer picks. A backup feeds Booth Mic only while a Booth primary instance runs 
 shutdown stops it (release()), and booth-mic-select.service's ExecCondition (`--select`) never starts one without Booth:
 it removes its config, so Booth Mic is silent until Booth starts, heals and says it.
 Every stage and the master switch is a dry/wet `mixer`, set live with `pw-cli set-param` on booth.mic.input: a switch
-or a knob changes only control values, so it never restarts anything; a new shape restarts both.
+or a knob changes only control values, so it never restarts anything; a new shape restarts both. Tone (#17, builtin
+biquads) is always in the graph, and a preset (PRESETS) is every stage's switch and knob at once: live too. The page sends
+its changes through one Throttle, about 20 a second.
 The plugin stages (STAGES) are in the graph exactly when their plugin verified (booth.plugins) as the chain was built
 for its start: booth-voice.service's ExecStartPre runs `--write`, which writes voice-run.conf, the only file its pipewire
 loads and one nothing else writes, so a plugin changed since is never loaded. voice.conf is what Booth wants (apply's
@@ -131,12 +133,96 @@ def ceiling(db):
 # The plugin stages after the rumble filter, in chain order: (settings key = node name, plugin file, LADSPA label,
 # audio inputs, audio output, the knob's settings key, its default, its mapping). The names are #14's fixture's exactly.
 # The limiter is stereo: the mono chain feeds both its inputs and takes Output 1.
-# #17's tone stage (builtin bq_* filters, no plugin) goes between "noise" and "leveling".
 STAGES = (("noise", "librnnoise_ladspa.so", "noise_suppressor_mono", ("Input",), "Output",
            "noise_strength", 50, strength),
           ("leveling", "sc4m_1916.so", "sc4m", ("Input",), "Output", "leveling_amount", 50, amount),
           ("limiter", "fast_lookahead_limiter_1913.so", "fastLookaheadLimiter", ("Input 1", "Input 2"), "Output 1",
            "limiter_ceiling", -1.0, ceiling))
+# The Tone stage (#17), between "noise" and "leveling": PipeWire's builtin biquads, no plugin, so always in the graph.
+# Its bands in chain order: (node name = its knob's settings key, builtin label, Freq in Hz, Q). Warmth is the voice's
+# body, Presence its intelligibility, Air the top end a dynamic mic rolls off.
+TONE = (("tone_warmth", "bq_lowshelf", 150.0, 0.707), ("tone_presence", "bq_peaking", 4000.0, 1.0),
+        ("tone_air", "bq_highshelf", 10000.0, 0.707))
+
+
+def band(key, db):
+    """A Tone knob, a gain in dB (−12..12, 0 flat) → its biquad's controls: the band's fixed Freq and Q, and Gain = the
+    knob as it is. Control names as PipeWire 1.0.5's builtin bq_* filters have them ("Freq", "Q", "Gain")."""
+    freq, q = next((f, q) for k, _label, f, q in TONE if k == key)
+    return {"Freq": freq, "Q": q, "Gain": float(db)}
+
+
+# What an absent value means: every switch on but Tone, which an upgrade adds off (its sound unchanged); the knobs as
+# STAGES says, the Tone bands flat. Fresh settings start from DEFAULT_PRESET instead (booth.store).
+ABSENT = {"rumble": True, "noise": True, "leveling": True, "limiter": True, "tone": False,
+          **{s[5]: s[6] for s in STAGES}, **{t[0]: 0.0 for t in TONE}}
+# The presets set every stage's switch and knob (never the master switch or monitoring): one apply, all of it live.
+PRESETS = {
+    "Natural": {  # a condenser in a quiet room: it should sound like the mic
+        "rumble": True,  # desk thumps are never wanted
+        "noise": True, "noise_strength": 25,  # hiss and hum only: a light gate keeps soft word ends
+        "tone": False, "tone_warmth": 0.0, "tone_presence": 0.0, "tone_air": 0.0,  # a condenser's own sound
+        "leveling": True, "leveling_amount": 30,  # gentle: evens out, keeps the voice's dynamics
+        "limiter": True, "limiter_ceiling": -1.0},  # a safety net only
+    "Broadcast": {  # a dynamic mic up close (#2: a Shure Beta 57A/58A): the dense, even radio voice
+        "rumble": True,  # a handheld or boom-mounted dynamic picks up thumps
+        "noise": True, "noise_strength": 50,  # a dynamic up close hears little of the room
+        "tone": True,
+        "tone_warmth": 2.0,  # body at 150 Hz, without the boom of leaning in
+        "tone_presence": 3.0,  # 4 kHz: words cut through on a call
+        "tone_air": 4.0,  # a dynamic rolls off above ~10 kHz: this gives the top end back
+        "leveling": True, "leveling_amount": 70,  # dense: quiet and loud words come out alike
+        "limiter": True, "limiter_ceiling": -1.0},  # heavy leveling's peaks never clip
+    "Noisy room": {  # fans, traffic, a keyboard: the voice first, the room as gone as it gets
+        "rumble": True,  # HVAC and traffic rumble
+        "noise": True, "noise_strength": 85,  # mutes the room between words; higher clips soft word ends
+        "tone": True,
+        "tone_warmth": -3.0,  # cuts the room's boom that suppression leaves
+        "tone_presence": 3.0,  # the voice stands out over what noise is left
+        "tone_air": 0.0,  # a lift up top would lift the hiss too
+        "leveling": True, "leveling_amount": 40,  # more would raise the room between words
+        "limiter": True, "limiter_ceiling": -1.0}}
+DEFAULT_PRESET = "Broadcast"  # #2: the user's mic is dynamic (a condenser would take Natural)
+
+
+def preset_of(v):
+    """The preset the voice settings `v` match on every stage (absent: ABSENT), or None: the page shows Custom."""
+    return next((name for name, p in PRESETS.items() if all(v.get(k, ABSENT[k]) == x for k, x in p.items())), None)
+
+
+class Throttle:
+    """Knob changes → `send` (apply(), which reads the settings as they are when it runs, so the latest value wins), in
+    a worker `spawn` starts, never on the caller's thread: at most one send every `gap` s (0.05: about 20 set-params a
+    second while a knob turns); changes that come while it waits or sends coalesce into one, and the last always lands.
+    One per process: the Microphone page's."""
+
+    def __init__(self, send, spawn, gap=0.05, clock=time.monotonic, sleep=time.sleep):
+        self.send, self.spawn, self.gap, self.clock, self.sleep = send, spawn, gap, clock, sleep
+        self.lock, self.dirty, self.busy, self.last = threading.Lock(), False, False, float("-inf")
+
+    def kick(self):
+        with self.lock:
+            self.dirty = True
+            if self.busy:  # the running worker sends it
+                return
+            self.busy = True
+        self.spawn(self.work)
+
+    def work(self):
+        try:
+            while True:
+                self.sleep(max(0.0, self.last + self.gap - self.clock()))
+                with self.lock:  # checked and cleared as one with kick(): a change is never left unsent
+                    if not self.dirty:
+                        self.busy = False
+                        return
+                    self.dirty = False
+                self.last = self.clock()
+                self.send()
+        except BaseException:  # a send that raised: the next change starts a new worker
+            with self.lock:
+                self.busy = False
+            raise
 
 
 def _stat(path, pin):
@@ -209,15 +295,24 @@ def build(settings, found=None):
              {"output": "rumble:Out", "input": "rumble_mix:In 1"},
              {"output": "in:Out", "input": "rumble_mix:In 2"}]
     last = "rumble_mix:Out"
-    for key, file, label, ins, out, knob, default, mapping in STAGES:
-        if file not in found:
-            continue
-        nodes += [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
-                   "control": mapping(v.get(knob, default))},
-                  _mix(f"{key}_mix", v.get(key, True))]
-        links += [{"output": last, "input": f"{key}:{port}"} for port in ins]
-        links += [{"output": f"{key}:{out}", "input": f"{key}_mix:In 1"}, {"output": last, "input": f"{key}_mix:In 2"}]
+
+    def stage(key, series, ins, out):
+        """`series`: the stage's nodes, each fed by the one before; its `<key>_mix` takes the last one's or the dry."""
+        nonlocal last
+        prev = last
+        for n in series:
+            links.extend({"output": prev, "input": f"{n['name']}:{port}"} for port in ins)
+            prev = f"{n['name']}:{out}"
+        nodes.extend(series + [_mix(f"{key}_mix", v.get(key, ABSENT[key]))])
+        links.extend([{"output": prev, "input": f"{key}_mix:In 1"}, {"output": last, "input": f"{key}_mix:In 2"}])
         last = f"{key}_mix:Out"
+    for key, file, label, ins, out, knob, default, mapping in STAGES:
+        if key == "leveling":  # Tone, after noise suppression: no plugin, so in the graph whatever verified
+            stage("tone", [{"type": "builtin", "name": k, "label": lb, "control": band(k, v.get(k, ABSENT[k]))}
+                           for k, lb, _f, _q in TONE], ("In",), "Out")
+        if file in found:
+            stage(key, [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
+                         "control": mapping(v.get(knob, default))}], ins, out)
     nodes.append(_mix("master", v.get("enabled", True)))
     links += [{"output": last, "input": "master:In 1"}, {"output": "in:Out", "input": "master:In 2"}]
     chain = {"node.description": "Booth Mic", "media.name": "Booth Mic",

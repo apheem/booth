@@ -11,11 +11,14 @@ sidebar. Each poll says which channel and node to meter; it runs while either is
 the after-meter, the same Meter on Booth Mic (mono), only while the page itself is on screen: never for the sidebar, so
 a glance at the sidebar never holds Booth Mic, and through it the Scarlett, open.
 
-Below, Voice processing (booth.voice): the master switch, the rumble filter and the plugin stages, each a switch, one
-knob and the raw controls the knob sets. A switch or a knob is saved and applied live to Booth Mic; each poll also brings
-Booth Mic's config up to date with the mic it found (a no-op when nothing changed) and checks the plugins: a stage whose
-plugin is missing or changed says so, greyed out, and is bypassed. Last, processed monitoring's switch (booth.monitor),
+Below, Voice processing (booth.voice): the master switch, the preset picker, the rumble filter, the plugin stages and
+Tone, each a switch, its knobs and the raw controls they set. A switch, a knob or a preset (every stage's switch and
+knob at once; a knob moved after shows Custom) is saved and applied live to Booth Mic through one throttle, in a worker
+(voice.Throttle: about 20 set-params a second, the last change always lands); each poll also brings Booth Mic's config
+up to date with the mic it found (a no-op when nothing changed) and checks the plugins: a stage whose plugin is missing
+or changed says so, greyed out, and is bypassed. Last, processed monitoring's switch (booth.monitor),
 saved and handed to monitor.sync off the main loop."""
+import functools
 import threading
 import types
 
@@ -31,11 +34,17 @@ RUMBLE = "Cuts low rumble and desk thumps below 80 Hz"
 AUTO = "Booth turns it back off when the headset is on again"
 MISSING = "Plugin missing or changed, so it is bypassed: run ./install.sh again"
 PENDING = "Plugin installed: it loads when Booth Mic restarts, bypassed until then"  # verified, not in the running chain
-# Each plugin stage's rows (voice.STAGES's keys): title, subtitle, the knob's title, range, step and digits. The knobs
-# stay inside what the settings accept (booth.store).
-STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room between words", "Strength", 0, 100, 5, 0),
-          "leveling": ("Leveling", "Evens out loud and quiet parts", "Amount", 0, 100, 5, 0),
-          "limiter": ("Limiter", "Keeps your voice from ever clipping", "Ceiling (dB)", -12, 0, 0.5, 1)}
+PRESET = "Sets every stage at once"
+PRESETS = list(voice.PRESETS) + ["Custom"]  # Custom: what no preset matches, never applied
+# Each stage's rows (voice.STAGES's keys and "tone"): title, subtitle.
+STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room between words"),
+          "tone": ("Tone", "Warmth, presence and air"),
+          "leveling": ("Leveling", "Evens out loud and quiet parts"),
+          "limiter": ("Limiter", "Keeps your voice from ever clipping")}
+# Each knob (its settings key): title, range, step and digits, inside what the settings accept (booth.store).
+KNOBS = {"noise_strength": ("Strength", 0, 100, 5, 0), "tone_warmth": ("Warmth (dB)", -12, 12, 0.5, 1),
+         "tone_presence": ("Presence (dB)", -12, 12, 0.5, 1), "tone_air": ("Air (dB)", -12, 12, 0.5, 1),
+         "leveling_amount": ("Amount", 0, 100, 5, 0), "limiter_ceiling": ("Ceiling (dB)", -12, 0, 0.5, 1)}
 
 
 class MicrophonePage(Adw.PreferencesPage):
@@ -91,38 +100,49 @@ class MicrophonePage(Adw.PreferencesPage):
         self.rumble.connect("notify::active", self.on_voice, "rumble", RUMBLE)
         self.monitoring = Adw.SwitchRow(title="Hear Processed Voice in Headphones", subtitle=monitor.LABEL)
         self.monitoring.connect("notify::active", self.on_monitoring)
-        self.stages, self.missing = {}, {}  # {stage: MISSING or PENDING}, from the first poll's plugin check
-        for key, _file, label, _ins, _out, knob, default, mapping in voice.STAGES:
-            title, subtitle, knob_title, lo, hi, step, digits = STAGES[key]
-            value = v.get(knob, default)
-            stage = types.SimpleNamespace(
-                key=key, subtitle=subtitle, knob_key=knob, kind=type(default), mapping=mapping, raw={},
-                switch=Adw.SwitchRow(title=title, subtitle=subtitle),
-                # Adjustment.new: a value set before its range would be clamped to the default 0..0
-                knob=Adw.SpinRow(title=knob_title, digits=digits,
-                                 adjustment=Gtk.Adjustment.new(value, lo, hi, step, step * 4, 0)),
-                details=Adw.ExpanderRow(title="Show details", subtitle=f"What {knob_title.split()[0]} sets on {label}"))
+        self.preset = Adw.ComboRow(title="Preset", subtitle=PRESET, model=Gtk.StringList.new(PRESETS))
+        self.preset.connect("notify::selected", self.on_preset)
+        # every voice change: one apply in a worker, coalesced; voice_row: the row that changed last, told if it failed
+        self.throttle = voice.Throttle(self.apply_voice, lambda work: threading.Thread(target=work, daemon=True).start())
+        self.voice_row = None
+        self.stages, self.knobs, self.missing = {}, {}, {}  # missing: {stage: MISSING or PENDING}, from a poll
+        chain = [(key, label, [(knob, mapping)]) for key, _f, label, _i, _o, knob, _d, mapping in voice.STAGES]
+        chain.insert(1, ("tone", "the builtin biquads", [(k, functools.partial(voice.band, k)) for k, *_ in voice.TONE]))
+        for key, label, knobs in chain:  # in chain order: Tone after noise suppression, as voice.build has it
+            title, subtitle = STAGES[key]
+            stage = types.SimpleNamespace(key=key, subtitle=subtitle, switch=Adw.SwitchRow(title=title, subtitle=subtitle),
+                                          details=Adw.ExpanderRow(title="Show details",
+                                                                  subtitle=f"The raw controls on {label}"))
             stage.switch.connect("notify::active", self.on_voice, key, subtitle)
-            stage.knob.connect("notify::value", self.on_knob, stage)
-            for name in mapping(value):
-                stage.raw[name] = Adw.ActionRow(title=name)
-                stage.details.add_row(stage.raw[name])
-            self.show_raw(stage, value)
+            for k, mapping in knobs:
+                knob_title, lo, hi, step, digits = KNOBS[k]
+                value = v.get(k, voice.ABSENT[k])
+                knob = types.SimpleNamespace(
+                    key=k, stage=key, kind=type(voice.ABSENT[k]), mapping=mapping, raw={},
+                    # Adjustment.new: a value set before its range would be clamped to the default 0..0
+                    row=Adw.SpinRow(title=knob_title, digits=digits,
+                                    adjustment=Gtk.Adjustment.new(value, lo, hi, step, step * 4, 0)))
+                knob.row.connect("notify::value", self.on_knob, knob)
+                for name in mapping(value):  # by node:control where a stage has more than one node
+                    knob.raw[name] = Adw.ActionRow(title=name if len(knobs) == 1 else f"{k}:{name}")
+                    stage.details.add_row(knob.raw[name])
+                self.knobs[k] = knob
             self.stages[key] = stage
         self.quiet = True  # showing the saved state is no change
         self.master.set_active(v.get("enabled", True))
-        self.rumble.set_active(v.get("rumble", True))
-        for stage in self.stages.values():
-            stage.switch.set_active(v.get(stage.key, True))
         self.auto.set_active(settings.setdefault("routing", {}).get(routing.SETTING, True))
         self.monitoring.set_active(v.get("monitor", False))
         self.quiet = False
-        self.sensitize()
+        self.show_voice()
         self.voice.add(self.master)
+        self.voice.add(self.preset)
         self.voice.add(self.rumble)
         for stage in self.stages.values():
-            for row in (stage.switch, stage.knob, stage.details):
-                self.voice.add(row)
+            self.voice.add(stage.switch)
+            for knob in self.knobs.values():
+                if knob.stage == stage.key:
+                    self.voice.add(knob.row)
+            self.voice.add(stage.details)
         self.voice.add(self.monitoring)
         self.add(self.levels)
         self.add(self.group)
@@ -165,12 +185,10 @@ class MicrophonePage(Adw.PreferencesPage):
     def show(self, state, since, selecting=True, said="", missing=None, running=True, source=None):
         self.polling = False
         if missing is not None and missing != self.missing:  # None: not checked, the rows stay as they are
-            self.missing, self.quiet = missing, True
-            for stage in self.stages.values():  # a missing plugin shows off: it is bypassed, whatever was saved
-                stage.switch.set_active(stage.key not in missing and self.settings["voice"].get(stage.key, True))
+            self.missing = missing
+            for stage in self.stages.values():
                 stage.switch.set_subtitle(missing.get(stage.key, stage.subtitle))
-            self.quiet = False
-            self.sensitize()
+            self.show_voice()
         self.record, problem = meter.source(state)
         self.levels.set_description(problem or meter.COACHING)
         if problem:
@@ -308,38 +326,68 @@ class MicrophonePage(Adw.PreferencesPage):
         on = self.master.get_active()
         self.rumble.set_sensitive(on)
         for stage in self.stages.values():
-            for row in (stage.switch, stage.knob):
-                row.set_sensitive(on and stage.key not in self.missing)
+            stage.switch.set_sensitive(on and stage.key not in self.missing)
+        for knob in self.knobs.values():
+            knob.row.set_sensitive(on and knob.stage not in self.missing)
 
-    def show_raw(self, stage, value):
-        for name, raw in stage.mapping(value).items():
-            stage.raw[name].set_subtitle(f"{raw:g}")
+    def show_voice(self):
+        """The saved stage switches, knobs and their raw controls, and the preset they match, shown, never written. A
+        missing plugin's stage shows off: it is bypassed, whatever was saved."""
+        v, self.quiet = self.settings["voice"], True
+        self.rumble.set_active(v.get("rumble", True))
+        for stage in self.stages.values():
+            stage.switch.set_active(stage.key not in self.missing and v.get(stage.key, voice.ABSENT[stage.key]))
+        for knob in self.knobs.values():
+            knob.row.set_value(v.get(knob.key, voice.ABSENT[knob.key]))
+            self.show_raw(knob, v.get(knob.key, voice.ABSENT[knob.key]))
+        self.show_preset()
+        self.quiet = False
+        self.sensitize()
 
-    def on_knob(self, row, _param, stage):
+    def show_preset(self):
+        quiet, self.quiet = self.quiet, True
+        self.preset.set_selected(PRESETS.index(voice.preset_of(self.settings["voice"]) or "Custom"))
+        self.quiet = quiet
+
+    def show_raw(self, knob, value):
+        for name, raw in knob.mapping(value).items():
+            knob.raw[name].set_subtitle(f"{raw:g}")
+
+    def on_knob(self, row, _param, knob):
         if not self.quiet:
-            value = stage.kind(round(row.get_value(), 1))  # a whole number for Strength and Amount, as the store wants
-            self.show_raw(stage, value)
-            self.change(row, stage.knob_key, value, "")
+            value = knob.kind(round(row.get_value(), 1))  # a whole number for Strength and Amount, as the store wants
+            self.show_raw(knob, value)
+            self.change(row, {knob.key: value}, "")
 
     def on_voice(self, row, _param, key, subtitle):
         if not self.quiet:
-            self.change(row, key, row.get_active(), subtitle)
+            self.change(row, {key: row.get_active()}, subtitle)
 
-    def change(self, row, key, value, subtitle):
-        """A switch or a knob: saved, then applied live to Booth Mic off the main loop."""
-        self.settings["voice"][key] = value
+    def on_preset(self, row, _param):
+        i = row.get_selected()
+        if not self.quiet and i < len(voice.PRESETS):  # Custom (or none) sets nothing
+            self.settings["voice"].update(voice.PRESETS[PRESETS[i]])
+            self.show_voice()
+            self.change(row, voice.PRESETS[PRESETS[i]], PRESET)
+
+    def change(self, row, values, subtitle):
+        """A switch, a knob or a preset: saved, then applied live to Booth Mic through the throttle."""
+        self.settings["voice"].update(values)
         self.sensitize()
+        self.show_preset()
         try:
             store.save(self.settings)
             row.set_subtitle(subtitle)
         except OSError as e:  # applied anyway: the user must know it won't last
             row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
+        self.voice_row = row
+        self.throttle.kick()
 
-        def apply():
-            said = voice.apply(self.settings, None)  # a switch never moves the selector: the polls do
-            if said.startswith("not "):  # not recorded: the next poll's apply tries again
-                GLib.idle_add(row.set_subtitle, f"Set, but {said}")
-        threading.Thread(target=apply, daemon=True).start()
+    def apply_voice(self):
+        """The throttle's worker: the settings as they are now, live; a switch never moves the selector: the polls do."""
+        row, said = self.voice_row, voice.apply(self.settings, None)
+        if said.startswith("not "):  # not recorded: the next poll's apply tries again
+            GLib.idle_add(row.set_subtitle, f"Set, but {said}")
 
     def spawn(self, make, done):
         threading.Thread(target=lambda: self.write(make, done), daemon=True).start()

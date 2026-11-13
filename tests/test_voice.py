@@ -1295,5 +1295,235 @@ class Heal(unittest.TestCase):
                          (True, False, False))
 
 
+TONE_PATH = "tone_air(tone_presence(tone_warmth({})))"
+
+
+class Tone(unittest.TestCase):
+    """#17's Tone stage: Warmth, Presence and Air as builtin biquads (no plugin) between noise and leveling, with its
+    own live dry/wet bypass; every knob a control value, so never a restart."""
+
+    def tone_nodes(self, cfg):
+        nodes = module(cfg, "libpipewire-module-filter-chain")["filter.graph"]["nodes"]
+        return {n["name"]: n for n in nodes if n["name"].startswith("tone_") and n["name"] != "tone_mix"}
+
+    def test_tone_sits_between_noise_and_leveling(self):
+        self.assertEqual(flow(config({"voice": {"tone": True}}, FOUND)),
+                         {f"limiter(leveling({TONE_PATH.format('noise(rumble(in))')}))": 1.0})
+
+    def test_tone_needs_no_plugin_so_it_is_always_in_the_graph(self):
+        self.assertEqual(flow(config({"voice": {"tone": True}}, {})), {TONE_PATH.format("rumble(in)"): 1.0})
+
+    def test_tone_off_or_absent_passes_dry_so_an_upgrade_never_changes_the_sound(self):
+        for v in ({}, {"tone": False}, {"tone": False, "tone_warmth": 6.0}):
+            self.assertEqual(flow(config({"voice": v}, FOUND)), {"limiter(leveling(noise(rumble(in))))": 1.0}, v)
+
+    def test_the_bands_are_builtin_shelves_and_a_peak_with_the_exact_control_names(self):
+        nodes = self.tone_nodes(config({"voice": {"tone": True}}))
+        self.assertEqual({k: (n["type"], n["label"]) for k, n in nodes.items()},
+                         {"tone_warmth": ("builtin", "bq_lowshelf"), "tone_presence": ("builtin", "bq_peaking"),
+                          "tone_air": ("builtin", "bq_highshelf")})
+        for n in nodes.values():  # PipeWire 1.0.5's builtin biquad controls, checked live on a test pipewire
+            self.assertEqual(list(n["control"]), ["Freq", "Q", "Gain"])
+            self.assertTrue(all(isinstance(v, float) for v in n["control"].values()))  # pw-cli reads 1 as an Int
+
+    def test_band_maps_a_knob_in_db_to_its_biquad(self):
+        self.assertEqual(voice.band("tone_warmth", 2), {"Freq": 150.0, "Q": 0.707, "Gain": 2.0})
+        self.assertEqual(voice.band("tone_presence", -3.5), {"Freq": 4000.0, "Q": 1.0, "Gain": -3.5})
+        self.assertEqual(voice.band("tone_air", 0), {"Freq": 10000.0, "Q": 0.707, "Gain": 0.0})
+        self.assertIsInstance(voice.band("tone_air", 0)["Gain"], float)
+
+    def test_the_knobs_reach_their_bands_and_absent_is_flat(self):
+        nodes = self.tone_nodes(config({"voice": {"tone_warmth": 3, "tone_presence": -2.5}}))
+        self.assertEqual({k: n["control"] for k, n in nodes.items()},
+                         {"tone_warmth": voice.band("tone_warmth", 3), "tone_presence": voice.band("tone_presence", -2.5),
+                          "tone_air": voice.band("tone_air", 0)})
+
+    def test_tone_switch_and_knobs_never_change_the_shape(self):
+        configs = [config({"voice": {"tone": on, "tone_warmth": g, "tone_presence": -g, "tone_air": g / 2}}, FOUND)
+                   for on in (True, False) for g in (-12.0, 0.0, 12.0)]
+        self.assertEqual(len({json.dumps(voice.shape(c), sort_keys=True) for c in configs}), 1)
+        self.assertEqual(len({json.dumps(c, sort_keys=True) for c in configs}), len(configs))
+
+    def test_a_tone_knob_goes_live_as_node_colon_control_on_the_input_node(self):
+        cmd = voice.set_params_cmd(CHAIN_DUMP, config({"voice": {"tone": True, "tone_presence": 4.5}}, FOUND))
+        self.assertEqual(cmd[:4], ["pw-cli", "set-param", "71", "Props"])
+        params = json.loads(cmd[4])["params"]
+        pairs = dict(zip(params[::2], params[1::2]))
+        self.assertEqual((pairs["tone_presence:Gain"], pairs["tone_presence:Freq"], pairs["tone_presence:Q"]),
+                         (4.5, 4000.0, 1.0))
+        self.assertEqual((pairs["tone_warmth:Gain"], pairs["tone_air:Gain"]), (0.0, 0.0))
+        self.assertEqual((pairs["tone_mix:Gain 1"], pairs["tone_mix:Gain 2"]), (1.0, 0.0))
+
+    def test_a_tone_knob_on_a_running_chain_is_live_never_a_restart(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file, ran = Path(tmp.name) / "voice.conf", []
+        voice.apply({"voice": {"tone": True}}, None, run=lambda c: ran.append(c) or True, dump=lambda: CHAIN_DUMP,
+                    file=file)
+        ran.clear()
+        said = voice.apply({"voice": {"tone": True, "tone_air": 3.0}}, None, run=lambda c: ran.append(c) or True,
+                           dump=lambda: CHAIN_DUMP, file=file)
+        self.assertEqual((said, [c[:3] for c in ran]), ("live", [["pw-cli", "set-param", "71"]]))
+        self.assertIn('"tone_air:Gain", 3.0', ran[0][-1])
+
+    def test_the_services_pre_start_writes_the_saved_tone_values(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file = Path(tmp.name) / "voice-run.conf"
+        settings = {"voice": {"tone": True, "tone_warmth": -4.0, "tone_air": 2.5}}
+        with mock.patch.object(voice.store, "load", lambda: settings):
+            self.assertIsNone(voice.write(file))
+        nodes = self.tone_nodes(json.loads(file.read_text()))
+        self.assertEqual((nodes["tone_warmth"]["control"]["Gain"], nodes["tone_air"]["control"]["Gain"]), (-4.0, 2.5))
+
+
+# Every stage's switch and knob: what a preset must set, all of it
+EVERY = {"rumble", "noise", "noise_strength", "tone", "tone_warmth", "tone_presence", "tone_air", "leveling",
+         "leveling_amount", "limiter", "limiter_ceiling"}
+
+
+class Presets(unittest.TestCase):
+    """Natural, Broadcast and Noisy room: each sets every stage's switch and knob, in one live apply."""
+
+    def test_the_preset_values(self):
+        on = {"rumble": True, "noise": True, "leveling": True, "limiter": True, "limiter_ceiling": -1.0}
+        self.assertEqual(voice.PRESETS, {
+            "Natural": {**on, "noise_strength": 25, "tone": False, "tone_warmth": 0.0, "tone_presence": 0.0,
+                        "tone_air": 0.0, "leveling_amount": 30},
+            "Broadcast": {**on, "noise_strength": 50, "tone": True, "tone_warmth": 2.0, "tone_presence": 3.0,
+                          "tone_air": 4.0, "leveling_amount": 70},
+            "Noisy room": {**on, "noise_strength": 85, "tone": True, "tone_warmth": -3.0, "tone_presence": 3.0,
+                           "tone_air": 0.0, "leveling_amount": 40}})
+
+    def test_every_preset_sets_every_stage_and_never_the_master_or_monitoring(self):
+        for name, p in voice.PRESETS.items():
+            self.assertEqual(set(p), EVERY, name)
+
+    def test_every_preset_is_a_valid_saved_setting(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file = Path(tmp.name) / "settings.json"
+        for name, p in voice.PRESETS.items():
+            voice.store.save({"voice": p}, file)
+            self.assertEqual(voice.store.load(file)["voice"], p, name)
+
+    def test_the_default_is_broadcast_for_the_users_dynamic_mic(self):  # #2: a Shure Beta 57A/58A
+        self.assertEqual(voice.DEFAULT_PRESET, "Broadcast")
+        self.assertEqual(voice.store.defaults()["voice"], voice.PRESETS["Broadcast"])
+        self.assertIsNot(voice.store.defaults()["voice"], voice.PRESETS["Broadcast"])  # a fresh copy
+
+    def test_an_existing_users_saved_values_are_never_replaced_by_the_default(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file = Path(tmp.name) / "settings.json"
+        file.write_text('{"version": 1, "voice": {"noise_strength": 70}}')
+        self.assertEqual(voice.store.load(file)["voice"], {"noise_strength": 70})
+
+    def test_the_page_names_the_preset_the_values_match_and_none_after_a_knob_moved(self):
+        for name, p in voice.PRESETS.items():
+            self.assertEqual(voice.preset_of(dict(p)), name)
+            self.assertEqual(voice.preset_of(dict(p, monitor=True, enabled=False)), name)  # not a stage
+            for k in p:
+                moved = dict(p, **{k: (not p[k]) if isinstance(p[k], bool) else p[k] + 1})
+                self.assertIsNone(voice.preset_of(moved), (name, k))
+        self.assertIsNone(voice.preset_of({}))  # an upgrade's absent values: the old defaults, no preset
+        self.assertEqual(voice.preset_of({k: v for k, v in voice.PRESETS["Broadcast"].items() if k != "rumble"}),
+                         "Broadcast")  # absent: its default, on
+
+    def test_a_preset_is_one_live_set_param_with_every_stage_never_a_restart(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        file, ran = Path(tmp.name) / "voice.conf", []
+        run = lambda c: ran.append(c) or True  # noqa: E731
+        with mock.patch.object(voice, "verified", lambda where=None: FOUND):
+            voice.apply({"voice": dict(voice.PRESETS["Natural"])}, None, run=run, dump=lambda: CHAIN_DUMP, file=file)
+            ran.clear()
+            said = voice.apply({"voice": dict(voice.PRESETS["Noisy room"])}, None, run=run, dump=lambda: CHAIN_DUMP,
+                               file=file)
+        self.assertEqual((said, len(ran), ran[0][:3]), ("live", 1, ["pw-cli", "set-param", "71"]))
+        params = json.loads(ran[0][4])["params"]
+        pairs = dict(zip(params[::2], params[1::2]))
+        self.assertEqual((pairs["noise:VAD Threshold (%)"], pairs["tone_mix:Gain 1"], pairs["tone_warmth:Gain"],
+                          pairs["leveling:Threshold level (dB)"]), (81.0, 1.0, -3.0, -12.0))
+
+
+class Throttle(unittest.TestCase):
+    """Knob changes coalesce: at most one send per gap (about 20 a second), off the caller's thread, the latest value
+    wins and the last change always lands."""
+
+    def setUp(self):
+        self.now, self.sent, self.workers, self.value = 100.0, [], [], 0
+        self.t = voice.Throttle(self.send, self.workers.append, gap=0.05, clock=lambda: self.now, sleep=self.sleep)
+
+    def sleep(self, s):
+        self.assertGreaterEqual(s, 0)
+        self.now += s
+
+    def send(self):
+        self.sent.append((round(self.now, 3), self.value))  # apply() reads the settings when it runs: the latest
+
+    def change(self, value):
+        self.value = value
+        self.t.kick()
+
+    def run_worker(self):
+        self.workers.pop(0)()
+
+    def test_changes_before_the_worker_runs_coalesce_into_one_send_of_the_latest(self):
+        for v in (1, 2, 3):
+            self.change(v)
+        self.assertEqual((len(self.workers), self.sent), (1, []))  # nothing sent on the caller's thread
+        self.run_worker()
+        self.assertEqual(self.sent, [(100.0, 3)])
+
+    def test_changes_while_sending_land_once_a_gap_later(self):
+        def send():
+            self.sent.append((round(self.now, 3), self.value))
+            if len(self.sent) == 1:  # dragged on while pw-cli ran
+                for v in (5, 6, 7):
+                    self.change(v)
+        self.t.send = send
+        self.change(4)
+        self.run_worker()
+        self.assertEqual(self.sent, [(100.0, 4), (100.05, 7)])
+        self.assertEqual(self.workers, [])  # one worker did it all
+
+    def test_never_more_than_one_send_per_gap_and_the_last_value_always_lands(self):
+        def send():
+            self.sent.append((round(self.now, 3), self.value))
+            self.now += 0.01  # pw-cli's own time
+            if self.value < 40:
+                self.change(self.value + 1)
+        self.t.send = send
+        self.change(1)
+        self.run_worker()
+        times = [t for t, _ in self.sent]
+        self.assertTrue(all(b - a >= 0.05 - 1e-9 for a, b in zip(times, times[1:])), times)
+        self.assertEqual(self.sent[-1][1], 40)
+
+    def test_a_change_after_the_worker_finished_starts_one_that_still_waits_the_gap(self):
+        self.change(1)
+        self.run_worker()
+        self.change(2)
+        self.assertEqual(len(self.workers), 1)
+        self.run_worker()
+        self.assertEqual(self.sent, [(100.0, 1), (100.05, 2)])
+
+    def test_a_send_that_raises_never_stops_later_changes(self):
+        def send():
+            raise OSError("pw-cli gone")
+        self.t.send = send
+        self.change(1)
+        with self.assertRaises(OSError):
+            self.run_worker()
+        self.t.send = self.send
+        self.change(2)
+        self.run_worker()
+        self.assertEqual(self.sent[-1][1], 2)
+
+    def test_the_default_gap_is_about_20_a_second(self):
+        self.assertEqual(voice.Throttle(self.send, self.workers.append).gap, 0.05)
+
+
 if __name__ == "__main__":
     unittest.main()
