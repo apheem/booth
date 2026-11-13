@@ -593,6 +593,7 @@ class Verification(unittest.TestCase):
         changed = {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}
         file.write_text(voice.build(ON, FOUND))
         run.write_text(voice.build(ON, changed))
+        os.utime(run, ns=(10**17, 10**17))  # recorded since its start: voice.conf holds what was set live
         with mock.patch.object(voice, "verified", lambda: FOUND):
             self.assertEqual(voice.loaded(file), changed)
             self.assertEqual(voice.apply(ON, None, run=lambda cmd: ran.append(cmd) or True, dump=lambda: CHAIN_DUMP,
@@ -623,6 +624,63 @@ class Verification(unittest.TestCase):
                 plugins.verify("sc4m_1916.so", where, manifest)
             self.assertNotIn(str(where / "sc4m_1916.so"), [n["plugin"] for n in ladspa(json.loads(run.read_text()))],
                              "the file ExecStart's pipewire reads names a plugin that fails verify()")
+
+
+class KeptRunConf(unittest.TestCase):
+    """booth-voice's pre-start can't replace voice-run.conf (disk full) and Booth Mic starts on the one there."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.file = Path(tmp.name) / "voice.conf"
+        self.run_conf = self.file.with_name(voice.RUN_CONF)
+
+    def full_disk(self, settings):
+        return mock.patch.multiple(voice.store, load=lambda: settings,
+                                   save=mock.Mock(side_effect=OSError(28, "No space left on device")))
+
+    def test_a_kept_run_conf_with_older_values_gets_the_saved_ones_live_once(self):
+        """Booth set processing off live and recorded it; Booth Mic restarts on a full disk on its older run conf
+        (processing on): the next apply sends off live, then leaves it."""
+        off = {"voice": {"enabled": False}}
+        self.file.write_text(voice.build(off, FOUND))
+        os.utime(self.file, ns=(10**18, 10**18))  # recorded before Booth Mic's start
+        self.run_conf.write_text(voice.build(ON, FOUND))
+        os.utime(self.run_conf, ns=(10**17, 10**17))  # written at an earlier start
+        ran = []
+        with mock.patch.object(voice, "verified", lambda where=None: FOUND):
+            with self.full_disk(off):
+                self.assertTrue(voice.write(self.run_conf).startswith("kept"))  # exit 0: starts on processing ON
+            said = voice.apply(off, None, run=lambda c: ran.append(c) or True, dump=lambda: CHAIN_DUMP, file=self.file)
+            self.assertEqual(([c[:3] for c in ran], said), ([["pw-cli", "set-param", "71"]], "live"))
+            self.assertIn('"master:Gain 1", 0.0', ran[0][-1])
+            ran.clear()
+            self.assertEqual(voice.apply(off, None, run=lambda c: ran.append(c) or True, dump=lambda: CHAIN_DUMP,
+                                         file=self.file), "unchanged")
+        self.assertEqual(ran, [])
+        self.assertEqual(self.run_conf.read_text(), voice.build(ON, FOUND))  # never written by apply
+
+    def test_a_run_conf_of_another_shape_is_never_kept_so_booth_mic_is_restarted_once(self):
+        """New code (a new shape), voice.conf saved, the run conf can't be replaced: kept, Booth Mic would run the old
+        shape and every poll's apply try-restart it again."""
+        self.file.write_text(voice.build(ON, FOUND))
+        old = json.loads(voice.build(ON, FOUND))
+        module(old, "libpipewire-module-filter-chain")["filter.graph"]["nodes"].append(
+            {"type": "builtin", "name": "oldnode", "label": "copy"})
+        self.run_conf.write_text(json.dumps(old))
+        running, restarts = [True], []
+
+        def run(cmd):  # systemd: a failed pre-start leaves the unit stopped; try-restart restarts only a running one
+            if cmd == RESTART and running[0]:
+                restarts.append(voice.write(self.run_conf))
+                running[0] = not restarts[-1].startswith("not ")
+                return running[0]
+            return True
+        with mock.patch.object(voice, "verified", lambda where=None: FOUND), self.full_disk(ON):
+            for _ in range(3):
+                voice.apply(ON, None, run=run, dump=lambda: CHAIN_DUMP, file=self.file)
+        self.assertEqual(restarts, ["not saved: No space left on device"])
+        self.assertEqual(json.loads(self.run_conf.read_text()), old)
 
 
 class Apply(unittest.TestCase):
@@ -776,6 +834,14 @@ class Apply(unittest.TestCase):
         self.assertEqual(voice.apply(ON, instrument, run=lambda cmd: self.ran.append(cmd) or cmd != ACTIVE,
                                      dump=lambda: CHAIN_DUMP, file=self.file), "unchanged")
         self.assertEqual(self.ran, [])
+
+    def test_a_selector_that_wont_stop_while_booth_mic_is_stopped_says_it_may_take_the_old_channel(self):
+        self.apply()
+        instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
+        said = voice.apply(ON, instrument, run=lambda cmd: cmd not in (ACTIVE, STOP_SELECT), dump=lambda: CHAIN_DUMP,
+                           file=self.file)
+        self.assertTrue(said.startswith("not stopped"), said)
+        self.assertEqual(voice.describe(instrument, True, said, running=False), voice.STALE)
 
     def test_plugins_are_verified_and_the_chain_written_while_holding_the_lock(self):
         """The last apply wins: the plugins verified just before its write, never another thread's in between."""

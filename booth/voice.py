@@ -38,6 +38,7 @@ both are missing (loaded()). A new shape (new code) restarts both services, neve
                                       booth-mic-select.service's ExecCondition: may_select (exit 0) or not (1)"""
 import copy
 import json
+import os
 import sys
 import threading
 import time
@@ -342,6 +343,13 @@ def _save(cfg, file):
     return None
 
 
+def _mtime(file):
+    try:
+        return file.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
 def _put_back(file, text):
     """`file` as it was (None: absent), so the next apply sees its change again and retries it."""
     try:
@@ -393,7 +401,11 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             if shape(same) == shape(now):  # nothing else changed: no restart; its next start loads what verifies
                 chain = same
         restart = shape(now) != shape(chain)
-        if old != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
+        # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
+        # kept run conf holds older ones), else voice.conf's, what apply set live since
+        live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
+        changed = old != chain or live != chain
+        if live != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
             said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
@@ -405,12 +417,12 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
         # the selector's own save first: a chain change that fails never holds back a new channel
         sel_said = sel is not None and sel != _load(select_file) and _save(sel, select_file)
         moved = sel_said is None
-        if old != chain and not said:
+        if changed and not said:  # also when only the run conf was behind: recorded newer, so sent once
             said = _save(chain, file)
         restart = restart and not said  # a chain that isn't written: nothing new to restart it with
         said = said or sel_said or None
         if not (restart or moved):
-            return said or ("live" if old != chain else "unchanged")
+            return said or ("live" if changed else "unchanged")
         # RESTART_SELECT: Booth Mic, and a call's link to it, stay; never with Booth Mic stopped (or starting), which
         # it would start (BindsTo): the new selector config stays, for whatever starts it next
         if not restart and not run(ACTIVE):
@@ -531,12 +543,19 @@ def write(file=None, where=None):
     """booth-voice.service's ExecStartPre: voice-run.conf (`file`: the one its pipewire loads) from the saved settings
     and the plugins verified now in `where`, so a plugin changed since the last write is never loaded. No systemctl, no
     Scarlett: the unit is starting. None; "kept …" when it can't be written but the one there loads only plugins
-    verified now, at their verified paths (Booth Mic starts on it); "not …": then the unit doesn't start."""
-    file, found = file or path().with_name(RUN_CONF), verified(where)
-    cfg = json.loads(build(store.load(), found))
+    verified now, at their verified paths, in the shape this code builds from them (else every apply would restart it):
+    Booth Mic starts on it, touched so apply sends it the saved values live; "not …": then the unit doesn't start."""
+    file, found, settings = file or path().with_name(RUN_CONF), verified(where), store.load()
+    cfg = json.loads(build(settings, found))
     said = None if _load(file) == cfg else _save(cfg, file)
-    kept = _plugins(_load(file)) if said else None
-    if kept is not None and all(found.get(k) == v for k, v in kept.items()):
+    on_disk = _load(file) if said else None
+    kept = _plugins(on_disk)
+    if (kept is not None and all(found.get(k) == v for k, v in kept.items())
+            and shape(on_disk) == shape(json.loads(build(settings, kept)))):
+        try:
+            os.utime(file)  # newer than voice.conf: its values may be older than what Booth set live
+        except OSError:
+            pass
         return f"kept the last config, {said}"
     return said
 

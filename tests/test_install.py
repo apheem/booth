@@ -211,7 +211,7 @@ class Install(unittest.TestCase):
     def test_a_reinstall_takes_group_write_off_the_folders_an_older_install_left_group_writable(self):
         for d in (self.app.parent, self.home / ".config/booth"):
             d.mkdir(parents=True)
-            d.chmod(0o775)
+            d.chmod(0o777)  # writable by anyone: a umask 0 install, or a chmod by hand
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual([oct(d.stat().st_mode & 0o777) for d in (self.app.parent, self.home / ".config/booth")],
                          ["0o755", "0o755"])
