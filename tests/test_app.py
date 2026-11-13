@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import signal
 import tempfile
 import threading
 import unittest
@@ -10,7 +11,7 @@ from unittest import mock
 
 from gi.repository import Gio, GLib
 
-from booth import app, camera, service, store
+from booth import app, camera, routing, service, store, voice
 from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_service import Clock, Timers
@@ -290,14 +291,19 @@ class BackgroundLaunch(unittest.TestCase):
         with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get), \
                 mock.patch.object(app.GLib, "timeout_add_seconds") as every, \
                 mock.patch.object(app.routing, "Executor") as executor, \
+                mock.patch.object(app.GLib, "unix_signal_add") as signal_add, \
                 mock.patch.object(app.GLib, "idle_add", idle_add):
             app.Application.watch(stub)
+            # logout stops booth.service with SIGTERM: quit, so shutdown stops a backup selector (#20)
+            signal_add.assert_called_once_with(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stub.quit)
             # the routing policy follows the PRO X in every primary instance, subscribed before the first poll, from
             # the saved move (a restart while moved still puts it back); its notifications and saves go to the main loop
             (settings, notify, save), = [c.args for c in executor.call_args_list]
             self.assertIs(stub.routing, executor.return_value)
-            self.assertEqual(stub.headset_monitor.mock_calls[:2],
-                             [mock.call.listeners.append(executor.return_value.listener), mock.call.poll()])
+            # and the mic fallback (#20): the PRO X on or off pokes a heal, also from the first reading
+            self.assertEqual(stub.headset_monitor.mock_calls[:3],
+                             [mock.call.listeners.append(executor.return_value.listener),
+                              mock.call.listeners.append(stub.on_headset), mock.call.poll()])
             notify("PRO X off")
             self.assertIs(save({}), stub.save_routing.return_value)  # waited for: the write-ahead needs the answer
         self.assertIs(settings, stub.settings)  # the saved record and the user's switch, read at each step
@@ -316,8 +322,12 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertIs(stub.snd_monitor, dongle)
         dongle.connect.assert_called_once_with("changed", stub.on_snd_by_id)
         self.assertIsInstance(stub.dongle, service.Debounce)
+        self.assertIsInstance(stub.mic_poke, service.Debounce)  # a burst of sound-card events: one heal after it
+        self.assertIs(stub.mic_poke.fire, stub.heal_voice)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
         stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
+        calls = [c[0] for c in stub.mock_calls]  # the mic running now said before sync_voice may move the selector
+        self.assertLess(calls.index("mic_at_start"), calls.index("sync_voice"))
         return stub
 
     def test_sync_voice_writes_booth_mics_config_and_starts_its_service_off_the_main_loop(self):
@@ -351,17 +361,21 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertFalse(stub.healing)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
-        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False, mic={})
         stub.heal_once = lambda: app.Application.heal_once(stub)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.voice, "heal") as heal:
             self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
             heal.assert_not_called()
             threads[0]()
-        heal.assert_called_once_with(stub.settings)  # the chosen input: heal reads the Scarlett's routing itself
+        (settings,), kwargs = heal.call_args  # the chosen input: heal reads the Scarlett's routing itself
+        self.assertIs(settings, stub.settings)
+        for on in (True, False, None):  # None: not answered yet, which choose() tells from off
+            stub.headset_monitor.on = on
+            self.assertIs(kwargs["on"](), on)
 
     def test_a_slow_heal_is_never_overlapped_by_the_next_tick(self):
-        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False, mic={})
         stub.heal_once = lambda: app.Application.heal_once(stub)
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.voice, "heal") as heal:
@@ -673,6 +687,116 @@ class HeadsetBattery(unittest.TestCase):
         notification.new.assert_called_once_with("Headset battery low")
         notification.new.return_value.set_body.assert_called_once_with("PRO X Wireless is at ~13 % (est.).")
         stub.send_notification.assert_called_once_with("headset-battery", notification.new.return_value)
+
+
+class MicFallback(unittest.TestCase):
+    """#20: after each heal the routing policy's mic rule sees what heal chose; a move is notified, shown in the sidebar
+    and on the Microphone page's banner at once; a return to the Scarlett not settled yet is looked at again ~2 s later."""
+
+    def heal_once(self, mic, chosen, running=True):
+        stub, idle = mock.Mock(settings={}, mic=mic, healing=True), []
+        with mock.patch.object(app.voice, "heal"), mock.patch.object(app.monitor, "sync"), \
+                mock.patch.object(app.voice, "running", return_value=running), \
+                mock.patch.object(app.voice, "CHOSEN", chosen, create=True), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            app.Application.heal_once(stub)
+        self.assertFalse(stub.healing)
+        return stub, idle
+
+    def test_a_first_sight_of_the_return_pokes_another_heal_soon(self):
+        stub, idle = self.heal_once({"said": voice.PRO_X_MIC}, voice.SCARLETT)
+        self.assertEqual(stub.mic, {"said": voice.PRO_X_MIC, "seen": voice.SCARLETT})
+        self.assertEqual(idle, [(stub.mic_poke.poke, ())])  # Debounce: a GLib timer, so on the main loop
+
+    def test_a_move_to_a_backup_goes_to_the_main_loop_on_the_heal_that_made_it(self):
+        stub, idle = self.heal_once({}, voice.PRO_X_MIC)
+        self.assertEqual(stub.mic, {"said": voice.PRO_X_MIC})
+        self.assertEqual(idle, [(stub.mic_moved, ([("notify", routing.MIC_SAID[voice.PRO_X_MIC]),
+                                                   ("label", voice.PRO_X_MIC)],))])
+
+    def test_booth_mic_not_running_is_its_own_source(self):  # #15's seam: a call may have moved to another mic
+        stub, _ = self.heal_once({}, voice.SCARLETT, running=False)
+        self.assertEqual(stub.mic["seen"], routing.DOWN)
+
+    def test_a_change_is_notified_replacing_the_last_and_shown_in_the_window(self):
+        stub = mock.Mock()
+        with mock.patch.object(app.Gio, "Notification") as notification:
+            app.Application.mic_moved(stub, [("notify", "said"), ("label", voice.BRIO_MIC)])
+        notification.new.assert_called_once_with("said")
+        stub.send_notification.assert_called_once_with("booth-mic", notification.new.return_value)
+        self.assertEqual(stub.mic_source, voice.BRIO_MIC)  # a window opened later shows it too
+        stub.window.show_mic.assert_called_once_with(voice.BRIO_MIC, True)
+        stub.window = None
+        app.Application.mic_moved(stub, [("label", voice.SCARLETT)])  # no window: nothing else to show
+
+    def test_a_backup_left_running_is_said_and_shown_at_start(self):  # the rule starts from what runs
+        for backup in (voice.PRO_X_MIC, voice.BRIO_MIC):
+            stub = mock.Mock(mic={})
+            with mock.patch.object(app.voice, "current", return_value=backup, create=True):
+                app.Application.mic_at_start(stub)
+            self.assertEqual(stub.mic, {"said": backup})  # a later return to the Scarlett is said
+            stub.mic_moved.assert_called_once_with([("notify", routing.MIC_SAID[backup]), ("label", backup)])
+
+    def test_the_scarlett_or_no_selector_at_start_says_nothing(self):
+        for running in (voice.SCARLETT, None):
+            stub = mock.Mock(mic={})
+            with mock.patch.object(app.voice, "current", return_value=running, create=True):
+                app.Application.mic_at_start(stub)
+            self.assertEqual(stub.mic, {})
+            stub.mic_moved.assert_not_called()
+
+    def test_quitting_stops_a_backup_selector_in_every_primary_instance(self):
+        stub = mock.Mock()
+        with mock.patch.object(app.voice, "release", create=True) as release, \
+                mock.patch.object(app.Adw.Application, "do_shutdown") as shutdown:
+            app.Application.do_shutdown(stub)
+        release.assert_called_once_with()
+        shutdown.assert_called_once_with(stub)
+
+    def test_the_bus_name_the_selector_unit_asks_for_is_the_apps(self):
+        self.assertEqual(app.APP_ID, service.APP_ID)
+
+    def test_the_headset_on_or_off_pokes_a_heal(self):
+        stub = mock.Mock()
+        for event in ("battery", "ack"):
+            app.Application.on_headset(stub, event)
+        stub.mic_poke.poke.assert_not_called()
+        for event in ("on", "off"):
+            app.Application.on_headset(stub, event)
+        self.assertEqual(stub.mic_poke.poke.call_count, 2)
+
+    def test_any_sound_card_coming_or_going_pokes_a_heal(self):
+        stub = mock.Mock()
+        scarlett = Gio.File.new_for_path("/dev/snd/by-id/usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00")
+        for event in (Gio.FileMonitorEvent.CREATED, Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.MOVED_OUT):
+            app.Application.on_snd_by_id(stub, None, scarlett, None, event)
+        app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path("/dev/snd/by-id/.#tmp"), scarlett,
+                                     Gio.FileMonitorEvent.RENAMED)  # udev's link, made under a temp name
+        app.Application.on_snd_by_id(stub, None, scarlett, Gio.File.new_for_path("/dev/snd/.tmp"),
+                                     Gio.FileMonitorEvent.MOVED_IN)
+        self.assertEqual(stub.mic_poke.poke.call_count, 5)
+        app.Application.on_snd_by_id(stub, None, scarlett, None, Gio.FileMonitorEvent.CHANGES_DONE_HINT)
+        self.assertEqual(stub.mic_poke.poke.call_count, 5)
+
+    def test_a_window_opened_while_on_a_backup_shows_it_in_the_sidebar_and_the_banner(self):
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.BRIO_MIC)
+        with mock.patch.object(app, "Window") as window:
+            app.Application.show_window(stub, {"camera": {}}, None, {}, False)
+        window.return_value.show_mic.assert_called_once_with(voice.BRIO_MIC)  # show_mic: the label and the banner
+
+    def test_the_window_shows_the_mic_in_the_sidebar_and_a_change_in_the_banner(self):
+        win = mock.Mock()
+        ui_window.Window.show_mic(win, voice.PRO_X_MIC)  # opened while on a backup: the banner says so
+        win.mic_label.set_label.assert_called_once_with("Booth Mic · from PRO X mic")
+        win.mic_banner.set_title.assert_called_once_with(routing.MIC_SAID[voice.PRO_X_MIC])
+        win.mic_banner.set_revealed.assert_called_once_with(True)
+        win.reset_mock()
+        ui_window.Window.show_mic(win, voice.SCARLETT)  # opened on the Scarlett: nothing to say
+        win.mic_banner.set_revealed.assert_called_once_with(False)
+        win.reset_mock()
+        ui_window.Window.show_mic(win, voice.SCARLETT, True)  # the return: said too
+        win.mic_banner.set_title.assert_called_once_with(routing.MIC_SAID[voice.SCARLETT])
+        win.mic_banner.set_revealed.assert_called_once_with(True)
 
 
 class RunInBackgroundSwitch(unittest.TestCase):

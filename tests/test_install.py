@@ -278,11 +278,41 @@ class Install(unittest.TestCase):
         unit = (self.unit.parent / "booth-mic-select.service").read_text().splitlines()
         conf = self.home / ".config/booth/voice-select.conf"
         self.assertIn(f'ExecStart=/usr/bin/pipewire -c "{conf}"', unit)
-        self.assertIn(f'ExecCondition=/usr/bin/test -f "{conf}"', unit)  # no mic channel seen yet: skipped
+        self.assertNotIn("ExecCondition=-", "\n".join(unit))
         self.assertIn("BindsTo=booth-voice.service", unit)  # it feeds Booth Mic's input: never runs without it
         self.assertIn("After=booth-voice.service", unit)
         self.assertIn("WantedBy=booth-voice.service", unit)
         self.assertIn("Restart=on-failure", unit)
+
+    def condition(self):
+        """booth-mic-select.service's ExecCondition as argv: systemd's %% and $$ undone, then its quoted words split."""
+        line = next(ln for ln in (self.unit.parent / "booth-mic-select.service").read_text().splitlines()
+                    if ln.startswith("ExecCondition="))
+        return shlex.split(line.removeprefix("ExecCondition=").replace("%%", "%").replace("$$", "$"))
+
+    def test_booth_mic_select_never_starts_a_backup_mic_without_booth_running(self):
+        """#20: a backup (the BRIO's room mic, the PRO X's) feeds a call only while Booth runs to say so. Left by a Booth
+        that exited, the installed code refuses it at start and removes it: Booth Mic is silent until Booth says why."""
+        self.assertEqual(self.install().returncode, 0)
+        conf = self.home / ".config/booth/voice-select.conf"
+        argv = self.condition()
+        self.assertEqual(argv, ["/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.voice",
+                                "--select", str(conf)])  # the installed copy, never the repo
+        brio = {"node": "alsa_input.usb-046d_Logitech_BRIO_FAKESER1-03.analog-stereo", "position": "FL",
+                "channel": None}
+        scarlett_mic = {"node": "alsa_input.usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00.pro-input-0",
+                        "position": "FR", "channel": 2}
+
+        def start(mic, owned):
+            if mic:
+                conf.write_text(voice.build_selector(mic))
+            env = dict(self.env, OWNED_POLLS="99" if owned else "0")  # Booth's bus name owned, or not
+            return subprocess.run(argv, env=env, cwd=self.home, capture_output=True, text=True, timeout=60).returncode
+        self.assertEqual((start(brio, owned=True), conf.exists()), (0, True))  # Booth runs: it says it
+        self.assertEqual((start(brio, owned=False), conf.exists()), (1, False))  # skipped, and gone for good
+        self.assertEqual((start(scarlett_mic, owned=False), conf.exists()), (0, True))  # login, no Booth yet
+        conf.unlink()
+        self.assertEqual(start(None, owned=True), 1)  # no config yet: skipped, never a failure
 
     def test_installs_booth_monitor_which_only_booth_starts_and_which_never_pulls_booth_mic_up(self):
         r = self.install()
@@ -531,7 +561,6 @@ class Install(unittest.TestCase):
         for u, key, conf in ((voice_unit, "ExecStart=/usr/bin/pipewire -c", "voice-run.conf"),
                              (voice_unit, "ExecCondition=/usr/bin/test -f", "voice.conf"),
                              (select_unit, "ExecStart=/usr/bin/pipewire -c", "voice-select.conf"),
-                             (select_unit, "ExecCondition=/usr/bin/test -f", "voice-select.conf"),
                              (monitor_unit, "ExecStart=/usr/bin/pipewire -c", "monitor.conf"),
                              (monitor_unit, "ExecCondition=/usr/bin/test -f", "monitor.conf")):
             line = next(ln for ln in u.read_text().splitlines() if ln.startswith(key))
@@ -547,6 +576,12 @@ class Install(unittest.TestCase):
         self.assertEqual([re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], w) for w in m.groups()],
                          [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice-run.conf"),
                           str(self.home / ".local/share/booth/plugins")])
+        line = next(ln for ln in select_unit.read_text().splitlines() if ln.startswith("ExecCondition="))
+        m = re.fullmatch(rf'ExecCondition=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
+                         rf'booth\.voice --select {word}', line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual([re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], w) for w in m.groups()],
+                         [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice-select.conf")])
         self.unit = unit
         pre = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
         self.assertEqual(pre.returncode, 0, pre.stderr)  # the installed copy found, whatever the home's name

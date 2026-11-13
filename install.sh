@@ -112,7 +112,8 @@ EOF
 mv "$units/booth-voice.service.new" "$units/booth-voice.service"
 # booth-mic-select.service runs Booth Mic's source selector (the Scarlett's mic channel into Booth Mic's input) as a
 # separate process, so a new mic channel or Scarlett node restarts only it, never Booth Mic. It never runs without
-# booth-voice.service (BindsTo) and starts with it (WantedBy).
+# booth-voice.service (BindsTo) and starts with it (WantedBy). Its ExecCondition, the installed booth.voice, skips it
+# with no config, and refuses (and removes) a backup mic's config unless Booth runs to say it (#20).
 cat > "$units/booth-mic-select.service.new" <<EOF
 [Unit]
 Description=Booth Mic's source: the Scarlett's mic channel (a PipeWire loopback)
@@ -120,7 +121,7 @@ After=booth-voice.service
 BindsTo=booth-voice.service
 
 [Service]
-ExecCondition=/usr/bin/test -f "$select_arg"
+ExecCondition=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --select "$select_arg"
 ExecStart=/usr/bin/pipewire -c "$select_arg"
 Restart=on-failure
 RestartSec=5

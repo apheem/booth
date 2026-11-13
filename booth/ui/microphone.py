@@ -146,11 +146,12 @@ class MicrophonePage(Adw.PreferencesPage):
     def read(self, since):
         state, selecting, said, missing, running = None, True, "", None, True
         try:
-            state = scarlett.read(self.choice())
-            if state:  # unplugged: the running chain keeps its last config
-                said = voice.apply(self.settings, state)  # not routed: the selector stops
-                selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
-                running = selecting or voice.running()  # the selector runs only with Booth Mic (BindsTo)
+            with voice._LOCK:  # read and applied as one: never a stale Scarlett written over a backup heal moved to
+                state = scarlett.read(self.choice())
+                if state:  # unplugged: the running chain keeps its last config
+                    said = voice.apply(self.settings, state)  # not routed: the selector stops
+                    selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
+                    running = selecting or voice.running()  # the selector runs only with Booth Mic (BindsTo)
             missing = voice.missing(voice.loaded())  # verified and running: one verified since waits for a restart
         finally:  # always: show() clears polling, else the page stops following outside changes
             GLib.idle_add(self.show, state, since, selecting, said, missing, running)

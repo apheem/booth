@@ -4,6 +4,7 @@ Every primary instance keeps the camera's saved settings applied: at launch, and
 `booth --background` (booth.service, at login) does it with no window. A plain launch while Booth runs shows the window
 in that same process (GApplication is single-instance over D-Bus). With "Run in background" on, the process is held:
 closing the window leaves it running."""
+import signal
 import sys
 import threading
 import traceback
@@ -17,7 +18,7 @@ from gi.repository import Adw, Gio, GLib  # noqa: E402
 from booth import camera, devices, headset, monitor, routing, service, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
-APP_ID = "io.github.apheem.Booth"
+APP_ID = service.APP_ID
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
 RESTORING = camera.WRITING  # the startup, replug and window-open restores and the page's writes never interleave
 BATTERY_S = 10  # the PRO X battery poll: also how soon "headset off" is noticed
@@ -83,6 +84,7 @@ class Application(Adw.Application):
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.snd_monitor, self.dongle, self.healing = None, None, False
+        self.mic, self.mic_source, self.mic_poke = {}, voice.SCARLETT, None  # #20: the mic rule's state, what it said
         self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # watch() subscribes the routing
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
@@ -128,13 +130,20 @@ class Application(Adw.Application):
         self.snd_monitor = Gio.File.new_for_path(devices.SND_BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES,
                                                                                        None)
         self.snd_monitor.connect("changed", self.on_snd_by_id)
+        # Booth Mic's mic fallback (#20) within seconds, not at the next tick: a heal once a sound card's (the
+        # Scarlett's, the BRIO's, the dongle's) burst of links settles, or the PRO X turns on or off
+        self.mic_poke = service.Debounce(REPLUG_MS, self.heal_voice, GLib.timeout_add, GLib.source_remove)
+        # logout stops booth.service with SIGTERM: quit, so do_shutdown stops a backup selector no Booth would say
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.quit)
         self.fix_headset()
+        self.mic_at_start()  # before sync_voice, which may move the selector
         self.sync_voice()
         # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
         # before the first poll, whose reading is the startup transition
         self.routing = routing.Executor(self.settings, lambda text: GLib.idle_add(self.routed, text),
                                         lambda state: on_main(self.save_routing, state))
         self.headset_monitor.listeners.append(self.routing.listener)
+        self.headset_monitor.listeners.append(self.on_headset)
         self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
         GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
         GLib.timeout_add_seconds(BATTERY_S, self.routing.retry)  # a rule not settled yet (the PRO X sink not back) again
@@ -144,6 +153,18 @@ class Application(Adw.Application):
             self.hold()
             self.held = True
             self.restore_saved()
+
+    def mic_at_start(self):
+        """#20: the mic rule starts from the selector that runs: a backup left running (a Booth that crashed, or started
+        after the selector) is said now and shown, and a later return to the Scarlett is said."""
+        running = voice.current()
+        if running in dict(voice.BACKUPS):
+            self.mic, actions = routing.next(self.mic, {"kind": "mic", "source": running})
+            self.mic_moved(actions)
+
+    def do_shutdown(self):
+        voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
+        Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):
         # the entry now in by-id: RENAMED's new name is `other`; MOVED_IN's `other` is its old path, outside the folder
@@ -155,6 +176,12 @@ class Application(Adw.Application):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file  # as in on_by_id
         if devices.dongle_appeared(entry.get_basename(), event.value_nick):
             self.dongle.poke()
+        if event.value_nick in ("created", "deleted", "moved-in", "moved-out", "renamed"):  # a mic may be back or gone
+            self.mic_poke.poke()
+
+    def on_headset(self, event):
+        if event in ("on", "off"):  # the PRO X mic is a backup only while the headset is on
+            self.mic_poke.poke()
 
     def fix_headset(self):
         threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
@@ -175,7 +202,13 @@ class Application(Adw.Application):
 
     def heal_once(self):
         try:
-            voice.heal(self.settings)
+            voice.heal(self.settings, on=lambda: self.headset_monitor.on)
+            source = voice.CHOSEN if voice.running() else routing.DOWN
+            self.mic, actions = routing.next(self.mic, {"kind": "mic", "source": source})
+            if "seen" in self.mic:  # a change seen once: looked at again once things settle, not at the next tick
+                GLib.idle_add(self.mic_poke.poke)
+            if actions:
+                GLib.idle_add(self.mic_moved, actions)
         finally:
             try:  # monitoring back after Booth Mic or the PRO X dongle came back, window or not
                 monitor.sync(self.settings)
@@ -189,6 +222,18 @@ class Application(Adw.Application):
 
     def routed(self, text):
         self.send_notification("routing", Gio.Notification.new(text))  # one id: the newest replaces the last
+        return GLib.SOURCE_REMOVE
+
+    def mic_moved(self, actions):
+        """The mic rule's actions, on the main loop: the notification (one id: the newest replaces the last), then the
+        source for the sidebar and the Microphone page's banner, now and in a window opened later."""
+        for kind, value in actions:
+            if kind == "notify":
+                self.send_notification("booth-mic", Gio.Notification.new(value))
+            else:
+                self.mic_source = value
+                if self.window is not None:
+                    self.window.show_mic(value, True)
         return GLib.SOURCE_REMOVE
 
     def save_routing(self, state):
@@ -230,6 +275,7 @@ class Application(Adw.Application):
                 self.hold()
                 self.held = True
             self.window = Window(self, settings, node, ctrls)
+            self.window.show_mic(self.mic_source)  # opened on a backup: its sidebar line and banner say so
             self.window.connect("close-request", self.on_close)
             self.window.present()
         except Exception:  # no window: release lets Booth exit instead of living on with nothing to show

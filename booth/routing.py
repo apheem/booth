@@ -25,15 +25,16 @@ event: {"kind": "headset", "on": bool, "final": bool when the last retry} or {"k
   while Direct Monitor is owed and the Scarlett's card is there) | observe(): the facts read just before it, with
   "auto": the user's Direct Monitor setting.
 actions: ("default", sink node name), ("direct", bool), ("notify", text), in the order to run.
-A new event (#20: the Scarlett or a mic gone or back) is a new kind with its function in RULES and its facts in
-observe(); the headset's rule doesn't change."""
+A new event is a new kind with its function in RULES and its facts in observe(); the headset's rule doesn't change.
+#20's "mic" rule decides only WHEN a Booth Mic source change is said (notify + sidebar label): voice.choose picks the
+source and voice.apply writes it, run by the app after each heal, not by the Executor (nothing to write here)."""
 import json
 import queue
 import sys
 import threading
 import traceback
 
-from booth import devices, scarlett, service
+from booth import devices, scarlett, service, voice
 
 SETTING = "direct_monitor"  # settings["routing"][SETTING]: the user's "Turn on Direct Monitor…" switch, never the record
 SINK = "alsa_output.usb-Focusrite_Scarlett_Solo_4th_Gen_"  # the Scarlett's PipeWire sink: then serial and profile
@@ -93,7 +94,37 @@ def _direct(state, e):
     return {}, [("direct", False)] if e["direct"] else []
 
 
-RULES = {"headset": _headset, "direct": _direct}
+DOWN = "down"  # Booth Mic's input isn't in PipeWire: its chain is stopped or restarting
+MIC_SAID = {voice.SCARLETT: "Booth Mic is back on the Scarlett",
+            voice.PRO_X_MIC: "Scarlett not connected — Booth Mic now uses the PRO X mic",
+            voice.BRIO_MIC: "Scarlett not connected — Booth Mic now uses the BRIO mic",
+            None: "Booth Mic has no mic — connect the Scarlett or turn on the PRO X",
+            voice.NO_INPUT: "Booth Mic has no input: the Scarlett's input isn't in PipeWire",
+            DOWN: "Booth Mic isn't running — a call may have switched to another mic"}
+LABELS = {voice.SCARLETT: "from the Scarlett", voice.PRO_X_MIC: "from PRO X mic", voice.BRIO_MIC: "from BRIO mic",
+          None: "no mic", voice.NO_INPUT: "no input", DOWN: "not running"}
+
+
+def label(source):
+    """The sidebar's line for Booth Mic's source."""
+    return f"Booth Mic · {LABELS[source]}"
+
+
+def _mic(state, e):
+    """#20: the mic voice.heal chose (or DOWN), after each heal. A move to a backup or to no mic is said on the heal
+    that made it: never a mic the user wasn't told of. Only the return to the Scarlett (and DOWN, Booth Mic's restart
+    gap) waits for a second heal in a row, so a flap Scarlett → BRIO → Scarlett is said once each way, never zero times,
+    never a stream. state: {"said": the last source said, the Scarlett at start, "seen": a return seen once}, in memory
+    only (a restart on a backup says it again)."""
+    said, source = state.get("said", voice.SCARLETT), e["source"]
+    if source == said:
+        return {"said": said}, []
+    if source in (voice.SCARLETT, DOWN) and state.get("seen") != source:
+        return {"said": said, "seen": source}, []
+    return {"said": source}, [("notify", MIC_SAID[source]), ("label", source)]
+
+
+RULES = {"headset": _headset, "direct": _direct, "mic": _mic}
 
 
 def next(state, event):

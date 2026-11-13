@@ -5,7 +5,7 @@ import threading
 import unittest
 from unittest import mock
 
-from booth import routing
+from booth import routing, voice
 from tests.fixture import read
 
 PROX = "alsa_output.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.iec958-stereo"
@@ -238,6 +238,69 @@ def dump(configured=PROX, effective=PROX):
             elif m["key"] == "default.audio.sink":
                 m["value"] = {"name": effective}
     return json.dumps(objects)
+
+
+class MicRule(unittest.TestCase):
+    """#20: Booth Mic's source, as heal chose it. A move to a backup or to no mic is said on the heal that made it; only
+    the return to the Scarlett (and DOWN) waits for a second heal in a row, so a flap is said once each way."""
+
+    @staticmethod
+    def mic(source):
+        return {"kind": "mic", "source": source}
+
+    def test_a_move_to_a_backup_or_no_mic_is_said_on_the_heal_that_made_it_and_only_once(self):
+        for source in (voice.PRO_X_MIC, voice.BRIO_MIC, None):  # privacy: never a mic the user wasn't told of
+            state, actions = routing.next({}, self.mic(source))
+            self.assertEqual(actions, [("notify", routing.MIC_SAID[source]), ("label", source)])
+            self.assertEqual(routing.next(state, self.mic(source)), (state, []))
+        state, actions = routing.next({"said": voice.PRO_X_MIC, "seen": voice.SCARLETT}, self.mic(voice.BRIO_MIC))
+        self.assertEqual((state, actions[0]), ({"said": voice.BRIO_MIC}, ("notify", routing.MIC_SAID[voice.BRIO_MIC])))
+
+    def test_no_mic_or_no_input_is_said_at_once_even_with_a_return_pending(self):
+        for source in (None, voice.NO_INPUT):  # Booth Mic went silent: said on the heal that made it, whatever was seen
+            state, actions = routing.next({"said": voice.BRIO_MIC, "seen": voice.SCARLETT}, self.mic(source))
+            self.assertEqual((state, actions), ({"said": source}, [("notify", routing.MIC_SAID[source]),
+                                                                   ("label", source)]))
+
+    def test_booth_mic_starts_on_the_scarlett_so_nothing_is_said_for_it(self):
+        state, actions = routing.next({}, self.mic(voice.SCARLETT))
+        self.assertEqual((state, actions), ({"said": voice.SCARLETT}, []))
+
+    def test_the_return_to_the_scarlett_is_said_once_it_holds_on_two_heals(self):
+        state, actions = routing.next({"said": voice.BRIO_MIC}, self.mic(voice.SCARLETT))
+        self.assertEqual((state, actions), ({"said": voice.BRIO_MIC, "seen": voice.SCARLETT}, []))
+        state, actions = routing.next(state, self.mic(voice.SCARLETT))
+        self.assertEqual(actions, [("notify", routing.MIC_SAID[voice.SCARLETT]), ("label", voice.SCARLETT)])
+
+    def test_a_flap_is_said_once_each_way_never_zero_never_a_stream(self):
+        state, said = {}, []
+        for source in [voice.PRO_X_MIC, voice.SCARLETT] * 5 + [voice.SCARLETT]:
+            state, actions = routing.next(state, self.mic(source))
+            said += [v for k, v in actions if k == "notify"]
+        self.assertEqual(said, [routing.MIC_SAID[voice.PRO_X_MIC], routing.MIC_SAID[voice.SCARLETT]])
+        self.assertEqual(state, {"said": voice.SCARLETT})
+
+    def test_booth_mic_down_is_said_once_it_holds_on_two_heals(self):  # its 5 s restart gap is not a move
+        state, actions = routing.next({}, self.mic(routing.DOWN))
+        self.assertEqual(actions, [])
+        self.assertEqual(routing.next(state, self.mic(routing.DOWN))[1][0], ("notify", routing.MIC_SAID[routing.DOWN]))
+
+    def test_the_mic_rule_never_touches_the_mute_or_a_default(self):  # mute lives on booth_mic: nothing to carry over
+        state, kinds = {}, set()
+        for source in (voice.PRO_X_MIC, voice.BRIO_MIC, None, routing.DOWN, voice.SCARLETT):
+            for _ in range(2):
+                state, actions = routing.next(state, self.mic(source))
+                kinds |= {k for k, _ in actions}
+        self.assertEqual(kinds, {"notify", "label"})
+
+    def test_the_sidebar_label_names_the_mic(self):
+        self.assertEqual(routing.label(voice.PRO_X_MIC), "Booth Mic · from PRO X mic")
+        self.assertEqual(routing.label(voice.BRIO_MIC), "Booth Mic · from BRIO mic")
+        self.assertEqual(routing.label(voice.SCARLETT), "Booth Mic · from the Scarlett")
+        self.assertEqual(routing.label(None), "Booth Mic · no mic")
+        self.assertEqual(routing.label(voice.NO_INPUT), "Booth Mic · no input")
+        self.assertEqual(routing.MIC_SAID[voice.NO_INPUT], "Booth Mic has no input: the Scarlett's input isn't in PipeWire")
+        self.assertEqual(routing.label(routing.DOWN), "Booth Mic · not running")
 
 
 class Observe(unittest.TestCase):
