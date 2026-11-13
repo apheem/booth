@@ -144,6 +144,7 @@ class PageCase(unittest.TestCase):
     def setUp(self):
         self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
         self.said, self.selecting = "live", True  # what voice.apply returns; whether Booth Mic's selector runs
+        self.running = True  # voice.running: Booth Mic's own process is in PipeWire
         self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
 
@@ -173,6 +174,7 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "apply",
                                   lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
+                mock.patch.object(microphone.voice, "running", lambda: self.running, create=True),
                 # every plugin verifies; self.found: those also in the running chain (voice.loaded), the page's rows
                 mock.patch.object(microphone.voice, "verified", lambda: dict.fromkeys(plugins.MANIFEST, "/verified")),
                 mock.patch.object(microphone.voice, "loaded", lambda: self.found, create=True),
@@ -423,6 +425,14 @@ class VoiceGroup(PageCase):
         f(*a)
         self.assertEqual(self.page.voice.description, voice.WAITING)
 
+    def test_a_poll_with_booth_mic_stopped_says_so_never_blames_the_scarlett(self):
+        s, self.selecting, self.running = state(), False, False  # its pre-start failed, or the user stopped it
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.page.voice.description, voice.STOPPED)
+
     def test_each_poll_says_where_booth_mic_takes_its_input(self):
         self.show(state())
         self.assertEqual(self.page.voice.description, voice.describe(state()))
@@ -660,7 +670,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4, True, "", None))])  # None: the stage rows stay as they are
+        self.assertEqual(self.idle, [(page.show, (None, 4, True, "", None, True))])  # None: the stage rows stay as they are
 
 
 if __name__ == "__main__":

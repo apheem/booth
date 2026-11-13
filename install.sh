@@ -3,12 +3,14 @@
 # Copies the repo's booth/ to ~/.local/share/booth/booth (a real copy, never a symlink into the repo or a worktree),
 # writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop.
 set -eu
+umask 022  # never group-writable, whatever the user's umask: verify() refuses that for a plugin, so for its pins too
 repo=$(cd "$(dirname "$0")" && pwd)
 share=${XDG_DATA_HOME:-}
 case $share in /*) ;; *) share=$HOME/.local/share ;; esac  # the XDG spec: a relative path is invalid and ignored
 dest=$share/booth
 bin=$HOME/.local/bin
 mkdir -p "$dest" "$bin" "$share/applications"
+chmod go-w "$dest"  # an install made under umask 0002
 
 # Stage then swap, so a failed copy never leaves a half-installed app and files removed from the repo don't linger.
 rm -rf "$dest/booth.new"
@@ -54,6 +56,7 @@ config=${XDG_CONFIG_HOME:-}
 case $config in /*) ;; *) config=$HOME/.config ;; esac
 units=$config/systemd/user
 mkdir -p "$units"
+[ ! -d "$config/booth" ] || chmod go-w "$config/booth"  # it holds the config Booth Mic's pipewire loads
 first=  # the first install enables the unit; a re-install keeps what the "Run in background" switch chose
 [ -e "$units/booth.service" ] || first=1
 # Unit-file quoting: in a quoted word \ and " take a backslash, % is doubled and $ too. The executable is /bin/sh
@@ -77,13 +80,15 @@ mv "$units/booth.service.new" "$units/booth.service"
 
 # booth-voice.service runs Booth Mic, the voice chain, as its own PipeWire client from the config Booth writes beside
 # its settings, so Booth Mic stays in a call with Booth closed or crashed. It lives with the user's PipeWire. No config
-# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above. ExecStartPre rewrites voice.conf with the
-# installed booth.voice from the saved settings and the plugins verified right then (booth.plugins), so a plugin file
-# changed since Booth last wrote the config is left out, never loaded; if it can't write it, the unit doesn't start.
-# It is given the paths baked here, so it rewrites the very file ExecStart loads, whatever the user manager's XDG_*.
+# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above. ExecStartPre writes voice-run.conf, the only file
+# ExecStart loads and one Booth never writes, with the installed booth.voice from the saved settings and the plugins
+# verified right then (booth.plugins), so a plugin file changed since is left out, never loaded; if it can't write it
+# and the one there names a plugin that doesn't verify now, the unit doesn't start. It is given the paths baked here, so
+# it writes the very file ExecStart loads, whatever the user manager's XDG_*.
 voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
 [ -e "$units/booth-voice.service" ] || voice_first=1
 voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+run_arg=$(printf '%s' "$config/booth/voice-run.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 select_arg=$(printf '%s' "$config/booth/voice-select.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 dest_arg=$(printf '%s' "$dest" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 plugins_arg=$(printf '%s' "$dest/plugins" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
@@ -95,8 +100,8 @@ BindsTo=pipewire.service
 
 [Service]
 ExecCondition=/usr/bin/test -f "$voice_arg"
-ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write "$voice_arg" "$plugins_arg"
-ExecStart=/usr/bin/pipewire -c "$voice_arg"
+ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write "$run_arg" "$plugins_arg"
+ExecStart=/usr/bin/pipewire -c "$run_arg"
 Restart=on-failure
 RestartSec=5
 Slice=session.slice

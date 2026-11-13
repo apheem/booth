@@ -492,6 +492,13 @@ class Verification(unittest.TestCase):
             with mock.patch.object(voice, "verified", lambda: now):
                 self.assertEqual(voice.reload(run=lambda cmd: ran.append(cmd) or ok, file=file), ok)
             self.assertEqual(ran, want)
+        file.write_text(voice.build(ON, FOUND))  # what Booth wants; its pre-start left sc4m out of what runs
+        file.with_name(voice.RUN_CONF).write_text(voice.build(ON, changed))
+        ran.clear()
+        with mock.patch.object(voice, "verified", lambda: FOUND):
+            self.assertTrue(voice.reload(run=lambda cmd: ran.append(cmd) or True, file=file))
+        self.assertEqual(ran, [RESTART])
+        file.with_name(voice.RUN_CONF).unlink()
         file.unlink()
         with mock.patch.object(voice, "verified", lambda: {}):
             self.assertTrue(voice.reload(run=lambda cmd: ran.append(cmd) or True, file=file))
@@ -534,7 +541,8 @@ class Verification(unittest.TestCase):
         file.mkdir()  # a folder where the file goes: the write fails
         with mock.patch.object(voice.store, "load", lambda: ON):
             self.assertIn("not saved", voice.write(file))
-            with mock.patch.object(voice, "path", lambda: file), mock.patch.object(voice.sys, "argv", ["x", "--write"]):
+            with mock.patch.object(voice, "path", lambda: file.with_name("voice.conf")), \
+                    mock.patch.object(voice, "RUN_CONF", file.name), mock.patch.object(voice.sys, "argv", ["x", "--write"]):
                 self.assertEqual(voice.main(), 1)
 
     def test_the_pre_start_never_runs_systemctl_or_reads_the_scarlett(self):
@@ -546,7 +554,75 @@ class Verification(unittest.TestCase):
                 mock.patch.object(voice.service, "run", side_effect=AssertionError("ran")), \
                 mock.patch.object(voice.scarlett, "read", side_effect=AssertionError("read the Scarlett")):
             self.assertEqual(voice.main(), 0)
-        self.assertEqual(json.loads(file.read_text()), config())
+        self.assertEqual(json.loads(file.with_name("voice-run.conf").read_text()), config())
+        self.assertFalse(file.exists())  # Booth's own record: never the pre-start's
+
+
+    def test_pre_start_refuses_to_start_when_conf_unwritable_even_if_its_plugins_verify(self):
+        """A full disk or read-only config folder: the run conf on disk loads only plugins verified now, at the paths
+        verified, so Booth Mic starts on it. One naming any other plugin path never starts."""
+        run = self.tmp_file().with_name("voice-run.conf")
+        where, manifest = plugin_folder(self, good=list(plugins.MANIFEST), bad=())
+        good = {n: str(where / n) for n in manifest}
+        settings = {"voice": {"noise": False}}
+        with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
+                mock.patch.object(voice.store, "load", lambda: settings), \
+                mock.patch.object(voice.sys, "argv", ["x", "--write", str(run), str(where)]):
+            for running, code in ((good, 0), (dict(list(good.items())[:1]), 0),
+                                  (dict(good, **{"sc4m_1916.so": "/elsewhere/sc4m_1916.so"}), 1)):
+                run.write_text(voice.build(ON, running))
+                with mock.patch.object(voice.store, "save", side_effect=OSError(30, "Read-only file system")):
+                    self.assertEqual(voice.main(), code, running)
+            run.write_text(voice.build(settings, good))  # what it would write: nothing to write
+            with mock.patch.object(voice.store, "save", side_effect=AssertionError("wrote an unchanged config")):
+                self.assertEqual(voice.main(), 0)
+        self.assertEqual(voice.describe(STATE, selecting=False, running=False), voice.STOPPED)  # not the Scarlett
+        self.assertNotIn("Scarlett", voice.STOPPED)
+
+    def test_a_chain_naming_a_plugin_at_another_path_never_counts_as_loaded(self):
+        file = self.tmp_file()
+        file.write_text(voice.build(ON, dict(FOUND, **{"sc4m_1916.so": "/tmp/elsewhere/sc4m_1916.so"})))
+        with mock.patch.object(voice, "verified", lambda: FOUND):
+            self.assertEqual(voice.loaded(file), {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"})
+
+    def test_the_running_chain_is_the_pre_starts_config_never_the_one_apply_wrote(self):
+        """voice.conf is what Booth wants; voice-run.conf what ExecStartPre wrote and pipewire loaded. A plugin the
+        pre-start left out isn't running, whatever voice.conf says: the page shows it missing, its stage dry, no restart."""
+        file, ran = self.tmp_file(), []
+        run = file.with_name("voice-run.conf")
+        changed = {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}
+        file.write_text(voice.build(ON, FOUND))
+        run.write_text(voice.build(ON, changed))
+        with mock.patch.object(voice, "verified", lambda: FOUND):
+            self.assertEqual(voice.loaded(file), changed)
+            self.assertEqual(voice.apply(ON, None, run=lambda cmd: ran.append(cmd) or True, dump=lambda: CHAIN_DUMP,
+                                         file=file), "live")
+        self.assertEqual([c[:2] for c in ran], [["pw-cli", "set-param"]])
+        self.assertEqual(flow(json.loads(file.read_text())), {"limiter(noise(rumble(in)))": 1.0})  # leveling dry
+        self.assertEqual(run.read_text(), voice.build(ON, changed))  # never written by apply
+
+    def test_skeptic_a_poll_racing_the_pre_start_leaves_an_unverified_plugin_in_the_conf_pipewire_loads(self):
+        """A poll's apply reads the configs, then waits on pw-dump before it writes. booth-voice.service starting in that
+        gap runs --write: apply's write lands after it, before ExecStart's pipewire reads its config."""
+        file = self.tmp_file()
+        run = file.with_name("voice-run.conf")
+        where, manifest = plugin_folder(self, good=list(plugins.MANIFEST), bad=())
+        with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
+                mock.patch.object(voice.plugins, "folder", lambda: where), \
+                mock.patch.object(voice.store, "load", lambda: ON):
+            voice.apply(ON, None, run=lambda c: True, dump=lambda: CHAIN_DUMP, file=file)  # Booth Mic, all verified
+            (where / "sc4m_1916.so").write_bytes(b"changed after the chain started")  # stays 0644, user-owned
+            pre_start = []
+
+            def dump():  # the pre-start runs while this poll waits on pw-dump
+                pre_start.append(voice.write(run, where))
+                return CHAIN_DUMP
+            voice.apply(ON, None, run=lambda c: True, dump=dump, file=file)
+            self.assertEqual(pre_start, [None])
+            with self.assertRaises(plugins.Refused):
+                plugins.verify("sc4m_1916.so", where, manifest)
+            self.assertNotIn(str(where / "sc4m_1916.so"), [n["plugin"] for n in ladspa(json.loads(run.read_text()))],
+                             "the file ExecStart's pipewire reads names a plugin that fails verify()")
 
 
 class Apply(unittest.TestCase):
@@ -682,7 +758,7 @@ class Apply(unittest.TestCase):
         instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
         self.ran, self.fails = [], ("restart",)
         self.assertTrue(self.apply(state=instrument).startswith("not restarted"))
-        self.assertEqual(json.loads(self.select.read_text()), selector())  # still the old one
+        self.assertFalse(self.select.exists())  # never the old channel back: Restart=, a later start would load it
         self.ran, self.fails = [], ()
         self.assertEqual(self.apply(state=instrument), "selector restarted")
         self.assertEqual(self.ran, MOVE)
@@ -693,8 +769,13 @@ class Apply(unittest.TestCase):
         self.ran = []
         said = voice.apply(ON, instrument, run=lambda cmd: self.ran.append(cmd) or cmd != ACTIVE,
                            dump=lambda: CHAIN_DUMP, file=self.file)
-        self.assertEqual((said, self.ran), ("not restarted: Booth Mic is stopped", [ACTIVE]))  # BindsTo would start it
-        self.assertEqual(json.loads(self.select.read_text()), selector())  # not recorded: the next apply retries
+        # restart booth-mic-select would start Booth Mic (BindsTo): stopped, so nothing starts on the old channel
+        self.assertEqual((said, self.ran), ("selector stopped: Booth Mic is stopped", [ACTIVE, STOP_SELECT]))
+        self.assertEqual(json.loads(self.select.read_text()), selector(instrument["mic"]))  # what its next start loads
+        self.ran = []
+        self.assertEqual(voice.apply(ON, instrument, run=lambda cmd: self.ran.append(cmd) or cmd != ACTIVE,
+                                     dump=lambda: CHAIN_DUMP, file=self.file), "unchanged")
+        self.assertEqual(self.ran, [])
 
     def test_plugins_are_verified_and_the_chain_written_while_holding_the_lock(self):
         """The last apply wins: the plugins verified just before its write, never another thread's in between."""
@@ -747,6 +828,26 @@ class Apply(unittest.TestCase):
         self.assertEqual(self.apply({"voice": {"rumble": False}}), "live")
         self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
         self.assertEqual(json.loads(self.file.read_text()), config({"voice": {"rumble": False}}))
+
+    def test_stage_switched_off_during_a_pw_dump_blip_is_recorded_but_never_applied(self):
+        """pw-dump failed, or listed no Booth Mic input: no set-param ran, so nothing is recorded; the next apply sends
+        it. The same for a stage forced dry because its plugin stopped verifying."""
+        off = {"voice": {"noise": False}}
+        with mock.patch.object(voice, "verified", lambda: FOUND):
+            self.apply()
+            for blip in ("", json.dumps([node(70, "booth_mic")])):
+                self.ran = []
+                said = voice.apply(off, None, run=lambda cmd: self.ran.append(cmd) or True, dump=lambda: blip,
+                                   file=self.file)
+                self.assertTrue(said.startswith("not applied"), said)
+                self.assertEqual((self.ran, json.loads(self.file.read_text())), ([], config(ON, FOUND)), blip)
+            self.ran = []
+            self.assertEqual(self.apply(off, None), "live")
+            self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
+        with mock.patch.object(voice, "verified", lambda: {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}):
+            self.assertTrue(voice.apply(off, None, run=lambda cmd: True, dump=lambda: "",
+                                        file=self.file).startswith("not applied"))  # leveling forced dry: not sent
+            self.assertEqual(json.loads(self.file.read_text()), config(off, FOUND))
 
     def test_a_live_change_that_cant_be_saved_is_retried(self):
         self.apply()
@@ -833,6 +934,21 @@ class Sync(unittest.TestCase):
         self.assertEqual(voice.describe(rerouted("PCM 1"), True, said), voice.STALE)
         self.assertIn("old channel", voice.STALE)
         self.assertEqual(voice.describe(rerouted("PCM 1"), True, "unchanged"), voice.NOT_ROUTED)
+
+    def test_skeptic_a_channel_moved_while_booth_mic_is_stopped_starts_on_the_old_channel(self):
+        """XLR moved to capture 1, the computer's playback now on capture 2, while booth-voice was stopped. sync()
+        (Booth's start) applies, then starts both units: the selector must start on capture 1."""
+        voice.sync(ON, read=lambda c: {"ctrls": CTRLS, "mic": MIC}, run=lambda c: True, dump=lambda: CHAIN_DUMP,
+                   file=self.file)
+        moved, at_start = xlr_on_channel_1(), []
+
+        def run(cmd):
+            if cmd == START:
+                at_start.append(json.loads(self.file.with_name("voice-select.conf").read_text()))
+            return cmd != ACTIVE  # booth-voice stopped
+        voice.sync(ON, read=lambda c: moved, run=run, dump=lambda: CHAIN_DUMP, file=self.file)
+        self.assertEqual(at_start, [selector(moved["mic"])],
+                         "the selector was started on capture 2, which now carries the computer's playback")
 
     def test_the_config_lives_beside_the_settings(self):
         from booth import store
@@ -935,8 +1051,8 @@ class Heal(unittest.TestCase):
         self.saved()
         instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
         self.assertFalse(self.heal(SCARLETT_BACK, state=instrument, fails=("restart",)))
-        self.assertEqual(self.ran, MOVE)  # apply's try, put back: the next tick tries the move again
-        self.assertEqual(json.loads(self.select.read_text()), selector())
+        self.assertEqual(self.ran, MOVE)  # apply's try, its config removed: the next tick tries the move again
+        self.assertFalse(self.select.exists())  # never the old channel back
 
     def test_a_replug_that_reuses_the_node_id_restarts_the_selector_at_once(self):
         self.saved()
@@ -995,6 +1111,16 @@ class Heal(unittest.TestCase):
         self.assertFalse(self.heal(SCARLETT_BACK, state=instrument, t=1010.0))  # its node isn't there yet
         self.assertEqual(self.ran, MOVE)  # one dropout per mic move, never two
 
+    def test_reroute_seen_while_booth_mic_is_down_starts_it_on_the_computers_playback(self):
+        """booth-voice stopped, activating or auto-restarting when heal sees the XLR moved to capture 1, the computer's
+        playback now on capture 2: whatever starts it next (a reboot, WantedBy, the user) must load capture 1."""
+        self.heal(SELECTING)
+        moved, down = xlr_on_channel_1(), json.dumps([node(40, MIC["node"])])  # no Booth Mic input
+        self.ran.clear()
+        self.assertFalse(self.heal(down, state=moved, fails=("is-active",)))
+        self.assertEqual(json.loads(self.select.read_text()), selector(moved["mic"]))
+        self.assertEqual(self.ran, [ACTIVE, STOP_SELECT])  # nothing started: BindsTo would start booth-voice
+
     def test_heal_takes_the_chosen_input(self):
         self.saved()
         settings = {"voice": {}, "microphone": {"input": "Instrument"}}
@@ -1003,6 +1129,11 @@ class Heal(unittest.TestCase):
                    clock=lambda: 1000.0)
         sel = module(json.loads(self.select.read_text()), "libpipewire-module-loopback")["capture.props"]
         self.assertEqual(sel["audio.position"], ["FL"])  # the Instrument's channel 1, never the XLR's FR
+
+    def test_running_reads_booth_mics_input_and_a_failed_pw_dump_never_says_stopped(self):
+        self.assertTrue(voice.running(CHAIN_DUMP))
+        self.assertFalse(voice.running(json.dumps([node(70, "booth_mic"), node(40, MIC["node"])])))  # no input
+        self.assertTrue(voice.running(""))  # pw-dump failed: unknown
 
     def test_selecting_reads_the_selector_node_by_name(self):
         self.assertEqual((voice.selecting(SELECTING), voice.selecting(SCARLETT_BACK), voice.selecting("")),

@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -142,7 +143,8 @@ class Install(unittest.TestCase):
         voice_unit = self.unit.parent / "booth-voice.service"
         unit = voice_unit.read_text().splitlines()
         conf = self.home / ".config/booth/voice.conf"  # beside settings.json, where Booth writes it
-        self.assertIn(f'ExecStart=/usr/bin/pipewire -c "{conf}"', unit)
+        run = conf.with_name("voice-run.conf")  # written only by its pre-start
+        self.assertIn(f'ExecStart=/usr/bin/pipewire -c "{run}"', unit)
         self.assertIn(f'ExecCondition=/usr/bin/test -f "{conf}"', unit)  # no config yet: skipped, never a failure
         self.assertIn("BindsTo=pipewire.service", unit)
         self.assertIn("WantedBy=pipewire.service", unit)  # Booth Mic lives with PipeWire, not with Booth's window
@@ -163,14 +165,14 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         argv = self.pre_start()
         self.assertEqual(argv, ["/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.voice",
-                                "--write", str(self.home / ".config/booth/voice.conf"),
+                                "--write", str(self.home / ".config/booth/voice-run.conf"),
                                 str(self.app.parent / "plugins")])  # the installed copy, never the repo
-        # voice.conf written while sc4m verified; the file changed since: the next start must never load it
+        # voice-run.conf written while sc4m verified; the file changed since: the next start must never load it
         plugin = self.app.parent / "plugins/sc4m_1916.so"
         plugin.parent.mkdir(exist_ok=True)
         plugin.write_bytes(b"changed after install")
-        conf = self.home / ".config/booth/voice.conf"
-        cfg = json.loads(conf.read_text())
+        conf = self.home / ".config/booth/voice-run.conf"
+        cfg = json.loads(conf.with_name("voice.conf").read_text())
         chain = next(m for m in cfg["context.modules"] if m["name"] == "libpipewire-module-filter-chain")["args"]
         chain["filter.graph"]["nodes"].append({"type": "ladspa", "name": "leveling", "plugin": str(plugin),
                                                "label": "sc4m"})
@@ -182,14 +184,45 @@ class Install(unittest.TestCase):
         self.assertNotIn(str(plugin), conf.read_text())
         self.assertEqual(self.calls.read_text(), before)  # no systemctl from inside the unit's own start
 
+    def test_booth_voice_loads_only_the_config_its_pre_start_wrote_never_the_one_booth_writes(self):
+        """Booth's poll writes voice.conf at any time, a moment after a pre-start's check too: pipewire must load a
+        file only the pre-start writes, from the plugins it verified just then."""
+        self.assertEqual(self.install().returncode, 0)
+        unit = (self.unit.parent / "booth-voice.service").read_text().splitlines()
+        start = shlex.split(next(ln for ln in unit if ln.startswith("ExecStart=")).removeprefix("ExecStart="))
+        self.assertEqual(start[:2], ["/usr/bin/pipewire", "-c"])
+        self.assertEqual(start[2], self.pre_start()[7])  # the file --write writes
+        self.assertNotEqual(start[2], str(voice.path().with_name("voice.conf")))
+        self.assertNotEqual(Path(start[2]).name, "voice.conf")  # what apply() writes
+
+    def test_skeptic_under_the_default_umask_the_pins_and_the_pre_start_code_are_group_writable(self):
+        old = os.umask(0o002)  # Ubuntu's default for a user with a private group (this desk: umask 0002)
+        try:
+            r = self.install()
+        finally:
+            os.umask(old)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        bad = {str(p.relative_to(self.home)): oct(stat.S_IMODE(p.stat().st_mode))
+               for p in (self.app.parent, self.app, self.app / "plugins.py", self.app / "voice.py",
+                         self.unit.parent / "booth-voice.service", self.home / ".config/booth")
+               if p.stat().st_mode & 0o022}
+        self.assertEqual(bad, {}, "verify() refuses a group-writable plugin, but the pins and --write's code are")
+
+    def test_a_reinstall_takes_group_write_off_the_folders_an_older_install_left_group_writable(self):
+        for d in (self.app.parent, self.home / ".config/booth"):
+            d.mkdir(parents=True)
+            d.chmod(0o775)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual([oct(d.stat().st_mode & 0o777) for d in (self.app.parent, self.home / ".config/booth")],
+                         ["0o755", "0o755"])
+
     def test_booth_voice_doesnt_start_when_its_pre_start_cant_write_the_config(self):
         self.assertEqual(self.install().returncode, 0)
         unit = (self.unit.parent / "booth-voice.service").read_text().splitlines()
         self.assertLess(unit.index(next(ln for ln in unit if ln.startswith("ExecStartPre="))),
                         unit.index(next(ln for ln in unit if ln.startswith("ExecStart="))))
         self.assertNotIn("ExecStartPre=-", "\n".join(unit))  # a failure stops the start
-        conf = self.home / ".config/booth/voice.conf"
-        conf.unlink()
+        conf = self.home / ".config/booth/voice-run.conf"
         conf.mkdir()  # a folder where the file goes: the write fails
         r = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 1)
@@ -197,7 +230,7 @@ class Install(unittest.TestCase):
 
     def test_the_pre_start_rewrites_the_config_pipewire_loads_whatever_the_units_environment(self):
         self.assertEqual(self.install().returncode, 0)
-        conf = self.home / ".config/booth/voice.conf"
+        conf = self.home / ".config/booth/voice-run.conf"
         conf.write_text("{}")
         other = self.home / "other"  # the user manager's XDG_* may differ from the install's
         env = dict(self.env, XDG_CONFIG_HOME=str(other / "config"), XDG_DATA_HOME=str(other / "data"))
@@ -478,20 +511,22 @@ class Install(unittest.TestCase):
         self.assertIsNotNone(m, start)
         self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]), str(launcher))
         voice_unit, select_unit = unit.parent / "booth-voice.service", unit.parent / "booth-mic-select.service"
-        for u, conf in ((voice_unit, "voice.conf"), (select_unit, "voice-select.conf")):
-            for key in ("ExecStart=/usr/bin/pipewire -c", "ExecCondition=/usr/bin/test -f"):
-                line = next(ln for ln in u.read_text().splitlines() if ln.startswith(key))
-                m = re.fullmatch(re.escape(key) + r' "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"', line)
-                self.assertIsNotNone(m, line)
-                self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
-                                 str(self.home / ".config/booth" / conf))
+        for u, key, conf in ((voice_unit, "ExecStart=/usr/bin/pipewire -c", "voice-run.conf"),
+                             (voice_unit, "ExecCondition=/usr/bin/test -f", "voice.conf"),
+                             (select_unit, "ExecStart=/usr/bin/pipewire -c", "voice-select.conf"),
+                             (select_unit, "ExecCondition=/usr/bin/test -f", "voice-select.conf")):
+            line = next(ln for ln in u.read_text().splitlines() if ln.startswith(key))
+            m = re.fullmatch(re.escape(key) + r' "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"', line)
+            self.assertIsNotNone(m, line)
+            self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
+                             str(self.home / ".config/booth" / conf))
         line = next(ln for ln in voice_unit.read_text().splitlines() if ln.startswith("ExecStartPre="))
         word = r'"((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"'
         m = re.fullmatch(rf'ExecStartPre=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
                          rf'booth\.voice --write {word} {word}', line)
         self.assertIsNotNone(m, line)
         self.assertEqual([re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], w) for w in m.groups()],
-                         [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice.conf"),
+                         [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice-run.conf"),
                           str(self.home / ".local/share/booth/plugins")])
         self.unit = unit
         pre = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)

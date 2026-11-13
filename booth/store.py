@@ -83,7 +83,7 @@ def load(file=None):
 
 def save(settings, file=None):
     file = Path(file or path())
-    file.parent.mkdir(parents=True, exist_ok=True)
+    file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # it holds the config Booth Mic's pipewire loads
     tmp = tempfile.NamedTemporaryFile("w", dir=file.parent, prefix=f".{file.name}.", delete=False)
     try:
         with tmp:

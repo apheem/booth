@@ -27,6 +27,14 @@ class Store(unittest.TestCase):
         self.assertEqual(store.load(self.path)["camera"], {"zoom_absolute": 250})
         self.assertEqual(json.loads(self.path.read_text())["version"], store.VERSION)
 
+    def test_the_config_folder_is_never_group_writable_whatever_the_umask(self):
+        old = os.umask(0o002)  # Ubuntu's default for a user with a private group
+        try:
+            store.save(store.defaults(), self.path)
+        finally:
+            os.umask(old)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o077, 0)  # it holds the config Booth Mic's pipewire loads
+
     def test_save_leaves_no_temp_file(self):
         store.save(store.defaults(), self.path)
         self.assertEqual(os.listdir(self.path.parent), ["settings.json"])
