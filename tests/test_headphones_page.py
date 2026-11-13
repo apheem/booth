@@ -166,7 +166,7 @@ def stand_ins():
             mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W,
                                                     SpinRow=ns(new_with_range=_W))), \
             mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0),
-                                                    EventControllerScroll=ns(new=_W),
+                                                    EventControllerScroll=ns(new=_W), Button=_W, Align=ns(CENTER=3),
                                                     EventControllerScrollFlags=ns(BOTH_AXES="both", VERTICAL="v"),
                                                     PropagationPhase=ns(CAPTURE="capture"))), \
             mock.patch.object(headphones.GLib, "timeout_add_seconds", lambda *a: 1), \
@@ -284,6 +284,21 @@ class SoundOutput(unittest.TestCase):
         with self.writing():
             page.scale.set_value(40)
         self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "33", "0.40"]])
+
+    def test_restart_output_is_shown_with_the_scarlett_and_sends_the_pair_to_the_nodes_found_now(self):
+        page, restarted = self.page(self.BACKUP), []
+        self.assertEqual(page.restart.set["set_visible"], (True,))
+        button = page.restart.set["add_suffix"][0]
+        with stand_ins(), mock.patch.object(headphones.devices, "_run", lambda *cmd: DUMP), \
+                mock.patch.object(headphones.revive, "restart", restarted.append):
+            button.handlers["clicked"](button)
+        self.assertEqual([found["sink"] for found in restarted], [SCARLETT])
+        with stand_ins(), mock.patch.object(headphones.devices, "_run", lambda *cmd: ""), \
+                mock.patch.object(headphones.revive, "restart", restarted.append):
+            button.handlers["clicked"](button)  # no PipeWire, or the Scarlett just went: nothing to restart
+        self.assertEqual(len(restarted), 1)
+        other = self.page({**self.BACKUP, "output": {**self.BACKUP["output"], "direct": None}})
+        self.assertEqual(other.restart.set["set_visible"], (False,))
 
     def test_direct_monitor_is_written_to_the_scarlett_by_name(self):
         page, cards = self.page(self.BACKUP), []

@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from booth import camera, devices, headset, monitor, mute, routing, service, stereo, store, voice  # noqa: E402
+from booth import camera, devices, headset, monitor, mute, revive, routing, service, stereo, store, voice  # noqa: E402
 from booth.ui.window import SHORTCUTS, Window  # noqa: E402
 
 APP_ID = service.APP_ID
@@ -84,6 +84,7 @@ class Application(Adw.Application):
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.snd_monitor, self.dongle, self.healing = None, None, False
+        self.output_watch, self.watching = revive.Watch(), False  # the Scarlett's stuck output, found and restarted
         self.mic, self.mic_source, self.mic_poke = {}, voice.SCARLETT, None  # #20: the mic rule's state, what it said
         self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # watch() subscribes the routing
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
@@ -161,6 +162,8 @@ class Application(Adw.Application):
         GLib.timeout_add_seconds(BATTERY_S, self.routing.retry)  # a rule not settled yet (the PRO X sink not back) again
         # Booth Mic's selector back within 10 s of its Scarlett: a replug, a login race or a profile switch (no by-id event)
         GLib.timeout_add_seconds(BATTERY_S, self.heal_voice)
+        # the Scarlett playing into nothing (booth.revive): noticed within a tick and restarted, window or not
+        GLib.timeout_add_seconds(BATTERY_S, self.watch_output)
         if self.background:
             self.hold()
             self.held = True
@@ -320,6 +323,18 @@ class Application(Adw.Application):
                     stereo.sync(self.settings, notify=self.stereo_switched)
                 finally:
                     self.healing = False
+
+    def watch_output(self):
+        if not self.watching:  # a look takes a second or two (pw-dump, the sink's monitor, amixer): never two at once
+            self.watching = True
+            off_main(self.output_watch.check, self.output_watched)
+        return True
+
+    def output_watched(self, said):
+        """The watch's verdict on the main loop: its notification when it restarted the output, or couldn't."""
+        self.watching = False
+        if said:
+            self.send_notification("scarlett-output", Gio.Notification.new(said))
 
     def stereo_switched(self, text):
         """Booth Stereo's notice (computer sound moved to a new output), from sync's worker: on the main loop."""

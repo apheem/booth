@@ -13,10 +13,11 @@ import threading
 
 from gi.repository import Adw, Gdk, GLib, Gtk
 
-from booth import headset, scarlett, store
+from booth import devices, headset, revive, scarlett, store
 
 POLL_S = 2
 DIRECT = "Hear yourself in the Scarlett's jack"
+RESTART = "Restarts the Scarlett's output without unplugging it; Booth also does it when it sees it stopped"
 SWITCH_SUBTITLE = "Play all sound through the headset"
 SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
 NOT_SET = "Not set in Booth"  # the headset can't report its own value: the widget's position means nothing yet
@@ -47,9 +48,13 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.backup, self.backup_row = self.slider(self.on_backup)
         self.direct = Adw.SwitchRow(title="Direct Monitor", subtitle=DIRECT)
         self.direct.connect("notify::active", self.on_direct)
-        for row in (self.playing, self.backup_row, self.direct):
+        self.restart = Adw.ActionRow(title="No Sound From the Scarlett?", subtitle=RESTART)  # booth.revive, by hand
+        button = Gtk.Button(label="Restart Output", valign=Gtk.Align.CENTER)
+        button.connect("clicked", self.on_restart)
+        self.restart.add_suffix(button)
+        for row in (self.playing, self.backup_row, self.direct, self.restart):
             self.output.add(row)
-        for row in (self.backup_row, self.direct):
+        for row in (self.backup_row, self.direct, self.restart):
             row.set_visible(False)  # until a poll finds sound on another output
         self.group = Adw.PreferencesGroup(title="PRO X Wireless")
         self.battery = Adw.ActionRow(title="Battery")
@@ -166,7 +171,8 @@ class HeadphonesPage(Adw.PreferencesPage):
                 self.switch.set_active(state["default"])
             output = state["output"] if state else None
             self.backup_row.set_visible(output is not None)
-            self.direct.set_visible(output is not None and output["direct"] is not None)
+            for row in (self.direct, self.restart):  # the Scarlett's own rows
+                row.set_visible(output is not None and output["direct"] is not None)
             if output:
                 self.backup.set_value(headset.percent(output["volume"]))
                 self.direct.set_active(output["direct"] is True)
@@ -180,6 +186,14 @@ class HeadphonesPage(Adw.PreferencesPage):
         if not self.quiet and output:
             p, name = round(scale.get_value()), output["name"]  # the output shown: never another one's volume
             self.writer.want("backup", lambda dump: headset.volume_cmd(dump, p, name))
+
+    def on_restart(self, _button):
+        """The Scarlett's stuck output restarted by hand (booth.revive's pair of silent streams), off the main loop."""
+        def work():
+            found = revive.nodes(devices._run("pw-dump"))
+            if found:
+                revive.restart(found)
+        threading.Thread(target=work, daemon=True).start()
 
     def on_direct(self, row, _param):
         if not self.quiet:

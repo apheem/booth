@@ -311,9 +311,10 @@ class BackgroundLaunch(unittest.TestCase):
         stub.save_routing.assert_called_once_with({})
         stub.headset_monitor.poll.assert_called_once_with()  # the battery now, in every primary instance
         # then every 10 s, window or not: the battery, a routing rule not settled yet (the PRO X sink not back, a failed
-        # write) run again, and Booth Mic's selector restarted if its Scarlett is back
+        # write) run again, Booth Mic's selector restarted if its Scarlett is back, and the Scarlett's stuck output
         self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll),
-                                                mock.call(10, executor.return_value.retry), mock.call(10, stub.heal_voice)])
+                                                mock.call(10, executor.return_value.retry), mock.call(10, stub.heal_voice),
+                                                mock.call(10, stub.watch_output)])
         monitor = folders["/dev/v4l/by-id"].monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
@@ -801,6 +802,22 @@ class MicFallback(unittest.TestCase):
             app.Application.do_shutdown(stub)
         stub.window.microphone.save_voice.assert_called_once_with()
         stub.window.microphone.take.stop.assert_called_once_with()  # no test recording outlives Booth
+
+    def test_the_scarletts_stuck_output_is_watched_off_the_main_loop_one_look_at_a_time(self):
+        stub, spawned = mock.Mock(watching=False), []
+        with mock.patch.object(app, "off_main", lambda work, done: spawned.append((work, done))):
+            self.assertIs(app.Application.watch_output(stub), True)  # True: the timer goes on
+            self.assertIs(app.Application.watch_output(stub), True)  # the first look still out: no second one
+        self.assertEqual(spawned, [(stub.output_watch.check, stub.output_watched)])
+
+    def test_a_restarted_output_is_said_and_the_next_look_may_run(self):
+        stub = mock.Mock(watching=True)
+        with mock.patch.object(app.Gio.Notification, "new", lambda text: text):
+            app.Application.output_watched(stub, None)  # nothing found, or the look raised
+            self.assertIs(stub.watching, False)
+            stub.send_notification.assert_not_called()
+            app.Application.output_watched(stub, app.revive.REVIVED)
+        stub.send_notification.assert_called_once_with("scarlett-output", app.revive.REVIVED)
 
     def test_quitting_ends_the_mute_watchers_pw_dump(self):  # #21: no pw-dump --monitor outlives Booth
         with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"), \
