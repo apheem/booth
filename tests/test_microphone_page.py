@@ -185,6 +185,7 @@ class PageCase(unittest.TestCase):
                                   lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
                 mock.patch.object(microphone.voice, "running", lambda: self.running, create=True),
+                mock.patch.object(microphone.voice, "current", lambda: None),  # the selector config on disk: none
                 # every plugin verifies; self.found: those also in the running chain (voice.loaded), the page's rows
                 mock.patch.object(microphone.voice, "verified", lambda: dict.fromkeys(plugins.MANIFEST, "/verified")),
                 mock.patch.object(microphone.voice, "loaded", lambda found=None: self.found, create=True),
@@ -488,6 +489,28 @@ class VoiceGroup(PageCase):
         self.real_poll(lambda choice: None)
         self.page.poll()
         self.assertEqual(self.applied, [])
+
+    def unplugged_poll(self, source):
+        idle = self.real_poll(lambda choice: None)
+        with mock.patch.object(microphone.voice, "current", lambda: source):
+            self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        return self.page.voice.description
+
+    def test_unplugged_on_a_backup_says_booth_mic_runs_from_it_never_waiting(self):
+        for source in (voice.PRO_X_MIC, voice.BRIO_MIC):
+            said = self.unplugged_poll(source)
+            self.assertEqual(said, voice.describe(None, source=source))
+            self.assertIn(f"from the {source}", said)
+            self.assertNotEqual(said, voice.WAITING)
+        self.assertEqual(self.unplugged_poll(voice.SCARLETT), voice.WAITING)  # its own selector: back when it is
+
+    def test_unplugged_with_booth_mic_stopped_says_stopped_and_never_meters_it(self):
+        self.running = False
+        self.assertEqual(self.unplugged_poll(voice.BRIO_MIC), voice.STOPPED)
+        self.assertEqual(self.page.after_record, None)
+        self.assertEqual(self.page.after.said, voice.STOPPED)
 
     real_poll = ScarlettGroup.real_poll
 
@@ -861,7 +884,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4, True, "", None, True))])  # None: the stage rows stay as they are
+        self.assertEqual(self.idle, [(page.show, (None, 4, True, "", None, True, None))])  # None: the stage rows stay as they are
 
 
 if __name__ == "__main__":

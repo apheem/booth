@@ -994,6 +994,10 @@ class Sync(unittest.TestCase):
         self.assertEqual(voice.describe({"ctrls": CTRLS, "mic": dict(MIC, node=None, position=None)}), voice.WAITING)
         self.assertIn("capture channel 2 (FR)", voice.describe({"ctrls": CTRLS, "mic": MIC}))
         self.assertEqual(voice.describe({"ctrls": CTRLS, "mic": MIC}, selecting=False), voice.WAITING)
+        self.assertEqual(voice.describe(None, source=voice.BRIO_MIC),
+                         "Booth Mic runs from the BRIO mic: the Scarlett isn't connected")
+        self.assertEqual(voice.describe(None, running=False, source=voice.BRIO_MIC), voice.STOPPED)
+        self.assertEqual(voice.describe(None, source=voice.SCARLETT), voice.WAITING)
 
     def test_a_selector_that_wont_stop_is_never_shown_as_no_input(self):
         said = "not stopped: Booth Mic's source still takes the mic's old channel"

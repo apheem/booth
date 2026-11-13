@@ -146,7 +146,7 @@ class MicrophonePage(Adw.PreferencesPage):
         return GLib.SOURCE_CONTINUE
 
     def read(self, since):
-        state, selecting, said, missing, running = None, True, "", None, True
+        state, selecting, said, missing, running, source = None, True, "", None, True, None
         try:
             with voice._LOCK:  # read and applied as one: never a stale Scarlett written over a backup heal moved to
                 state = scarlett.read(self.choice())
@@ -154,13 +154,15 @@ class MicrophonePage(Adw.PreferencesPage):
                     said = voice.apply(self.settings, state)  # not routed: the selector stops
                     selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
                     running = selecting or voice.running()  # the selector runs only with Booth Mic (BindsTo)
+                else:  # on a backup, or silent: said so, and a stopped Booth Mic is never metered
+                    running, source = voice.running(), voice.current()
             found = voice.verified()  # verified and running: one verified since waits for a restart
             missing = dict.fromkeys(voice.missing(voice.loaded(found=found)), PENDING)
             missing.update(dict.fromkeys(voice.missing(found), MISSING))
         finally:  # always: show() clears polling, else the page stops following outside changes
-            GLib.idle_add(self.show, state, since, selecting, said, missing, running)
+            GLib.idle_add(self.show, state, since, selecting, said, missing, running, source)
 
-    def show(self, state, since, selecting=True, said="", missing=None, running=True):
+    def show(self, state, since, selecting=True, said="", missing=None, running=True, source=None):
         self.polling = False
         if missing is not None and missing != self.missing:  # None: not checked, the rows stay as they are
             self.missing, self.quiet = missing, True
@@ -177,7 +179,7 @@ class MicrophonePage(Adw.PreferencesPage):
         if not running:
             self.after.idle(voice.STOPPED)
         self.meter_update()
-        self.voice.set_description(voice.describe(state, selecting, said, running))
+        self.voice.set_description(voice.describe(state, selecting, said, running, source))
         self.show_monitoring(monitor.LAST)  # the latest sync, the switch's or a heal tick's
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back

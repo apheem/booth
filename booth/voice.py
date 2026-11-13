@@ -532,9 +532,9 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
         return restarted
 
 
-def describe(state, selecting=True, said="", running=True):
+def describe(state, selecting=True, said="", running=True, source=None):
     """The Voice processing group's description for a Scarlett poll (scarlett.read), whether the selector runs, what
-    apply said and whether Booth Mic runs."""
+    apply said, whether Booth Mic runs and, with the Scarlett unplugged, the mic its selector takes (current())."""
     if said.startswith("not stopped"):
         return STALE
     mic = state["mic"] if state else None
@@ -542,6 +542,8 @@ def describe(state, selecting=True, said="", running=True):
         return NOT_ROUTED
     if not running:
         return STOPPED
+    if state is None and source in dict(BACKUPS):
+        return f"Booth Mic runs from the {source}: the Scarlett isn't connected"
     if not mic or not mic["node"] or not mic["position"] or not selecting:
         return WAITING
     return f"Booth Mic takes the Scarlett's capture channel {mic['channel']} ({mic['position']}), in mono"
