@@ -159,7 +159,8 @@ class Install(unittest.TestCase):
         self.assertNotIn("graphical-session", voice_unit.read_text())
         self.assertIn("Booth Mic is waiting for the Scarlett", r.stdout)  # what booth.voice said
         self.assertEqual(sorted(os.listdir(self.unit.parent)),
-                         ["booth-mic-select.service", "booth-monitor.service", "booth-voice.service", "booth.service"])
+                         ["booth-mic-select.service", "booth-monitor.service", "booth-stereo.service", "booth-voice.service",
+                          "booth.service"])
 
     def pre_start(self):
         """booth-voice.service's ExecStartPre as argv: systemd's %% and $$ undone, then its quoted words split."""
@@ -365,6 +366,34 @@ class Install(unittest.TestCase):
         self.assertNotIn("[Install]", text)
         self.assertNotIn("booth-monitor", self.calls.read_text())  # never enabled or started by the install
 
+    def test_installs_booth_stereo_which_only_booth_starts_from_a_config_its_pre_start_writes(self):  # #19
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = (self.unit.parent / "booth-stereo.service").read_text()
+        unit, conf = text.splitlines(), self.home / ".config/booth/stereo.conf"
+        self.assertIn(f'ExecStart=/usr/bin/pipewire -c "{conf}"', unit)
+        self.assertIn("BindsTo=pipewire.service", unit)
+        self.assertIn("After=pipewire.service", unit)
+        self.assertIn("Restart=on-failure", unit)
+        # a new side or source restarts only it: it never starts, stops or waits on another Booth unit
+        self.assertEqual([ln for ln in unit if any(u in ln for u in ("booth-voice", "booth-mic-select", "booth.service"))],
+                         [])
+        self.assertNotIn("[Install]", text)
+        self.assertNotIn("booth-stereo", self.calls.read_text())  # never enabled or started by the install
+        line = next(ln for ln in unit if ln.startswith("ExecStartPre="))
+        argv = shlex.split(line.removeprefix("ExecStartPre=").replace("%%", "%").replace("$$", "$"))
+        self.assertEqual(argv, ["/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.stereo",
+                                "--write", str(conf), str(self.app.parent / "plugins")])  # the installed copy
+        plugin = self.app.parent / "plugins/sc4m_1916.so"  # changed since it verified: never loaded
+        plugin.parent.mkdir(exist_ok=True)
+        plugin.write_bytes(b"changed after install")
+        before = self.calls.read_text()
+        r = subprocess.run(argv, env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('"booth_stereo"', conf.read_text())
+        self.assertNotIn("ladspa", conf.read_text())
+        self.assertEqual(self.calls.read_text(), before)  # no systemctl from inside the unit's own start
+
     def test_booth_mic_is_set_up_by_the_installed_copy_never_the_repo(self):
         # the repo may be a worktree on another branch, or deleted later: the units run what was installed
         python = shutil.which("python3", path=self.env["PATH"])
@@ -541,7 +570,8 @@ class Install(unittest.TestCase):
         self.assertEqual(tree(self.app), tree(REPO / "booth"))
         self.assertEqual(list(self.app.parent.iterdir()), [self.app])
         self.assertEqual(sorted(os.listdir(self.unit.parent)),
-                         ["booth-mic-select.service", "booth-monitor.service", "booth-voice.service", "booth.service"])  # no .new left
+                         ["booth-mic-select.service", "booth-monitor.service", "booth-stereo.service", "booth-voice.service",
+                          "booth.service"])  # no .new left
 
     def test_relative_xdg_data_home_is_ignored(self):
         self.env["XDG_DATA_HOME"] = "rel/share"  # invalid per the XDG spec: must not install relative to the cwd
@@ -620,11 +650,13 @@ class Install(unittest.TestCase):
         self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]), str(launcher))
         voice_unit, select_unit = unit.parent / "booth-voice.service", unit.parent / "booth-mic-select.service"
         monitor_unit = unit.parent / "booth-monitor.service"
+        stereo_unit = unit.parent / "booth-stereo.service"  # #19
         for u, key, conf in ((voice_unit, "ExecStart=/usr/bin/pipewire -c", "voice-run.conf"),
                              (voice_unit, "ExecCondition=/usr/bin/test -f", "voice.conf"),
                              (select_unit, "ExecStart=/usr/bin/pipewire -c", "voice-select.conf"),
                              (monitor_unit, "ExecStart=/usr/bin/pipewire -c", "monitor.conf"),
-                             (monitor_unit, "ExecCondition=/usr/bin/test -f", "monitor.conf")):
+                             (monitor_unit, "ExecCondition=/usr/bin/test -f", "monitor.conf"),
+                             (stereo_unit, "ExecStart=/usr/bin/pipewire -c", "stereo.conf")):
             line = next(ln for ln in u.read_text().splitlines() if ln.startswith(key))
             m = re.fullmatch(re.escape(key) + r' "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"', line)
             self.assertIsNotNone(m, line)
@@ -654,7 +686,7 @@ class Install(unittest.TestCase):
         pre = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
         self.assertEqual(pre.returncode, 0, pre.stderr)  # the installed copy found, whatever the home's name
         if shutil.which("systemd-analyze"):  # read-only: parses the unit, starts nothing
-            for u in (unit, voice_unit, select_unit, monitor_unit):
+            for u in (unit, voice_unit, select_unit, monitor_unit, stereo_unit):
                 v = subprocess.run(["systemd-analyze", "--user", "verify", str(u)], capture_output=True, text=True,
                                    timeout=60)
                 self.assertEqual(v.returncode, 0, v.stderr)

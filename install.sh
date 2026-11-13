@@ -152,6 +152,25 @@ RestartSec=5
 Slice=session.slice
 EOF
 mv "$units/booth-monitor.service.new" "$units/booth-monitor.service"
+# booth-stereo.service runs Booth Stereo (#19, booth.stereo): its own copy of the voice chain on Booth Mic's input, and
+# the other side's source, into a stereo source for recording apps. Never enabled, and nothing in it names another Booth
+# unit: Booth starts it and restarts only it for a new side or source. Its ExecStartPre writes the config it loads from
+# the saved settings, the source found then and the plugins verified then, as booth-voice.service's does.
+stereo_arg=$(printf '%s' "$config/booth/stereo.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+cat > "$units/booth-stereo.service.new" <<EOF
+[Unit]
+Description=Booth Stereo: the voice on one side, a chosen source on the other, for recording apps (PipeWire)
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.stereo --write "$stereo_arg" "$plugins_arg"
+ExecStart=/usr/bin/pipewire -c "$stereo_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+EOF
+mv "$units/booth-stereo.service.new" "$units/booth-stereo.service"
 # Enabled whatever the Run in Background switch says. booth.voice writes the configs from the Scarlett now and starts
 # them (restarts what changed). The first install then makes Booth Mic the default mic by name: WirePlumber picks it
 # as soon as it appears. None of this stops the install: Booth writes the configs and starts the services each run.
