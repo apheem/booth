@@ -236,7 +236,7 @@ def live(settings, run=service.run, dump=voice._dump):
     """A knob, switch or preset (the voice throttle's): only the chain's values, set live on booth.stereo.voice and read
     back; never a shape or restart decision (sync's: the heal tick, a side or source change). → LAST, or "not …"."""
     with _LOCK:
-        cfg = json.loads(build(settings, voice.verified(), None))  # a plugin that doesn't verify now: its stage dry
+        cfg = json.loads(build(settings, voice.verified(), None))  # a stage whose plugin doesn't verify: untouched (sync dries it)
         missed = voice.set_live(cfg, run, dump, VOICE)  # None: not running, the heal tick starts it
         return f"not applied: Booth Stereo didn't take {', '.join(missed)}" if missed else LAST
 
