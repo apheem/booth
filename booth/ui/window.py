@@ -36,7 +36,7 @@ class Window(Adw.ApplicationWindow):
             ("Camera", "camera-web-symbolic", page("Camera", self.camera),
              camera_status),
             ("Microphone", "audio-input-microphone-symbolic",
-             page("Microphone", self.microphone), None),
+             page("Microphone", self.microphone), self.microphone.mini),
             ("Headphones", "audio-headphones-symbolic", page("Headphones", self.headphones), headphones_status),
         ]
 
