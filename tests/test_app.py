@@ -9,9 +9,9 @@ import threading
 import unittest
 from unittest import mock
 
-from gi.repository import Gio, GLib
+from gi.repository import Gio, GLib, Gtk
 
-from booth import app, camera, routing, service, store, voice
+from booth import app, camera, mute, routing, service, store, voice
 from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_service import Clock, Timers
@@ -324,6 +324,8 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertIsInstance(stub.dongle, service.Debounce)
         self.assertIsInstance(stub.mic_poke, service.Debounce)  # a burst of sound-card events: one heal after it
         self.assertIs(stub.mic_poke.fire, stub.heal_voice)
+        self.assertIsInstance(stub.camera_seen, service.Debounce)  # #22: the BRIO come or gone, once a burst settles
+        self.assertIs(stub.camera_seen.fire, stub.check_camera)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
         stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
         stub.watch_mute.assert_called_once_with()  # #21: the mute's record kept, window or not
@@ -1072,6 +1074,169 @@ class MenuWiring(unittest.TestCase):
         action = app.Application().lookup_action(name.removeprefix("app."))
         self.assertIsNotNone(action)
         self.assertEqual(action.get_state().get_type_string(), "b")  # a check item
+
+
+class Shortcuts(unittest.TestCase):
+    """#22: Ctrl+1/2/3 select the pages, Ctrl+0 resets the zoom; every shortcut is in the Keyboard Shortcuts window."""
+
+    def test_ctrl_1_2_3_select_the_pages_ctrl_0_resets_the_zoom_and_the_help_has_its_key(self):
+        booth = app.Application()
+        self.assertEqual([booth.get_accels_for_action(a) for a in ("win.page(0)", "win.page(1)", "win.page(2)",
+                                                                    "win.reset-zoom", "win.show-help-overlay",
+                                                                    "app.mute")],
+                         [["<Control>1"], ["<Control>2"], ["<Control>3"], ["<Control>0"], ["<Control>question"],
+                          ["<Control>m"]])
+
+    def test_the_shortcuts_window_lists_every_accelerator_the_app_sets_and_gnomes_ctrl_alt_m(self):
+        booth = app.Application()
+        bound = {accel for action in booth.list_action_descriptions() for accel in booth.get_accels_for_action(action)}
+        self.assertEqual({accel for _group, _action, accel, _title in ui_window.SHORTCUTS}, bound | {mute.SHORTCUT})
+
+    def test_the_primary_menu_opens_the_keyboard_shortcuts(self):
+        menu = ui_window.main_menu()
+        self.assertIn("win.show-help-overlay", [menu.get_item_attribute_value(i, "action", None).get_string()
+                                                for i in range(menu.get_n_items())])
+
+    def test_a_page_shortcut_selects_its_sidebar_row_and_shows_it(self):
+        win = mock.Mock()
+        ui_window.Window.select_page(win, 2)
+        win.sidebar.get_row_at_index.assert_called_once_with(2)
+        win.sidebar.select_row.assert_called_once_with(win.sidebar.get_row_at_index.return_value)
+        win.split.set_show_content.assert_called_once_with(True)  # a narrow window shows the page, not the sidebar
+
+    def test_ctrl_0_resets_the_zoom_only_while_the_brio_is_there(self):
+        for plugged in (True, False):
+            win = mock.Mock(plugged=plugged)
+            ui_window.Window.reset_zoom(win)
+            self.assertEqual(win.camera.reset_zoom.call_count, int(plugged))  # never a write to a gone camera
+
+    def test_the_window_uses_the_apps_own_icon(self):
+        app.Application()
+        self.assertEqual(Gtk.Window.get_default_icon_name(), app.APP_ID)
+
+
+class NotConnected(unittest.TestCase):
+    """#22: unplugging the BRIO or the PRO X dongle shows a status page, live, and the sidebar says so; both follow
+    the by-id watchers (and the HeadsetMonitor), each device resolved again on every event."""
+    DONGLE = "/dev/snd/by-id/usb-Logitech_PRO_X_Wireless_Gaming_Headset-00"
+
+    def by_id(self, stub, file, event):
+        app.Application.on_by_id(stub, None, Gio.File.new_for_path(file), None, event)
+
+    def test_the_brio_coming_or_going_checks_the_camera_once_the_burst_settles(self):
+        stub = mock.Mock()
+        self.by_id(stub, DEV, Gio.FileMonitorEvent.DELETED)  # the unplug
+        self.by_id(stub, "/dev/v4l/by-id", Gio.FileMonitorEvent.DELETED)  # udev removes the folder with the last camera
+        self.by_id(stub, DEV.replace("index0", "index2"), Gio.FileMonitorEvent.CREATED)  # never the IR node
+        self.assertEqual(stub.camera_seen.poke.call_count, 2)
+        stub.replug.poke.assert_not_called()  # an unplug restores nothing
+
+    def check(self, page, found, window=True):
+        stub = mock.Mock(settings={"camera": {"zoom_absolute": 250}})
+        stub.window = mock.Mock(camera=page) if window else None
+        ctrls, done = camera.parse_ctrls(read("brio/ctrls-index0.txt")), []
+        with mock.patch.object(app, "off_main", lambda work, then: done.append((work, then))), \
+                mock.patch.object(app.devices, "discover", return_value={"camera": found}) as discover, \
+                mock.patch.object(app, "restore_camera", return_value=found) as restore, \
+                mock.patch.object(camera, "read_ctrls", return_value=ctrls) as read_ctrls:
+            app.Application.check_camera(stub)
+            for work, then in done:  # off the main loop, then back on it
+                then(work())
+        return stub, discover, restore, read_ctrls, ctrls
+
+    def test_the_brio_gone_shows_the_status_page(self):
+        stub, _, restore, _, _ = self.check(mock.Mock(node=DEV, ctrls={camera.ZOOM: {}}), None)
+        stub.window.show_camera.assert_called_once_with(None, None)
+        restore.assert_not_called()
+
+    def test_the_same_brio_back_shows_its_page_and_leaves_the_restore_to_its_setter(self):
+        stub, _, restore, read_ctrls, _ = self.check(mock.Mock(node=DEV, ctrls={camera.ZOOM: {}}), DEV)
+        stub.window.show_camera.assert_called_once_with(DEV, None)
+        restore.assert_not_called()  # restore_saved's page.reapply sends the saved values, behind its own writes
+        read_ctrls.assert_not_called()
+
+    def test_a_brio_the_page_lacks_is_restored_then_read_for_a_new_page(self):
+        stub, _, restore, read_ctrls, ctrls = self.check(mock.Mock(node=None, ctrls={}), DEV)  # opened unplugged
+        restore.assert_called_once_with(stub.settings)
+        read_ctrls.assert_called_once_with(DEV)  # after the restore: the new page shows the saved values
+        stub.window.show_camera.assert_called_once_with(DEV, ctrls)
+
+    def test_with_no_window_nothing_is_probed(self):
+        _, discover, _, _, _ = self.check(None, DEV, window=False)
+        discover.assert_not_called()  # a window opened later reads the camera in start()
+
+    def test_a_window_closed_while_the_camera_was_probed_is_never_told(self):
+        stub = mock.Mock(window=mock.Mock(camera=mock.Mock(node=DEV, ctrls={camera.ZOOM: {}})))
+        old, done = stub.window, []
+        with mock.patch.object(app, "off_main", lambda work, then: done.append(then)):
+            app.Application.check_camera(stub)
+        stub.window = None
+        done[0]((None, None))
+        old.show_camera.assert_not_called()
+
+    def test_an_unplugged_brio_shows_the_status_page_and_a_late_refresh_never_says_ready(self):
+        win = mock.Mock()
+        win.camera.node, win.camera.ctrls, win.camera.values = DEV, {camera.ZOOM: {"min": 100}}, {camera.ZOOM: 250}
+        win.camera_said = lambda text: ui_window.Window.camera_said(win, text)
+        ui_window.Window.show_camera(win, None)
+        win.camera_stack.set_visible_child_name.assert_called_once_with("missing")
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Not connected",))
+        win.camera_said("Ready · 2.5×")  # a write the gone camera refused refreshes the page
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Not connected",))
+        ui_window.Window.show_camera(win, DEV)  # the same BRIO back: its page and its zoom, live
+        win.camera_stack.set_visible_child_name.assert_called_with("camera")
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Ready · 2.5×",))
+
+    def test_a_brio_the_page_lacks_gets_a_new_page(self):
+        win, ctrls = mock.Mock(), camera.parse_ctrls(read("brio/ctrls-index0.txt"))
+        old = win.camera
+        win.camera_said = lambda text: ui_window.Window.camera_said(win, text)
+        with mock.patch.object(ui_window, "CameraPage") as page:
+            page.return_value.configure_mock(node=DEV, ctrls=ctrls, values={camera.ZOOM: 100})
+            ui_window.Window.show_camera(win, DEV, ctrls)
+        page.assert_called_once_with(win.settings, DEV, ctrls, win.camera_said)
+        win.camera_stack.remove.assert_called_once_with(old)
+        win.camera_stack.add_named.assert_called_once_with(page.return_value, "camera")
+        self.assertIs(win.camera, page.return_value)  # the app's camera_page() and Ctrl+0 find the new one
+        win.camera_stack.set_visible_child_name.assert_called_once_with("camera")
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Ready · 1.0×",))
+
+    def test_the_dongle_coming_or_going_shows_on_the_open_window_resolved_now(self):
+        stub = mock.Mock()
+        with mock.patch.object(app.devices, "dongle_present", side_effect=[False, True]):
+            for event in (Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.CREATED,
+                          Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+                app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(self.DONGLE), None, event)
+        self.assertEqual(stub.window.show_headset.call_args_list, [mock.call(False), mock.call(True)])
+        stub = mock.Mock(window=None)
+        with mock.patch.object(app.devices, "dongle_present") as present:
+            app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(self.DONGLE), None,
+                                         Gio.FileMonitorEvent.DELETED)
+        present.assert_not_called()
+
+    def test_the_headset_turning_on_or_off_checks_the_dongle_too(self):
+        stub = mock.Mock()
+        with mock.patch.object(app.devices, "dongle_present", return_value=False):
+            for event in ("off", "battery", "ack"):
+                app.Application.on_headset(stub, event)
+        stub.window.show_headset.assert_called_once_with(False)
+
+    def test_a_window_opens_showing_the_dongle_as_found_now(self):
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.SCARLETT)
+        with mock.patch.object(app, "Window") as window, \
+                mock.patch.object(app.devices, "dongle_present", return_value=False):
+            app.Application.show_window(stub, {"camera": {}}, None, {}, False)
+        window.return_value.show_headset.assert_called_once_with(False)
+
+    def test_an_unplugged_dongle_shows_the_status_page_and_the_sidebar_says_so(self):
+        win = mock.Mock()
+        ui_window.Window.show_headset(win, False)
+        win.headphones_stack.set_visible_child_name.assert_called_once_with("missing")
+        win.headphones_status.set_label.assert_called_once_with("Not connected")
+        win.reset_mock()
+        ui_window.Window.show_headset(win, True)  # back: the page, whose next poll says battery · volume
+        win.headphones_stack.set_visible_child_name.assert_called_once_with("headset")
+        win.headphones_status.set_label.assert_not_called()
 
 
 if __name__ == "__main__":
