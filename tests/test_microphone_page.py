@@ -178,6 +178,7 @@ class PageCase(unittest.TestCase):
                                                         Adjustment=ns(new=lambda value, lower, upper, *_: dict(
                                                             value=value, lower=lower, upper=upper)))),
                 mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
+                mock.patch.object(microphone.GLib, "timeout_add", lambda ms, f: f()),  # a voice save: at once here
                 mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: f(*a)),
                 mock.patch.object(microphone.threading, "Thread", Inline),
                 mock.patch.object(microphone.scarlett, "send", send),
@@ -718,6 +719,44 @@ class Presets(PageCase):
         self.pick("Broadcast")
         self.assertEqual((self.page.stages["noise"].switch.active, self.page.stages["tone"].switch.active),
                          (False, True))
+
+
+class SavedOffTheNotifyPath(PageCase):
+    """#17 W5 final: store.save fsyncs, so a knob's notifies are saved at most about twice a second on the main loop,
+    the latest value always, and on the window's close or Booth's quit too."""
+
+    def setUp(self):
+        super().setUp()
+        self.timers = []
+        patch = mock.patch.object(microphone.GLib, "timeout_add", lambda ms, f: self.timers.append((ms, f)) or 7)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_dragged_knob_is_saved_once_with_its_latest_value(self):
+        for v in (10.0, 20.0, 30.0):
+            self.page.knobs["noise_strength"].row.set_value(v)
+        self.assertEqual(self.saved, [])  # never per notify
+        self.assertEqual(len(self.timers), 1)
+        self.assertLessEqual(self.timers[0][0], 500)
+        self.assertFalse(self.timers[0][1]())  # fired once: GLib removes it
+        self.assertEqual((self.saved, self.settings["voice"]), ([self.settings], {"noise_strength": 30}))
+        self.page.knobs["noise_strength"].row.set_value(40.0)  # a later change: a new timer
+        self.assertEqual(len(self.timers), 2)
+
+    def test_a_failed_save_says_so_on_every_row_it_carried(self):
+        self.page.knobs["noise_strength"].row.set_value(80.0)
+        self.page.knobs["tone_air"].row.set_value(2.0)
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.timers[0][1]()
+        for key in ("noise_strength", "tone_air"):
+            self.assertEqual(self.page.knobs[key].row.subtitle, "Set, but not saved: No space left on device", key)
+
+    def test_closing_the_window_saves_what_is_pending(self):
+        self.page.knobs["tone_air"].row.set_value(3.0)
+        self.page.stop()
+        self.assertEqual(self.saved, [self.settings])
+        self.timers[0][1]()  # the timer still fires: nothing left to save
+        self.assertEqual(self.saved, [self.settings])
 
 
 class Throttled(PageCase):

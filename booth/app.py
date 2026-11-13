@@ -177,6 +177,8 @@ class Application(Adw.Application):
     def do_shutdown(self):
         voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
         mute.stop()  # #21: its pw-dump --monitor ends with Booth
+        if self.window is not None:  # a quit closes no window by close-request: its pending voice change saved here
+            self.window.microphone.save_voice()
         Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):
