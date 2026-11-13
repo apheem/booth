@@ -103,7 +103,8 @@ def listen(sink):
 
 def other_rate(hw_params):
     """The playback stream's /proc hw_params → a rate the device isn't at, and never the graph's own 48000, which
-    PipeWire won't force while streams run: 44100, or 88200 from there."""
+    PipeWire won't force while streams run: 44100, or 88200 from there. The device is touchier at 88200 (25 Hz at
+    -34 dBFS stopped it there within a second, twice): that stop is heard like any other and goes back to 44100."""
     return 88200 if "rate: 44100" in hw_params else 44100
 
 
