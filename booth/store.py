@@ -22,8 +22,9 @@ def defaults():
     #   "leveling_amount" 0..100 (50 when absent) and "limiter_ceiling" −20..0 dB (−1 when absent), see booth.voice;
     #   "monitor": the "Hear processed voice in headphones" switch, False when absent (booth.monitor); the Tone stage's
     #   switch "tone" (False when absent: an upgrade's sound unchanged) and its knobs "tone_warmth", "tone_presence" and
-    #   "tone_air", gains −12..12 dB (0 when absent). Fresh settings start on booth.voice's DEFAULT_PRESET. "muted":
-    #   Booth's record of Booth Mic's node mute (booth.mute), False when absent: muted, its chain carries silence.
+    #   "tone_air", gains −12..12 dB (0 when absent). Fresh settings (no file) start on booth.voice's DEFAULT_PRESET;
+    #   an existing file without "voice" keeps ABSENT's sound. "muted": Booth's record of Booth Mic's node mute
+    #   (booth.mute), False when absent: muted, its chain carries silence.
     #   Booth Stereo (booth.stereo): "stereo_side", the voice's side, "L" or "R" ("L" when absent), and
     #   "stereo_source", the other side's: "scarlett", "computer" or a source's node name ("scarlett" when absent).
     # routing: {"direct_monitor": the "Turn on Direct Monitor when the PRO X turns off" switch, True when absent}, and
@@ -50,7 +51,8 @@ def path():
     return Path(base) / "booth" / "settings.json"
 
 
-def load(file=None):
+def load(file=None, strict=False):
+    """The settings in `file`; `strict`: a file that can't be read now (EIO, EACCES…) raises OSError, never defaults."""
     file = Path(file or path())
     try:
         raw = file.read_bytes()
@@ -59,6 +61,8 @@ def load(file=None):
     except IsADirectoryError:
         raw = b""  # a folder where the file goes: moved aside below, so the next save can write the file
     except OSError:  # EIO, EACCES, EMFILE…: the file may well be fine, so it stays exactly where it is
+        if strict:
+            raise
         return defaults()
     try:
         data = json.loads(raw.decode())
@@ -93,7 +97,8 @@ def load(file=None):
         except OSError:
             pass  # can't move it aside (read-only folder): it stays as it is, and Booth still starts
         return defaults()
-    return defaults() | data
+    # a missing section takes its default, but an existing file's voice is never the preset: an upgrade keeps its sound
+    return defaults() | {"voice": {}} | data
 
 
 def save(settings, file=None):

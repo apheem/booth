@@ -290,11 +290,22 @@ class Store(unittest.TestCase):
         self.assertEqual(store.load(self.path), store.defaults())
         self.assertFalse(self.path.exists())
 
-    def test_missing_keys_take_defaults(self):
+    def test_missing_keys_take_defaults_but_an_existing_files_voice_never_takes_the_preset(self):  # #17 W5 final
         self.path.parent.mkdir(parents=True)
         self.path.write_text('{"version": 1}')
-        self.assertEqual(store.load(self.path), store.defaults())
+        # an upgrade's sound unchanged (voice.ABSENT: no Tone): only fresh settings start on Broadcast
+        self.assertEqual(store.load(self.path), dict(store.defaults(), voice={}))
         self.assertTrue(self.path.exists())
+        self.path.write_text('{"version": 1, "voice": {"rumble": false}}')  # a section is never merged with the preset
+        self.assertEqual(store.load(self.path)["voice"], {"rumble": False})
+
+    def test_strict_raises_a_read_error_never_defaults(self):  # booth.voice --write keeps its last run conf
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('{"version": 1}')
+        with mock.patch.object(Path, "read_bytes", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(OSError):
+                store.load(self.path, strict=True)
+            self.assertEqual(store.load(self.path), store.defaults())
 
     def test_defaults_are_fresh_copies(self):
         store.defaults()["camera"]["zoom_absolute"] = 5

@@ -546,18 +546,56 @@ def _restarted(key, clock):
     _HEALED[key] = clock()
 
 
-def _held(settings, dump):
-    """#21: muted with Booth Mic running, so no restart: while booth_mic is gone a call falls back to the raw mic,
-    unmuted. A Booth Mic that isn't running has no gap to fall back in, so it still starts. Fail closed: only a pw-dump
-    that read a list without booth_mic says it isn't running, never a failed or empty one."""
-    if not (settings.get("voice") or {}).get("muted"):
+def _live_muted(text):
+    """booth_mic's own node mute in `pw-dump` JSON `text` (booth.mute.find's): True only when it reads muted."""
+    from booth import mute  # here, not at the top: mute imports voice
+    try:
+        node = mute.find(json.loads(text))
+    except (TypeError, ValueError):
         return False
+    return bool(node and node[2])
+
+
+def _held(settings, dump):
+    """#21: muted (the record, or booth_mic's live node mute: GNOME's Ctrl+Alt+M with no Booth to record it) with Booth
+    Mic running, so no restart: while booth_mic is gone a call falls back to the raw mic, unmuted. A Booth Mic that
+    isn't running has no gap to fall back in, so it still starts. Fail closed: only a pw-dump that read a list without
+    booth_mic says it isn't running, never a failed or empty one."""
     text = dump()
+    if not ((settings.get("voice") or {}).get("muted") or _live_muted(text)):
+        return False
     try:
         listed = isinstance(json.loads(text), list)
     except (TypeError, ValueError):
         listed = False
     return not listed or _node_id(text, NODE) is not None
+
+
+def _saved():
+    """The saved settings for booth.voice's own runs (install.sh's sync and --reload, the pre-start), with no Booth to
+    watch booth_mic: its live node mute recorded when the record lacks it, so the chain built now and a booth_mic
+    recreated later (a PipeWire restart: booth.mute --enforce) are muted too. OSError: unreadable, never written over."""
+    settings = store.load(strict=True)
+    if not (settings.get("voice") or {}).get("muted") and _live_muted(_dump()):
+        settings.setdefault("voice", {})["muted"] = True
+        try:
+            store.save(settings)
+        except OSError:
+            pass  # the chain built from it now is silent anyway
+    return settings
+
+
+def _within(cfg, running):
+    """`cfg` with only the controls the running chain `running` (its config on disk) has, master's gains alone when it
+    can't be read: a held restart's new controls can't land on the chain that runs, only the mute must."""
+    try:
+        has = {n["name"]: set(n.get("control", {})) for n in _graph_nodes(running)}
+    except (AttributeError, KeyError, TypeError):
+        has = {"master": {"Gain 1", "Gain 2"}}
+    cfg = copy.deepcopy(cfg)
+    for n in _graph_nodes(cfg):
+        n["control"] = {k: v for k, v in n.get("control", {}).items() if k in has.get(n["name"], ())}
+    return cfg
 
 
 def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
@@ -595,7 +633,8 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
         # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
         live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
         changed = old != chain or live != chain
-        if live != chain and (held or not restart) and (missed := set_live(chain, run, dump)) != []:
+        if live != chain and (held or not restart) and (missed := set_live(_within(chain, now) if held else chain,
+                                                                          run, dump)) != []:
             # not recorded: the next apply sends every control again
             said = f"not applied: Booth Mic didn't take {', '.join(missed) if missed else 'the change'}"
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
@@ -756,19 +795,24 @@ def write(file=None, where=None):
     verified now, at their verified paths, in the shape this code builds from them (else every apply would restart it):
     Booth Mic starts on it, touched so apply sends it the saved values live; "not …": then the unit doesn't start."""
     _VERIFIED.clear()  # what pipewire loads: hashed now, never a poll's cached verdict
-    file, found, settings = file or path().with_name(RUN_CONF), verified(where), store.load()
-    cfg = json.loads(build(settings, found))
-    said = None if _load(file) == cfg else _save(cfg, file)
+    file, found = file or path().with_name(RUN_CONF), verified(where)
+    try:
+        settings = _saved()
+    except OSError as e:  # EIO: never rebuilt from defaults (another sound, unmuted): the last one kept, as below
+        settings, said = None, f"not read: the settings ({e.strerror or e})"
+    else:
+        cfg = json.loads(build(settings, found))
+        said = None if _load(file) == cfg else _save(cfg, file)
     on_disk = _load(file) if said else None
     kept = _plugins(on_disk)
-    if (kept is not None and all(found.get(k) == v for k, v in kept.items())
-            and shape(on_disk) == shape(json.loads(build(settings, kept)))):
+    if (kept is not None and all(found.get(k) == v for k, v in kept.items())  # a shape is the plugins', not settings'
+            and shape(on_disk) == shape(json.loads(build(settings or {}, kept)))):
         try:
             os.utime(file)  # newer than voice.conf: its values may be older than what Booth set live
         except OSError:
             pass
         master = lambda c: [n.get("control") for n in _graph_nodes(c) if n.get("name") == "master"]  # noqa: E731
-        if (settings.get("voice") or {}).get("muted") and master(on_disk) != master(cfg):
+        if settings and (settings.get("voice") or {}).get("muted") and master(on_disk) != master(cfg):
             return f"kept the last config, {said}; it isn't silent though Booth Mic is muted: booth.mute --enforce " \
                    "mutes its node"
         return f"kept the last config, {said}"
@@ -783,7 +827,11 @@ def reload(run=service.run, file=None):
         _VERIFIED.clear()  # an install's fresh plugins: hashed now
         if _plugins(_running(file or path())) == verified():
             return True
-        return HELD_RELOAD if _held(store.load(), _dump) else run(RESTART)
+        try:
+            settings = _saved()
+        except OSError:  # unreadable: _held still reads booth_mic's own mute
+            settings = {}
+        return HELD_RELOAD if _held(settings, _dump) else run(RESTART)
 
 
 def main():
@@ -800,7 +848,11 @@ def main():
         return 0 if done else 1
     if args[:1] == ["--select"] and len(args) == 2:
         return 0 if may_select(Path(args[1])) else 1
-    print(sync(store.load()))
+    try:
+        settings = _saved()
+    except OSError:
+        settings = store.load()
+    print(sync(settings))
     return 0
 
 
