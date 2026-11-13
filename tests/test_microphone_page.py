@@ -130,6 +130,7 @@ Page = type("MicrophoneStandIn", (GObject.Object,), {
 class PageCase(unittest.TestCase):
     def setUp(self):
         self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
+        self.said, self.selecting = "live", True  # what voice.apply returns; whether Booth Mic's selector runs
         self.settings = {"microphone": {}}
 
         real_send = scarlett.send
@@ -153,7 +154,8 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.scarlett, "send", send),
                 mock.patch.object(microphone.store, "save", self.saved.append),
                 mock.patch.object(microphone.voice, "apply",
-                                  lambda s, mic: self.applied.append((dict(s["voice"]), mic))),
+                                  lambda s, mic: self.applied.append((dict(s["voice"]), mic)) or self.said),
+                mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst)):
             patch.start()
@@ -359,6 +361,22 @@ class VoiceGroup(PageCase):
         self.click(self.page.master, True)
         self.assertEqual(self.page.master.subtitle, microphone.MASTER)
 
+    def test_a_change_booth_mic_didnt_take_says_so_on_the_row(self):
+        self.said = "not applied: Booth Mic didn't take the change"
+        self.click(self.page.rumble, False)
+        self.assertEqual(self.page.rumble.subtitle, "Set, but not applied: Booth Mic didn't take the change")
+        self.said = "live"
+        self.click(self.page.rumble, True)
+        self.assertEqual(self.page.rumble.subtitle, microphone.RUMBLE)
+
+    def test_a_poll_with_the_selector_down_says_booth_mic_is_waiting_for_the_scarlett(self):
+        s, self.selecting = state(), False  # the Scarlett just came back: Booth restarts the selector within 10 s
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.page.voice.description, voice.WAITING)
+
     def test_each_poll_says_where_booth_mic_takes_its_input(self):
         self.show(state())
         self.assertEqual(self.page.voice.description, voice.describe(state()))
@@ -497,7 +515,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4))])
+        self.assertEqual(self.idle, [(page.show, (None, 4, True))])
 
 
 if __name__ == "__main__":

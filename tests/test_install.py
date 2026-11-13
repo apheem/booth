@@ -31,11 +31,14 @@ OWNER = ("gdbus call --session --dest org.freedesktop.DBus --object-path /org/fr
          f" --method org.freedesktop.DBus.NameHasOwner {APP_ID}")
 UNIT_CALLS = ["systemctl --user daemon-reload", "systemctl --user enable booth.service",
               "systemctl --user restart booth.service"]
-# Booth Mic: its unit enabled whatever the Run in Background switch says, then made the default mic by name. With no
-# Scarlett (amixer is stubbed empty) no config is written and booth-voice.service isn't started: Booth does it later.
+# Booth Mic: its two units enabled whatever the Run in Background switch says. With no Scarlett (amixer is stubbed
+# empty) Booth Mic's chain is written and started, its selector not; the first install makes it the default mic by name.
 DEFAULT_MIC = 'pw-metadata -n default 0 default.configured.audio.source { "name": "booth_mic" } Spa:String:JSON'
-VOICE_CALLS = ["systemctl --user daemon-reload", "systemctl --user enable booth-voice.service", DEFAULT_MIC]
-V = len(VOICE_CALLS)
+VOICE_UNITS = "booth-voice.service booth-mic-select.service"
+VOICE_AGAIN = ["systemctl --user daemon-reload", f"systemctl --user enable {VOICE_UNITS}",
+               f"systemctl --user start {VOICE_UNITS}"]  # a re-install: the same config, no new default mic
+VOICE_CALLS = VOICE_AGAIN[:2] + [f"systemctl --user restart {VOICE_UNITS}", VOICE_AGAIN[2], DEFAULT_MIC]
+V, A = len(VOICE_CALLS), len(VOICE_AGAIN)
 STALE = "Booth is still running the old version"
 CLOSED = "Booth was closed to update it — open it again from the app grid."
 NO_SYSTEMD = "couldn't reach systemd; run: systemctl --user daemon-reload && systemctl --user restart booth.service"
@@ -111,7 +114,7 @@ class Install(unittest.TestCase):
         code = [ln for ln in (REPO / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
         self.assertFalse([ln for ln in code if "sudo" in ln])
         written = {p.relative_to(self.home).parts[:2] for p in self.home.rglob("*") if p.is_file()}
-        self.assertEqual(written, {(".local", "bin"), (".local", "share"), (".config", "systemd")})
+        self.assertEqual(written, {(".local", "bin"), (".local", "share"), (".config", "systemd"), (".config", "booth")})
 
     def test_installs_enables_and_starts_the_service(self):
         r = self.install()
@@ -142,21 +145,41 @@ class Install(unittest.TestCase):
         self.assertIn("Restart=on-failure", unit)
         self.assertNotIn("graphical-session", voice_unit.read_text())
         self.assertIn("Booth Mic is waiting for the Scarlett", r.stdout)  # what booth.voice said
-        self.assertNotIn("restart booth-voice", self.calls.read_text())  # no config, nothing to restart
-        self.assertEqual(sorted(os.listdir(self.unit.parent)), ["booth-voice.service", "booth.service"])
+        self.assertEqual(sorted(os.listdir(self.unit.parent)),
+                         ["booth-mic-select.service", "booth-voice.service", "booth.service"])
+
+    def test_installs_booth_mic_select_which_runs_the_selector_bound_to_booth_voice(self):
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        unit = (self.unit.parent / "booth-mic-select.service").read_text().splitlines()
+        conf = self.home / ".config/booth/voice-select.conf"
+        self.assertIn(f'ExecStart=/usr/bin/pipewire -c "{conf}"', unit)
+        self.assertIn(f'ExecCondition=/usr/bin/test -f "{conf}"', unit)  # no mic channel seen yet: skipped
+        self.assertIn("BindsTo=booth-voice.service", unit)  # it feeds Booth Mic's input: never runs without it
+        self.assertIn("After=booth-voice.service", unit)
+        self.assertIn("WantedBy=booth-voice.service", unit)
+        self.assertIn("Restart=on-failure", unit)
+
+    def test_only_the_first_install_makes_booth_mic_the_default_mic(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn(DEFAULT_MIC, self.calls.read_text().splitlines())
+        self.calls.write_text("")  # the user may have chosen another mic since: a re-install never overrides it
+        self.assertEqual(self.install().returncode, 0)
+        self.assertNotIn("pw-metadata", self.calls.read_text())
+        self.assertEqual(self.calls.read_text().splitlines()[:A], VOICE_AGAIN)
 
     def test_booth_mic_is_set_up_even_with_the_background_service_switched_off(self):
         self.assertEqual(self.install().returncode, 0)
         self.env["UNIT_STATE"] = "disabled"
         self.calls.write_text("")
         self.assertEqual(self.install().returncode, 0)
-        self.assertEqual(self.calls.read_text().splitlines()[:V], VOICE_CALLS)
+        self.assertEqual(self.calls.read_text().splitlines()[:A], VOICE_AGAIN)
 
     def test_without_a_user_manager_it_says_how_to_start_booth_mic(self):
         self.env["SYSTEMCTL_RC"] = "1"
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("systemctl --user enable --now booth-voice.service", r.stderr)
+        self.assertIn(f"systemctl --user enable --now {VOICE_UNITS}", r.stderr)
         self.assertIn(DEFAULT_MIC, self.calls.read_text())  # by name: it still becomes the default when it appears
 
     def test_without_pipewire_it_says_how_to_choose_booth_mic(self):
@@ -199,7 +222,7 @@ class Install(unittest.TestCase):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.calls.read_text().splitlines()
-        self.assertEqual(calls[V + 2:], ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload"])
+        self.assertEqual(calls[A + 2:], ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload"])
         self.assertNotIn("couldn't start", r.stderr)
 
     def test_fsk_reinstall_with_no_user_bus_says_nothing(self):
@@ -238,7 +261,7 @@ class Install(unittest.TestCase):
         self.calls.write_text("")
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.calls.read_text().splitlines()[V + 2:],
+        self.assertEqual(self.calls.read_text().splitlines()[A + 2:],
                          ["systemctl --user is-enabled booth.service", "systemctl --user daemon-reload",
                           "systemctl --user restart booth.service"])
 
@@ -275,7 +298,8 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(tree(self.app), tree(REPO / "booth"))
         self.assertEqual(list(self.app.parent.iterdir()), [self.app])
-        self.assertEqual(sorted(os.listdir(self.unit.parent)), ["booth-voice.service", "booth.service"])  # no .new left
+        self.assertEqual(sorted(os.listdir(self.unit.parent)),
+                         ["booth-mic-select.service", "booth-voice.service", "booth.service"])  # no .new left
 
     def test_relative_xdg_data_home_is_ignored(self):
         self.env["XDG_DATA_HOME"] = "rel/share"  # invalid per the XDG spec: must not install relative to the cwd
@@ -352,15 +376,16 @@ class Install(unittest.TestCase):
         m = re.fullmatch(r'ExecStart=/bin/sh "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" --background', start)
         self.assertIsNotNone(m, start)
         self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]), str(launcher))
-        voice_unit = unit.parent / "booth-voice.service"
-        for key in ("ExecStart=/usr/bin/pipewire -c", "ExecCondition=/usr/bin/test -f"):
-            line = next(ln for ln in voice_unit.read_text().splitlines() if ln.startswith(key))
-            m = re.fullmatch(re.escape(key) + r' "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"', line)
-            self.assertIsNotNone(m, line)
-            self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
-                             str(self.home / ".config/booth/voice.conf"))
+        voice_unit, select_unit = unit.parent / "booth-voice.service", unit.parent / "booth-mic-select.service"
+        for u, conf in ((voice_unit, "voice.conf"), (select_unit, "voice-select.conf")):
+            for key in ("ExecStart=/usr/bin/pipewire -c", "ExecCondition=/usr/bin/test -f"):
+                line = next(ln for ln in u.read_text().splitlines() if ln.startswith(key))
+                m = re.fullmatch(re.escape(key) + r' "((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"', line)
+                self.assertIsNotNone(m, line)
+                self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
+                                 str(self.home / ".config/booth" / conf))
         if shutil.which("systemd-analyze"):  # read-only: parses the unit, starts nothing
-            for u in (unit, voice_unit):
+            for u in (unit, voice_unit, select_unit):
                 v = subprocess.run(["systemd-analyze", "--user", "verify", str(u)], capture_output=True, text=True,
                                    timeout=60)
                 self.assertEqual(v.returncode, 0, v.stderr)

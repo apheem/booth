@@ -118,6 +118,8 @@ class Application(Adw.Application):
         self.sync_voice()
         self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
         GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
+        # Booth Mic's selector back within 10 s of its Scarlett: a replug, a login race or a profile switch (no by-id event)
+        GLib.timeout_add_seconds(BATTERY_S, self.heal_voice)
         if self.background:
             self.hold()
             self.held = True
@@ -140,6 +142,10 @@ class Application(Adw.Application):
     def sync_voice(self):
         """Booth Mic's config up to date with the Scarlett and its service started (amixer, pw-dump: off the main loop)."""
         threading.Thread(target=lambda: voice.sync(self.settings), daemon=True).start()
+
+    def heal_voice(self):
+        threading.Thread(target=voice.heal, daemon=True).start()  # pw-dump, off the main loop
+        return True
 
     def low_battery(self, percent):
         note = Gio.Notification.new("Headset battery low")

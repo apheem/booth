@@ -89,15 +89,16 @@ class MicrophonePage(Adw.PreferencesPage):
         return GLib.SOURCE_CONTINUE
 
     def read(self, since):
-        state = None
+        state, selecting = None, True
         try:
             state = scarlett.read(self.choice())
             if state:  # unplugged: the running chain keeps its last config
                 voice.apply(self.settings, state["mic"])
+                selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
         finally:  # always: show() clears polling, else the page stops following outside changes
-            GLib.idle_add(self.show, state, since)
+            GLib.idle_add(self.show, state, since, selecting)
 
-    def show(self, state, since):
+    def show(self, state, since, selecting=True):
         self.polling = False
         self.record, problem = meter.source(state)
         self.levels.set_description(problem or meter.COACHING)
@@ -105,7 +106,7 @@ class MicrophonePage(Adw.PreferencesPage):
             self.on_meter_failed(problem)
         self.meter_update()
         self.mic = state["mic"] if state else None
-        self.voice.set_description(voice.describe(state))
+        self.voice.set_description(voice.describe(state, selecting))
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
             ctrls = state["ctrls"] if state else {}
@@ -205,8 +206,13 @@ class MicrophonePage(Adw.PreferencesPage):
             row.set_subtitle(subtitle)
         except OSError as e:  # applied anyway: the user must know it won't last
             row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
-        mic = self.mic  # shortcut: unplugged (None), the switch applies at the next poll that finds the mic
-        threading.Thread(target=lambda: voice.apply(self.settings, mic), daemon=True).start()
+        mic = self.mic  # unplugged (None): the chain still takes the switch; the selector keeps its last config
+
+        def apply():
+            said = voice.apply(self.settings, mic)
+            if said.startswith("not "):  # not recorded: the next poll's apply tries again
+                GLib.idle_add(row.set_subtitle, f"Set, but {said}")
+        threading.Thread(target=apply, daemon=True).start()
 
     def spawn(self, make, done):
         threading.Thread(target=lambda: self.write(make, done), daemon=True).start()
