@@ -506,6 +506,10 @@ class VoiceGroup(PageCase):
             self.assertNotEqual(said, voice.WAITING)
         self.assertEqual(self.unplugged_poll(voice.SCARLETT), voice.WAITING)  # its own selector: back when it is
 
+    def test_unplugged_with_the_backup_selector_down_says_waiting_never_runs_from_it(self):  # heal's backoff
+        self.selecting = False
+        self.assertEqual(self.unplugged_poll(voice.BRIO_MIC), voice.WAITING)
+
     def test_unplugged_with_booth_mic_stopped_says_stopped_and_never_meters_it(self):
         self.running = False
         self.assertEqual(self.unplugged_poll(voice.BRIO_MIC), voice.STOPPED)

@@ -426,6 +426,7 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
         restart = shape(now) != shape(chain)
         # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
         # kept run conf holds older ones), else voice.conf's, what apply set live since
+        # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
         live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
         changed = old != chain or live != chain
         if live != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
@@ -565,7 +566,7 @@ def describe(state, selecting=True, said="", running=True, source=None):
         return NOT_ROUTED
     if not running:
         return STOPPED
-    if state is None and source in dict(BACKUPS):
+    if state is None and source in dict(BACKUPS) and selecting:  # else silent: heal brings it back
         return f"Booth Mic runs from the {source}: the Scarlett isn't connected"
     if not mic or not mic["node"] or not mic["position"] or not selecting:
         return WAITING

@@ -2,10 +2,12 @@
 BRIO mic, each by name and its own discovered position, and goes back to the Scarlett when it returns. Only the selector
 ever restarts, so Booth Mic (booth_mic) and its node mute stay; the routing policy says each settled change once."""
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from booth import routing, voice
 from tests.test_headset import DUMP
@@ -369,6 +371,25 @@ class Release(unittest.TestCase):
             self.assertFalse(voice.may_select(self.select, owned=owned))  # the backup it read never starts
             self.assertEqual(json.loads(self.select.read_text()), selector(), mic["node"])
             self.assertEqual(sorted(p.name for p in self.select.parent.iterdir()), [voice.SELECT_CONF])
+
+    def test_the_selector_unit_never_overwrites_an_even_newer_config_booth_wrote_after_its_check(self):
+        """As above, and Booth writes again between the unit moving its read aside and linking the newer one back:
+        that latest config is kept, the one moved aside is dropped."""
+        self.on(self.backups[1])
+        real, latest = os.replace, selector(self.backups[0])
+
+        def replace(src, dst):
+            real(src, dst)
+            if Path(src) == self.select:  # the unit's move aside: Booth's next save lands right after it
+                voice._save(latest, self.select)
+
+        def owned():
+            voice._save(selector(), self.select)
+            return False
+        with mock.patch.object(voice.os, "replace", replace):
+            self.assertFalse(voice.may_select(self.select, owned=owned))
+        self.assertEqual(json.loads(self.select.read_text()), latest)
+        self.assertEqual(sorted(p.name for p in self.select.parent.iterdir()), [voice.SELECT_CONF])
 
     def test_the_selector_unit_always_starts_the_scarlett_and_never_no_config(self):
         self.on(MIC)

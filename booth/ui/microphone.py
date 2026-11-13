@@ -155,7 +155,7 @@ class MicrophonePage(Adw.PreferencesPage):
                     selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
                     running = selecting or voice.running()  # the selector runs only with Booth Mic (BindsTo)
                 else:  # on a backup, or silent: said so, and a stopped Booth Mic is never metered
-                    running, source = voice.running(), voice.current()
+                    running, source, selecting = voice.running(), voice.current(), voice.selecting()
             found = voice.verified()  # verified and running: one verified since waits for a restart
             missing = dict.fromkeys(voice.missing(voice.loaded(found=found)), PENDING)
             missing.update(dict.fromkeys(voice.missing(found), MISSING))

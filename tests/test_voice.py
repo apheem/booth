@@ -7,6 +7,8 @@ import json
 import os
 import tempfile
 import threading
+import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -425,6 +427,41 @@ class Verification(unittest.TestCase):
         where.chmod(0o775)  # its folder group-writable: everything in it refused
         self.assertEqual(self.found(where, manifest), {})
 
+    def test_a_same_size_rewrite_with_its_mtime_put_back_is_hashed_again(self):  # only its ctime tells
+        names = list(plugins.MANIFEST)
+        where, manifest = plugin_folder(self, good=names, bad=())
+        p, every = where / names[0], {n: str(where / n) for n in names}
+        self.assertEqual(self.found(where, manifest), every)
+        before = os.stat(p)
+        for _ in range(100):  # a coarse ctime clock: until the rewrite lands on another tick
+            p.write_bytes(b"\0" * before.st_size)
+            os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns))
+            if os.stat(p).st_ctime_ns != before.st_ctime_ns:
+                break
+            time.sleep(0.01)
+        self.assertEqual((os.stat(p).st_size, os.stat(p).st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.assertNotIn(names[0], self.found(where, manifest))
+
+    def test_each_field_of_the_cache_key_alone_gets_the_plugin_hashed_again(self):
+        """A swap by rename (inode), a hardlink or chmod (ctime, mode), a chown (uid), the folder replaced or changed:
+        each one field that differs from the cached verdict's misses it. A new pin too."""
+        names = list(plugins.MANIFEST)
+        where, manifest = plugin_folder(self, good=names, bad=())
+        name, real = names[0], os.stat
+        fields = ("st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode", "st_uid")
+        self.found(where, manifest)
+        folder_fields = ("st_ino", "st_mode", "st_uid", "st_ctime_ns")  # a new entry in it changes its ctime
+        for folder, field in [(False, f) for f in fields] + [(True, f) for f in folder_fields]:
+            with self.subTest(folder=folder, field=field):
+                def stat(p, *a, **k):
+                    s, bump = real(p, *a, **k), Path(p) == (where if folder else where / name)
+                    return types.SimpleNamespace(**{f: getattr(s, f) + (f == field and bump) for f in fields})
+                with mock.patch.object(voice.os, "stat", stat):
+                    self.assertIn(name, self.hashed(lambda: self.found(where, manifest)))
+                self.found(where, manifest)  # cached again on the real stat
+                self.assertEqual(self.hashed(lambda: self.found(where, manifest)), [])
+        self.assertNotIn(name, self.found(where, dict(manifest, **{name: "0" * 64})))  # pinned to other bytes now
+
     def test_the_pre_start_hashes_every_plugin_every_time_never_a_cached_verdict(self):
         names = list(plugins.MANIFEST)
         where, manifest = plugin_folder(self, good=names, bad=())
@@ -694,6 +731,17 @@ class KeptRunConf(unittest.TestCase):
                                          file=self.file), "unchanged")
         self.assertEqual(ran, [])
         self.assertEqual(self.run_conf.read_text(), voice.build(ON, FOUND))  # never written by apply
+
+    def test_a_run_conf_no_newer_than_voice_conf_counts_as_voice_conf(self):  # an equal mtime: voice.conf's values
+        off = {"voice": {"enabled": False}}
+        self.file.write_text(voice.build(off, FOUND))
+        self.run_conf.write_text(voice.build(ON, FOUND))
+        for f in (self.file, self.run_conf):
+            os.utime(f, ns=(10**18, 10**18))
+        ran = []
+        with mock.patch.object(voice, "verified", lambda where=None: FOUND):
+            said = voice.apply(off, None, run=lambda c: ran.append(c) or True, dump=lambda: CHAIN_DUMP, file=self.file)
+        self.assertEqual((said, ran), ("unchanged", []))
 
     def test_a_run_conf_of_another_shape_is_never_kept_so_booth_mic_is_restarted_once(self):
         """New code (a new shape), voice.conf saved, the run conf can't be replaced: kept, Booth Mic would run the old
@@ -1033,6 +1081,8 @@ class Sync(unittest.TestCase):
                          "Booth Mic runs from the BRIO mic: the Scarlett isn't connected")
         self.assertEqual(voice.describe(None, running=False, source=voice.BRIO_MIC), voice.STOPPED)
         self.assertEqual(voice.describe(None, source=voice.SCARLETT), voice.WAITING)
+        # its backup selector isn't up (heal's backoff, a failed start): Booth Mic is silent, never "runs from"
+        self.assertEqual(voice.describe(None, selecting=False, source=voice.BRIO_MIC), voice.WAITING)
 
     def test_a_selector_that_wont_stop_is_never_shown_as_no_input(self):
         said = "not stopped: Booth Mic's source still takes the mic's old channel"

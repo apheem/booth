@@ -531,6 +531,15 @@ class Executor(unittest.TestCase):
         self.assertEqual(self.settle(ex), 1)
         self.assertEqual((ex.state, fake.writes[-1][-1]), ({}, "off"))
 
+    def test_each_headset_transition_gives_unreadable_direct_monitor_fresh_reads(self):
+        ex = self.executor(dump(PROX, PROX), {"direct": False})
+        ex.run = lambda *cmd: "" if cmd[0] == "amixer" else self.run(*cmd)  # no controls
+        self.settle(ex)
+        self.assertEqual(self.settle(ex), 0)  # capped
+        ex.listener("on")
+        ex.events.get_nowait()  # its step not run: only the cap's reset counts here
+        self.assertEqual(self.settle(ex), routing.TRIES)
+
     def test_a_put_back_tick_never_stops_the_headsets_retries(self):
         objects = [o for o in json.loads(dump(SCARLETT, SCARLETT)) if "Logitech" not in json.dumps(o.get("info") or {})]
         ex = self.executor(json.dumps(objects), {"moved": True})
