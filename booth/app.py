@@ -21,6 +21,19 @@ APP_ID = "io.github.apheem.Booth"
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
 RESTORING = camera.WRITING  # the startup, replug and window-open restores and the page's writes never interleave
 BATTERY_S = 10  # the PRO X battery poll: also how soon "headset off" is noticed
+ON_MAIN_S = 10  # how long a worker waits for the main loop before taking "no" (it is quitting)
+
+
+def on_main(f, *args):
+    """From a worker: f(*args) on the main loop, waited for → its result, or False when the main loop didn't run it."""
+    done, out = threading.Event(), [False]
+
+    def call():
+        out[0] = f(*args)
+        done.set()
+    GLib.idle_add(call)
+    done.wait(ON_MAIN_S)
+    return out[0]
 
 
 def off_main(work, done):
@@ -119,8 +132,8 @@ class Application(Adw.Application):
         self.sync_voice()
         # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
         # before the first poll, whose reading is the startup transition
-        self.routing = routing.Executor(self.settings.get("routing", {}), lambda text: GLib.idle_add(self.routed, text),
-                                        lambda state: GLib.idle_add(self.save_routing, state))
+        self.routing = routing.Executor(self.settings, lambda text: GLib.idle_add(self.routed, text),
+                                        lambda state: on_main(self.save_routing, state))
         self.headset_monitor.listeners.append(self.routing.listener)
         self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
         GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
@@ -172,13 +185,17 @@ class Application(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def save_routing(self, state):
-        self.settings["routing"] = state  # on the main loop, as every other save of the shared dict
+        """The routing's record → True when it reached the disk. On the main loop, as every other save of the shared
+        dict, so the user's switch next to it (the Microphone page's) is never lost."""
+        self.settings["routing"] = state | {k: v for k, v in self.settings.get("routing", {}).items()
+                                            if k == routing.SETTING}
         try:
             store.save(self.settings)
+            return True
         except OSError as e:  # disk full, read-only: kept in memory, but a restart won't know Booth moved the sound
             self.send_notification("routing-unsaved",
                                    Gio.Notification.new(f"Sound routing set, but not saved: {e.strerror or e}"))
-        return GLib.SOURCE_REMOVE
+            return False
 
     def restore_saved(self):
         # one writer: the page queues it behind its own writes, even a closed one's whose last write isn't saved yet

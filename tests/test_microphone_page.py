@@ -39,6 +39,7 @@ class _W:
     def __init__(self, *_args, **kwargs):
         self.handlers, self.active, self.selected, self.sensitive = {}, False, 0, True
         self.description = self.subtitle = self.model = None
+        self.title = kwargs.get("title")
         self.responses = []
 
     def connect(self, signal, handler, *args):
@@ -328,6 +329,33 @@ class ScarlettGroup(PageCase):
         with mock.patch.object(microphone.GLib, "source_remove", removed.append):
             self.page.stop()
         self.assertEqual(removed, [self.page.timer])
+
+
+class DirectMonitorSetting(PageCase):
+    """"Turn on Direct Monitor when the PRO X turns off": the routing policy's switch, saved, never a Scarlett write."""
+
+    def test_it_starts_on_and_shows_the_saved_value(self):
+        self.assertTrue(self.page.auto.active)
+        self.assertEqual(self.page.auto.title, "Turn on Direct Monitor when the PRO X turns off")
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "routing": {"direct_monitor": False}})
+        self.assertFalse(page.auto.active)
+
+    def test_a_click_is_saved_and_never_writes_the_scarlett(self):
+        self.show(state())
+        self.click(self.page.auto, False)
+        self.assertEqual((self.settings["routing"], self.saved), ({"direct_monitor": False}, [self.settings]))
+        self.assertEqual(self.ran, [])
+        self.settings["routing"] = {"moved": True}  # the routing saved its record since: a new dict
+        self.click(self.page.auto, True)
+        self.assertEqual(self.settings["routing"], {"moved": True, "direct_monitor": True})
+
+    def test_a_failed_save_says_so_on_the_row(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.click(self.page.auto, False)
+        self.assertEqual(self.page.auto.subtitle, "Set, but not saved: No space left on device")
+        self.click(self.page.auto, True)
+        self.assertEqual(self.page.auto.subtitle, microphone.AUTO)
 
 
 class VoiceGroup(PageCase):

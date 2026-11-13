@@ -282,21 +282,27 @@ class BackgroundLaunch(unittest.TestCase):
     def watch(self, background):
         stub = mock.Mock(held=False, background=background, settings={"routing": {"moved": True, "direct": False}})
         folders, idle = {path: mock.Mock(name=path) for path in ("/dev/v4l/by-id", "/dev/snd/by-id")}, []
+
+        def idle_add(f, *a):  # the main loop runs it at once; a source id back, as GLib's
+            idle.append((f, a))
+            f(*a)
+            return 7
         with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get), \
                 mock.patch.object(app.GLib, "timeout_add_seconds") as every, \
                 mock.patch.object(app.routing, "Executor") as executor, \
-                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+                mock.patch.object(app.GLib, "idle_add", idle_add):
             app.Application.watch(stub)
             # the routing policy follows the PRO X in every primary instance, subscribed before the first poll, from
             # the saved move (a restart while moved still puts it back); its notifications and saves go to the main loop
-            (state, notify, save), = [c.args for c in executor.call_args_list]
+            (settings, notify, save), = [c.args for c in executor.call_args_list]
             self.assertIs(stub.routing, executor.return_value)
             self.assertEqual(stub.headset_monitor.mock_calls[:2],
                              [mock.call.listeners.append(executor.return_value.listener), mock.call.poll()])
             notify("PRO X off")
-            save({})
-        self.assertEqual(state, {"moved": True, "direct": False})
-        self.assertEqual(idle, [(stub.routed, ("PRO X off",)), (stub.save_routing, ({},))])
+            self.assertIs(save({}), stub.save_routing.return_value)  # waited for: the write-ahead needs the answer
+        self.assertIs(settings, stub.settings)  # the saved record and the user's switch, read at each step
+        self.assertEqual(idle[0], (stub.routed, ("PRO X off",)))
+        stub.save_routing.assert_called_once_with({})
         stub.headset_monitor.poll.assert_called_once_with()  # the battery now, in every primary instance
         # then every 10 s, window or not: the battery, a routing rule not settled yet (the PRO X sink not back, a failed
         # write) run again, and Booth Mic's selector restarted if its Scarlett is back
@@ -600,6 +606,12 @@ class HeadsetBattery(unittest.TestCase):
             app.off_main(lambda: 1 / 0, "done")
         self.assertEqual(idle, [("done", (None,))])
 
+    def test_on_main_runs_on_the_main_loop_and_waits_for_its_answer(self):  # the routing's write-ahead save
+        with mock.patch.object(app.GLib, "idle_add", lambda f, *a: threading.Timer(0.05, f, a).start()):
+            self.assertEqual(app.on_main(lambda x: x + 1, 1), 2)  # the main loop busy for a moment: waited for
+        with mock.patch.object(app.GLib, "idle_add", lambda f, *a: None), mock.patch.object(app, "ON_MAIN_S", 0):
+            self.assertIs(app.on_main(lambda: True), False)  # the main loop gone (quitting): not saved
+
     def test_the_application_owns_one_monitor_wired_to_its_notification_and_worker(self):
         booth = app.Application()
         self.assertIs(booth.headset_monitor.spawn, app.off_main)
@@ -617,10 +629,10 @@ class HeadsetBattery(unittest.TestCase):
         stub.send_notification.assert_called_once_with("routing", notification.new.return_value)
 
     def test_the_routing_state_is_saved_in_the_shared_settings(self):
-        stub = mock.Mock(settings={"version": 1, "routing": {}})
+        stub = mock.Mock(settings={"version": 1, "routing": {"moved": True, "direct": False, "direct_monitor": False}})
         with mock.patch.object(app.store, "save") as save:
-            self.assertIs(app.Application.save_routing(stub, {"moved": True, "direct": False}), GLib.SOURCE_REMOVE)
-        self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
+            self.assertIs(app.Application.save_routing(stub, {}), True)
+        self.assertEqual(stub.settings["routing"], {"direct_monitor": False})  # the user's switch is kept
         save.assert_called_once_with(stub.settings)
         stub.send_notification.assert_not_called()
 
@@ -628,7 +640,7 @@ class HeadsetBattery(unittest.TestCase):
         stub = mock.Mock(settings={"version": 1, "routing": {}})
         with mock.patch.object(app.store, "save", side_effect=OSError(28, "No space left on device")), \
                 mock.patch.object(app.Gio, "Notification") as notification:
-            self.assertIs(app.Application.save_routing(stub, {"moved": True, "direct": False}), GLib.SOURCE_REMOVE)
+            self.assertIs(app.Application.save_routing(stub, {"moved": True, "direct": False}), False)
         self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
         notification.new.assert_called_once_with("Sound routing set, but not saved: No space left on device")
         stub.send_notification.assert_called_once_with("routing-unsaved", notification.new.return_value)
