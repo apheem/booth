@@ -1,12 +1,14 @@
 """The PRO X's HID++ battery query: the hidraw node found by vendor/product and usage page in sysfs, the request and
 reply bytes ported from HeadsetControl, voltage → an estimated percentage, and no answer within ~1 s meaning off.
 Descriptors, uevents and the off reply are captured from this desk's devices."""
+import errno
 import os
 import socket
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from booth import hidpp
 from tests.fixture import read
@@ -35,8 +37,13 @@ class Discovery(unittest.TestCase):
         self.root = tempfile.mkdtemp()
 
     def test_the_pro_x_descriptor_declares_the_hidpp_usage_page(self):
-        self.assertIn(0xff43, hidpp.usage_pages(descriptor("pro-x")))
-        self.assertIn(0x000c, hidpp.usage_pages(descriptor("pro-x")))  # and its consumer-control collection
+        self.assertEqual(hidpp.usage_pages(descriptor("pro-x")), {0x0001, 0x000a, 0x000c, 0xff00, 0xff43})
+
+    def test_a_4_byte_item_is_stepped_over_whole(self):  # Logical Maximum 0x05000000, then Usage Page 0x0c
+        self.assertEqual(hidpp.usage_pages(bytes.fromhex("2700000005050c")), {0x000c})
+
+    def test_a_long_item_is_skipped_whole(self):  # 0xfe, data size, long tag, data: its data is never parsed as items
+        self.assertEqual(hidpp.usage_pages(bytes.fromhex("fe02100501050c")), {0x000c})
 
     def test_other_descriptors_do_not(self):
         self.assertNotIn(0xff43, hidpp.usage_pages(descriptor("brio")))
@@ -87,6 +94,9 @@ class Reply(unittest.TestCase):
         self.assertIsNone(hidpp.answer(bytes.fromhex("11ffff050d05") + bytes(14)))  # another feature's error
         self.assertIsNone(hidpp.answer(b""))
 
+    def test_a_reply_for_another_device_index_is_not_the_answer(self):
+        self.assertIsNone(hidpp.answer(bytes.fromhex("1101060d0f3c01") + bytes(13)))
+
 
 class Estimate(unittest.TestCase):
     def test_the_gpro_curve_points(self):
@@ -96,7 +106,7 @@ class Estimate(unittest.TestCase):
     def test_between_points_it_interpolates_and_truncates(self):
         self.assertEqual(hidpp.estimate(3990), 75)
         self.assertEqual(hidpp.estimate(3805), 40)
-        self.assertEqual(hidpp.estimate(3831), 50)  # 50.15 → 50, as HeadsetControl's int cast
+        self.assertEqual(hidpp.estimate(3970), 71)  # 71.875 → 71, not 72: HeadsetControl's int cast truncates
 
     def test_outside_the_curve_it_clamps(self):
         self.assertEqual(hidpp.estimate(4300), 100)
@@ -128,6 +138,19 @@ class Exchange(unittest.TestCase):
         t0 = time.monotonic()
         self.assertIs(hidpp.read_reply(self.ours.fileno(), 0.2), hidpp.OFF)
         self.assertLess(time.monotonic() - t0, 0.6)
+
+    def test_a_wake_up_with_nothing_to_read_keeps_waiting_for_the_answer(self):
+        self.dev.send(ON)
+        real, calls = os.read, []
+
+        def read(fd, n):  # the first read finds nothing (EAGAIN) although select said readable
+            calls.append(fd)
+            if len(calls) == 1:
+                raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real(fd, n)
+        with mock.patch.object(hidpp.os, "read", read):
+            self.assertEqual(hidpp.read_reply(self.ours.fileno(), 1), (3900, False))
+        self.assertEqual(len(calls), 2)
 
     def test_the_captured_error_reply_is_off_at_once(self):
         self.dev.send(OFF)
@@ -163,6 +186,16 @@ class Battery(unittest.TestCase):
         finally:
             ours.close()
         self.assertEqual((reading, sent), ((3900, False), [hidpp.REQUEST]))
+
+    def test_an_unplug_mid_query_is_off(self):  # EIO from the write: the node went away after it was opened
+        ours, dev = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(dev.close)
+        self.addCleanup(ours.close)
+
+        def write(fd, data):
+            raise OSError(errno.EIO, "Input/output error")
+        self.assertIsNone(hidpp.battery(find=lambda: "/dev/hidraw0", open_=lambda p, f: os.dup(ours.fileno()),
+                                        write=write))
 
     def test_an_off_reply_is_none(self):
         ours, dev = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)

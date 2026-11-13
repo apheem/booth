@@ -211,6 +211,10 @@ class Battery(unittest.TestCase):
         m = monitor(None)
         self.assertEqual((m.on, m.percent, m.log), (False, None, ["off"]))
 
+    def test_going_off_drops_the_last_level(self):  # no stale percent for a headset that no longer answers
+        m = monitor((3990, False), None)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
+
     def test_on_off_on_emits_each_change_once(self):
         m = monitor((3990, False), (3990, False), None, None, (3990, False))
         self.assertEqual(m.log, ["on", "battery", "off", "on", "battery"])
@@ -220,6 +224,13 @@ class Battery(unittest.TestCase):
         m.log.clear()
         m.update((3990, False))
         self.assertEqual(m.log, [])
+
+    def test_a_level_change_alone_is_a_battery_event(self):
+        m = monitor((3990, False))
+        m.log.clear()
+        m.update((3830, False))  # smoothed, still discharging, but the estimate moved
+        self.assertLess(m.percent, 75)
+        self.assertEqual(m.log, ["battery"])
 
     def test_readings_are_smoothed(self):
         m = monitor((3990, False), (3830, False))  # one low read (a load spike) moves it only part of the way
@@ -244,6 +255,10 @@ class Battery(unittest.TestCase):
     def test_one_warning_per_discharge_at_15_percent(self):
         m = monitor(*[(3710, False)] * 5)  # ~13 %
         self.assertEqual([e for e in m.log if e[0] == "notify"], [("notify", 13)])
+
+    def test_exactly_15_percent_warns(self):
+        m = monitor((3717, False))  # 3717 mV → 15 % on the curve
+        self.assertEqual((m.percent, [e for e in m.log if e[0] == "notify"]), (15, [("notify", 15)]))
 
     def test_above_15_percent_no_warning(self):
         m = monitor((3746, False))  # ~21 %
