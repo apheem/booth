@@ -191,7 +191,7 @@ class Application(Adw.Application):
         switch says (amixer, pw-dump, systemctl: off the main loop)."""
         def sync():
             voice.sync(self.settings)
-            monitor.sync(self.settings)
+            monitor.sync(self.settings, on=self.headset_monitor.on)
         threading.Thread(target=sync, daemon=True).start()
 
     def heal_voice(self):
@@ -211,7 +211,7 @@ class Application(Adw.Application):
                 GLib.idle_add(self.mic_moved, actions)
         finally:
             try:  # monitoring back after Booth Mic or the PRO X dongle came back, window or not
-                monitor.sync(self.settings)
+                monitor.sync(self.settings, on=self.headset_monitor.on)  # paused while the PRO X is off
             finally:
                 self.healing = False
 

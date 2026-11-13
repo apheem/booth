@@ -38,9 +38,10 @@ STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room
 
 
 class MicrophonePage(Adw.PreferencesPage):
-    def __init__(self, settings):
+    def __init__(self, settings, headset_monitor=None):
         super().__init__()
         self.settings, self.quiet, self.polling, self.items, self.unsaved = settings, False, False, {}, ""
+        self.headset_monitor = headset_monitor  # monitoring is paused while the PRO X is off
         self.writer = headset.Writer(self.spawn)
         self.group = Adw.PreferencesGroup(title="Scarlett Solo")
         self.input = Adw.ComboRow(title="Input", model=Gtk.StringList.new(list(scarlett.INPUTS)))
@@ -279,7 +280,7 @@ class MicrophonePage(Adw.PreferencesPage):
         self.show_monitoring(None)
 
         def sync():
-            said = monitor.sync(self.settings)
+            said = monitor.sync(self.settings, on=self.headset_monitor.on if self.headset_monitor else None)
             GLib.idle_add(self.show_monitoring, said)
         threading.Thread(target=sync, daemon=True).start()
 

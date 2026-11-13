@@ -153,6 +153,8 @@ class PageCase(unittest.TestCase):
         self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
         self.monitored, self.monitor_said = [], "on"  # every monitor.sync's switch; what it returns
+        self.monitor_on = []  # every monitor.sync's `on`: the PRO X headset's HeadsetMonitor.on
+        self.headset = types.SimpleNamespace(on=True)
         self.labels = []  # every Gtk.Label the page made, as {its keyword arguments}
 
         real_send = scarlett.send
@@ -190,12 +192,13 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.meter, "Meter", _Gst),
                 mock.patch.object(microphone.monitor, "LAST", None, create=True),  # no sync yet this run
                 mock.patch.object(microphone.monitor, "sync",
-                                  lambda settings: self.monitored.append(dict(settings["voice"])) or self.monitor_said)):
+                                  lambda settings, on: self.monitor_on.append(on)
+                                  or self.monitored.append(dict(settings["voice"])) or self.monitor_said)):
             patch.start()
             self.addCleanup(patch.stop)
         self.page = Page()
         self.page.root_ = _Root()
-        microphone.MicrophonePage.__init__(self.page, self.settings)
+        microphone.MicrophonePage.__init__(self.page, self.settings, self.headset)
         self.assertEqual([n for n in vars(self.page) if hasattr(microphone.MicrophonePage, n)], [])  # none shadowed
 
     def show(self, s):
@@ -733,6 +736,15 @@ class Monitoring(PageCase):
         self.click(self.page.monitoring, False)
         self.assertEqual(self.monitored[-1], {"monitor": False})
         self.assertEqual((self.applied, self.ran), ([], []))  # never Booth Mic's chain, never the Scarlett
+
+    def test_a_click_with_the_pro_x_off_hands_that_to_sync_which_pauses_it(self):
+        for on in (False, None, True):
+            self.headset.on = on
+            self.click(self.page.monitoring, not self.page.monitoring.active)
+        self.assertEqual(self.monitor_on, [False, None, True])
+        self.monitor_said = monitor.PAUSED
+        self.click(self.page.monitoring, True)
+        self.assertEqual(self.page.monitoring.subtitle, "Paused: the PRO X is off")
 
     def test_what_didnt_happen_is_said_on_the_row(self):
         self.monitor_said = "not started: see systemctl --user status booth-monitor.service"

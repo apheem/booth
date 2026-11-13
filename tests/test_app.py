@@ -346,7 +346,7 @@ class BackgroundLaunch(unittest.TestCase):
             app.Application.sync_voice(stub)
             sync.assert_not_called()
             threads[0]()
-        sync.assert_called_once_with(stub.settings)
+        sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)  # paused while the PRO X is off
 
     def test_every_heal_tick_brings_monitoring_back_even_when_booth_mics_heal_fails(self):
         threads, stub = [], mock.Mock(settings={"voice": {"monitor": True}}, healing=False)
@@ -357,7 +357,8 @@ class BackgroundLaunch(unittest.TestCase):
             app.Application.heal_voice(stub)
             with self.assertRaises(OSError):
                 threads[0]()
-        sync.assert_called_once_with(stub.settings)  # a closed window, the background service: every 10 s
+        # a closed window, the background service: every 10 s, paused while the PRO X is off
+        sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)
         self.assertFalse(stub.healing)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):

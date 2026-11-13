@@ -3,11 +3,14 @@ X sink, run as its own PipeWire client by booth-monitor.service (`pipewire -c mo
 installed by install.sh, never enabled: sync() starts and stops it), so it works with the window closed. It only reads
 booth_mic, like any app: it never restarts or reconfigures Booth Mic, its chain or its selector.
 
-Privacy: it plays ONLY to the PRO X sink, by name with node.dont-reconnect, never the default sink. When the routing
+Privacy: it plays to the PRO X sink only, by name with node.dont-reconnect, never the default sink. When the routing
 (#12) moves output to the Scarlett, or the user picks speakers, the voice never goes to the room (the Scarlett's
-headphone jack shares its rear line outputs); on the Scarlett, Direct Monitor is the monitoring. A PRO X that is off
-keeps its dongle's sink, so the voice goes nowhere. With the dongle gone WirePlumber destroys the loopback instead of
-moving it; the same with booth_mic gone (Booth Mic restarted), and sync(), every 10 s, starts it again once both are back.
+headphone jack shares its rear line outputs); on the Scarlett, Direct Monitor is the monitoring. That sink's monitor
+carries it to any app capturing the computer's sound (a screen share with sound, a desktop recording): the label says so.
+A PRO X that is off keeps its dongle's sink: sync() stops the loopback then (PAUSED, the switch stays on), so Booth Mic
+and its mic aren't held open for a dead headset, and starts it again when the headset is on. With the dongle gone
+WirePlumber destroys the loopback instead of moving it; the same with booth_mic gone (Booth Mic restarted), and sync(),
+every 10 s, starts it again once both are back.
 
 While on it reads Booth Mic, so Booth Mic and the Scarlett stay in use (and the mic-in-use indicator shows): the label
 says so. Mute (#21) is Booth Mic's node mute, so monitoring hears what the call hears, silence; a fallback (#20) moves
@@ -26,8 +29,10 @@ CAPTURE, PLAYBACK = "booth.monitor", "booth.monitor.out"
 # clock: 40 ms at quantum 1024, 35.5 at 256; RNNoise's frames are most of it (without it 5 ms: the limiter's lookahead).
 # The Scarlett's capture and the headset's playback and radio add theirs on top: not measurable without playing to it.
 DELAY_MS = 40
-LABEL = (f"Booth adds about {DELAY_MS} ms, the Scarlett and the headset a little more. Only in the PRO X headset; "
-         "keeps Booth Mic and the Scarlett in use while on")
+LABEL = (f"Booth adds about {DELAY_MS} ms, the Scarlett and the headset a little more. Plays in the PRO X headset, and "
+         "apps capturing the computer's sound (screen sharing with sound, desktop recording) hear it too; keeps Booth Mic "
+         "and the Scarlett in use while on")
+PAUSED = "Paused: the PRO X is off"
 NO_PROX = "Waiting for the PRO X headset's dongle"
 NO_MIC = "Waiting for Booth Mic"
 NOT_RUNNING = "not running: Booth tries again within a minute"
@@ -71,20 +76,22 @@ def problem(said):
     return f"Set, but {said}" if said.startswith("not ") else said
 
 
-def _sync(settings, run=service.run, dump=voice._dump, file=None, clock=time.monotonic):
-    """The switch (settings["voice"]["monitor"]) → the unit. Off: stopped, then its config removed (ExecCondition: then
-    nothing can start it); a failed stop keeps the config, so the next call stops it again. On: the config for the PRO X
-    sink found now, started (restart) when it is new, or when the loopback isn't in PipeWire, Booth Mic is, and it wasn't
-    started for these same nodes in the last BACKOFF_S. Nothing without the PRO X sink in pw-dump. Returns what it did:
-    "on", "off", NO_PROX, NO_MIC, or "not …"."""
+def _sync(settings, run=service.run, dump=voice._dump, file=None, clock=time.monotonic, on=None):
+    """The switch (settings["voice"]["monitor"]) → the unit. Off, or on with the PRO X off (`on`: HeadsetMonitor.on,
+    None until it answers): stopped, then its config removed (ExecCondition: then nothing can start it); a failed stop
+    keeps the config, so the next call stops it again. On: the config for the PRO X sink found now, started (restart)
+    when it is new, or when the loopback isn't in PipeWire, Booth Mic is, and it wasn't started for these same nodes in
+    the last BACKOFF_S. Nothing without the PRO X sink in pw-dump. Returns what it did: "on", "off", PAUSED, NO_PROX,
+    NO_MIC, or "not …"."""
     file = file or path()
-    if (settings.get("voice") or {}).get("monitor") is not True:
+    switched = (settings.get("voice") or {}).get("monitor") is True
+    if not switched or on is False:
         if not file.exists():
-            return "off"
+            return PAUSED if switched else "off"
         if not run(STOP):
             return f"not stopped: see systemctl --user status {UNIT}"
         voice._put_back(file, None)
-        return "off"
+        return PAUSED if switched else "off"
     now = dump()
     sink = devices.find_sink(devices.parse_sinks(now)[0])
     if sink is None:  # unplugged, or pw-dump failed: the running loopback (if any) is left to its own end

@@ -33,7 +33,7 @@ class Window(Adw.ApplicationWindow):
         headphones_status = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])  # e.g. "~70 % · Volume 63 %"
         self.headphones = HeadphonesPage(settings, headphones_status.set_label, app.headset_monitor)
         self.connect("close-request", lambda _w: self.headphones.stop())  # stops its poll; None lets the close go on
-        self.microphone = MicrophonePage(settings)
+        self.microphone = MicrophonePage(settings, app.headset_monitor)
         self.connect("close-request", lambda _w: self.microphone.stop())
         # Booth Mic's source (#20): "Booth Mic · from PRO X mic"; the banner says a change on the Microphone page
         self.mic_label = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"])
