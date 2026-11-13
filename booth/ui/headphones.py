@@ -7,12 +7,27 @@ every tick. A `pw-dump --monitor` stream would need a long-lived process and a m
 learn the same two values."""
 import threading
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gdk, GLib, Gtk
 
 from booth import headset, store
 
 POLL_S = 2
 SWITCH_SUBTITLE = "Play all sound through the headset"
+SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
+NOT_SET = "Not set in Booth"  # the headset can't report its own value: the widget's position means nothing yet
+NAMES = {"sidetone": "sidetone", "auto_off": "auto power-off"}
+
+
+def pass_scroll(controller, _dx, dy):
+    """A wheel or touchpad scroll over Sidetone or Auto power-off, caught before the widget (GTK4 would change its
+    value, which sends and saves one the user didn't pick): the page scrolls instead, by the step its own
+    GtkScrolledWindow uses. shortcut: no kinetic glide after a touchpad flick; add one if it feels abrupt."""
+    window = controller.get_widget().get_ancestor(Gtk.ScrolledWindow)
+    if window is not None:
+        adj = window.get_vadjustment()
+        step = adj.get_page_size() ** (2 / 3) if controller.get_unit() == Gdk.ScrollUnit.WHEEL else 1
+        adj.set_value(adj.get_value() + dy * step)
+    return True
 
 
 class HeadphonesPage(Adw.PreferencesPage):
@@ -25,8 +40,6 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.group = Adw.PreferencesGroup(title="PRO X Wireless")
         self.battery = Adw.ActionRow(title="Battery")
         self.group.add(self.battery)
-        monitor.listeners.append(self.on_headset)
-        self.on_headset()
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.scale.set_hexpand(True)
         self.scale.set_draw_value(True)
@@ -40,6 +53,34 @@ class HeadphonesPage(Adw.PreferencesPage):
         for row in self.rows:
             self.group.add(row)
             row.set_sensitive(False)  # until the first poll finds the sink
+        # HID++ settings: the user's saved values, set before connecting, so showing them sends nothing (an unsaved one
+        # shows NOT_SET); visible per on_headset
+        saved = settings["headphones"]
+        self.sidetone = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 128, 1)
+        self.sidetone.set_hexpand(True)
+        if "sidetone" in saved:
+            self.sidetone.set_value(saved["sidetone"])
+        self.sidetone.connect("value-changed", lambda s: self.on_setting("sidetone", round(s.get_value())))
+        sidetone = Adw.ActionRow(title="Sidetone")
+        sidetone.add_suffix(self.sidetone)
+        auto_off = Adw.SpinRow.new_with_range(0, 90, 5)
+        auto_off.set_title("Auto power-off")
+        if "auto_off" in saved:
+            auto_off.set_value(saved["auto_off"])
+        auto_off.connect("notify::value", lambda r, _p: self.on_setting("auto_off", round(r.get_value())))
+        self.hidpp_rows = {"sidetone": sidetone, "auto_off": auto_off}
+        for widget in (self.sidetone, auto_off):
+            scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.BOTH_AXES)
+            scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            scroll.connect("scroll", pass_scroll)
+            widget.add_controller(scroll)
+        for kind, row in self.hidpp_rows.items():
+            row.set_subtitle(SUBTITLES[kind] if kind in saved else NOT_SET)
+            self.group.add(row)
+        self.note = Adw.ActionRow()  # "This headset doesn't accept …": a refused row hides rather than half-works
+        self.group.add(self.note)
+        monitor.listeners.append(self.on_headset)
+        self.on_headset()
         self.add(self.group)
         self.poll()
         self.timer = GLib.timeout_add_seconds(POLL_S, self.poll)
@@ -55,7 +96,24 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.group.set_title(title)
         self.battery.set_subtitle(battery or "")
         self.battery.set_visible(battery is not None)
+        on, refused = self.monitor.on is True, [k for k in self.hidpp_rows if k in self.monitor.refused]
+        for kind, row in self.hidpp_rows.items():  # hidden until restart once it refused a value the user sent
+            row.set_visible(on and kind not in refused)
+        self.note.set_title("This headset doesn't accept " + " or ".join(NAMES[k] for k in refused))
+        self.note.set_visible(on and bool(refused))
         self.status(headset.status(self.state, self.monitor))
+
+    def on_setting(self, kind, value):
+        """Sidetone or Auto power-off changed: sent through the service's monitor (one HID++ exchange at a time with
+        its battery poll) and saved, so it is re-sent whenever the headset turns on."""
+        self.monitor.set(kind, value)
+        self.settings["headphones"][kind] = value
+        row = self.hidpp_rows[kind]
+        try:  # on the main loop, like the page's other saves of the same dict
+            store.save(self.settings)
+            row.set_subtitle(SUBTITLES[kind])
+        except OSError as e:  # disk full, read-only: set, but the user must know it won't last
+            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
 
     def poll(self):
         if not self.polling:  # a slow pw-dump never piles up threads

@@ -19,6 +19,13 @@ OFF = bytes.fromhex(read("headset/hidpp-battery-off.hex"))  # captured: the dong
 # shortcut: constructed from the ported reply layout (bytes 4-5 mV big-endian, byte 6 state), not captured, because the
 # headset was off at capture time; replace with a live capture when the headset is on.
 ON = bytes.fromhex("11ff060d0f3c01") + bytes(13)  # 3900 mV, discharging
+# captured with the headset off: the dongle's error replies to sidetone 0 and auto power-off 30 min
+SIDETONE_OFF = bytes.fromhex(read("headset/hidpp-sidetone-off.hex"))
+AUTO_OFF_OFF = bytes.fromhex(read("headset/hidpp-auto-off-off.hex"))
+# shortcut: HID++ 2.0's reply layout (the request's feature index and function/software-id echoed), not captured: the
+# headset was off at capture time; replace with a live capture when the headset is on.
+SIDETONE_ACK = bytes.fromhex("11ff051a00") + bytes(15)
+AUTO_OFF_ACK = bytes.fromhex("11ff07211e") + bytes(15)
 
 
 def info(vendor=0x046D, product=0x0ABA):
@@ -109,6 +116,46 @@ class Reply(unittest.TestCase):
 
     def test_an_unsolicited_event_of_the_same_feature_index_is_not_a_level(self):  # function 0, not getBattery's 0x0d
         self.assertIsNone(hidpp.answer(bytes.fromhex("11ff06000f3c01") + bytes(13)))
+
+
+class Settings(unittest.TestCase):
+    """Sidetone and auto power-off: HeadsetControl's LogitechGPro::setSidetone and setInactiveTimeHIDPP."""
+
+    def test_sidetone_requests_map_0_to_128_onto_the_headsets_0_to_100(self):
+        self.assertEqual(hidpp.sidetone_request(0), bytes.fromhex("11ff051a00") + bytes(15))  # the bytes sent live
+        self.assertEqual(hidpp.sidetone_request(128)[:5], bytes.fromhex("11ff051a64"))
+        self.assertEqual(hidpp.sidetone_request(64)[4], 50)
+        self.assertEqual(hidpp.sidetone_request(127)[4], 99)  # map<uint8_t> truncates
+        self.assertEqual((hidpp.sidetone_request(65)[4], hidpp.sidetone_request(1)[4]), (50, 0))  # 50.8, 0.8
+        self.assertEqual(hidpp.sidetone_request(200)[4], 100)  # clamped, as map() clamps
+        self.assertEqual(hidpp.sidetone_request(-5)[4], 0)
+
+    def test_auto_off_requests_carry_the_minutes(self):
+        self.assertEqual(hidpp.auto_off_request(30), bytes.fromhex("11ff07211e") + bytes(15))  # the bytes sent live
+        self.assertEqual(hidpp.auto_off_request(0)[4], 0)  # never
+        self.assertEqual(hidpp.auto_off_request(90)[4], 90)
+        self.assertEqual(hidpp.auto_off_request(91)[4], 90)
+        self.assertEqual(hidpp.auto_off_request(-1)[4], 0)
+
+    def test_every_request_is_one_long_report(self):
+        for request in (hidpp.sidetone_request(64), hidpp.auto_off_request(30)):
+            self.assertEqual(len(request), 20)
+
+    def test_the_echo_is_the_acknowledgement(self):
+        self.assertIs(hidpp.acked(SIDETONE_ACK, hidpp.SIDETONE), True)
+        self.assertIs(hidpp.acked(AUTO_OFF_ACK, hidpp.AUTO_OFF), True)
+
+    def test_the_captured_error_replies_are_not_acknowledged(self):
+        self.assertIs(hidpp.acked(SIDETONE_OFF, hidpp.SIDETONE), False)
+        self.assertIs(hidpp.acked(AUTO_OFF_OFF, hidpp.AUTO_OFF), False)
+
+    def test_other_reports_are_not_the_answer(self):
+        for report in (OFF, ON, AUTO_OFF_ACK, AUTO_OFF_OFF, bytes.fromhex("010200"), b"",
+                       bytes.fromhex("1101051a00") + bytes(15),  # another device index
+                       bytes.fromhex("11ff051000") + bytes(15)):  # an unsolicited event of the feature (sw id 0)
+            self.assertIsNone(hidpp.acked(report, hidpp.SIDETONE), report.hex())
+        self.assertIsNone(hidpp.answer(SIDETONE_ACK))  # nor is an acknowledgement a battery answer
+        self.assertIsNone(hidpp.answer(SIDETONE_OFF))
 
 
 class Estimate(unittest.TestCase):
@@ -240,6 +287,40 @@ class Battery(unittest.TestCase):
     def test_the_captured_error_reply_is_off_not_a_miss(self):
         self.dev.send(OFF)
         self.assertIs(self.query(), hidpp.OFF)
+        self.assertClosed()
+
+
+class Setting(Battery):
+    """A settings command takes the battery query's path: the same node checks, one write, the echo read back."""
+
+    def set(self, request, **kw):
+        return hidpp.setting(request, **{"find": lambda: "/dev/hidraw0", "open_": self.open_, "write": self.write,
+                                         "ioctl": PRO_X, "timeout": 0.1, **kw})
+
+    def test_the_request_is_written_and_its_echo_skips_other_reports(self):
+        self.dev.send(ON)  # the battery poll of another Booth: every reader of the node gets it
+        self.dev.send(SIDETONE_ACK)
+        self.assertIs(self.set(hidpp.sidetone_request(0), timeout=1), True)
+        self.assertEqual(self.sent, [hidpp.sidetone_request(0)])
+        self.assertClosed()
+
+    def test_the_captured_error_reply_is_not_acknowledged(self):
+        self.dev.send(AUTO_OFF_OFF)
+        self.assertIs(self.set(hidpp.auto_off_request(30)), False)
+        self.assertClosed()
+
+    def test_another_settings_echo_is_not_this_ones(self):
+        self.dev.send(SIDETONE_ACK)
+        self.assertIsNone(self.set(hidpp.auto_off_request(30)))
+
+    def test_no_reply_is_none_and_no_dongle_is_not_acknowledged(self):
+        self.assertIsNone(self.set(hidpp.sidetone_request(0)))
+        self.assertClosed()
+        self.assertIs(self.set(hidpp.sidetone_request(0), find=lambda: None), False)
+
+    def test_another_device_on_the_number_gets_no_write(self):
+        self.assertIsNone(self.set(hidpp.sidetone_request(0), ioctl=info(0x046D, 0x085E)))
+        self.assertEqual(self.sent, [])
         self.assertClosed()
 
 

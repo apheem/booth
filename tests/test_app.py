@@ -266,6 +266,7 @@ class BackgroundLaunch(unittest.TestCase):
                 mock.patch.object(app, "Window") as window:
             app.Application.do_activate(stub)
         self.assertEqual(stub.settings, {"version": 1, "camera": {}})  # loaded once, for the whole process
+        self.assertIs(stub.headset_monitor.settings, stub.settings)  # the same dict: sidetone re-sent as last saved
         stub.watch.assert_called_once_with()
         window.assert_not_called()
         self.assertEqual(threads, [])

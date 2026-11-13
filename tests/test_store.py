@@ -77,6 +77,24 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_sidetone_and_auto_off_round_trip_at_their_limits(self):
+        for sidetone, auto_off in ((0, 0), (1, 1), (128, 90)):
+            settings = store.load(self.path)
+            settings["headphones"].update(sidetone=sidetone, auto_off=auto_off)
+            store.save(settings, self.path)
+            self.assertEqual(store.load(self.path)["headphones"], {"sidetone": sidetone, "auto_off": auto_off})
+
+    def test_a_bad_sidetone_or_auto_off_counts_as_corrupt(self):
+        # both are sent to the headset on every power-on: only whole numbers in the headset's range
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"headphones": {"sidetone": 129}}', '{"headphones": {"sidetone": -1}}',
+                     '{"headphones": {"sidetone": "64"}}', '{"headphones": {"sidetone": 6.5}}', '{"headphones": {"sidetone": 64.0}}',
+                     '{"headphones": {"sidetone": true}}', '{"headphones": {"auto_off": 91}}',
+                     '{"headphones": {"auto_off": -1}}', '{"headphones": {"auto_off": null}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+            self.assertFalse(self.path.exists(), text)
+
     def test_the_microphone_input_choice_round_trips(self):
         settings = store.load(self.path)
         self.assertEqual(settings["microphone"], {})  # no choice saved: XLR
