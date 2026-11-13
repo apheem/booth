@@ -122,6 +122,10 @@ class Rules(unittest.TestCase):
                          ({"moved": True, "direct": False},
                           [("direct", False), ("default", SCARLETT), ("direct", True), ("notify", MOVED_DIRECT)]))
 
+    def test_an_owed_record_is_put_back_at_an_off_even_with_the_setting_off(self):  # Booth's own, whatever the switch
+        self.assertEqual(routing.next({"direct": False}, event(False, direct=True, auto=False)),
+                         ({"moved": True}, [("direct", False), ("default", SCARLETT), ("notify", routing.MOVED)]))
+
     def test_an_off_never_carries_a_record_that_is_neither_a_move_nor_owed(self):  # e.g. a hand-edited settings file
         self.assertEqual(routing.next({"direct": True}, event(False)), routing.next({}, event(False)))
 
@@ -132,6 +136,7 @@ class Rules(unittest.TestCase):
         self.assertEqual(routing.next({"direct": False}, tick(True)), ({}, [("direct", False)]))
         self.assertEqual(routing.next({"direct": False}, tick(False)), ({}, []))
         self.assertEqual(routing.next({"direct": False}, tick(None)), ({"direct": False}, []))
+        self.assertEqual(routing.next({"direct": False}, tick(True) | {"auto": False}), ({}, [("direct", False)]))
         for state in ({}, {"moved": True, "direct": False}):  # nothing owed, or the next "on" puts it back
             self.assertEqual(routing.next(state, tick(True)), (state, []))
 
@@ -510,6 +515,30 @@ class Executor(unittest.TestCase):
             self.assertEqual(self.run.writes,
                              [["amixer", "-c", "Gen", "cset", "name=Direct Monitor Playback Switch", "off"]])
             self.assertEqual((self.notes, ex.state, self.saved), (notes, {}, [{}]))
+
+    def test_direct_monitor_unreadable_with_the_scarlett_there_is_read_at_most_tries_times_and_said_once(self):
+        ex = self.executor(dump(PROX, PROX), {"direct": False})
+        fake, reads = self.run, []
+        ex.run = lambda *cmd: reads.append(cmd[0]) or ("" if cmd[0] == "amixer" else fake(*cmd))  # no controls
+        self.assertEqual(self.settle(ex), routing.TRIES)
+        self.assertEqual(reads.count("amixer"), routing.TRIES)
+        self.assertEqual((self.notes, ex.state), (["Sound routing gave up: putting Direct Monitor back kept failing"],
+                                                  {"direct": False}))
+        self.assertEqual((self.settle(ex), len(self.notes)), (0, 1))  # capped: no reads, no second notice
+        ex.card = lambda: None  # the Scarlett unplugged, then back readable: fresh ticks put it back
+        self.assertEqual(self.settle(ex), 0)
+        ex.card, ex.run, fake.direct = lambda: "Gen", fake, "on"
+        self.assertEqual(self.settle(ex), 1)
+        self.assertEqual((ex.state, fake.writes[-1][-1]), ({}, "off"))
+
+    def test_each_headset_transition_gives_unreadable_direct_monitor_fresh_reads(self):
+        ex = self.executor(dump(PROX, PROX), {"direct": False})
+        ex.run = lambda *cmd: "" if cmd[0] == "amixer" else self.run(*cmd)  # no controls
+        self.settle(ex)
+        self.assertEqual(self.settle(ex), 0)  # capped
+        ex.listener("on")
+        ex.events.get_nowait()  # its step not run: only the cap's reset counts here
+        self.assertEqual(self.settle(ex), routing.TRIES)
 
     def test_a_put_back_tick_never_stops_the_headsets_retries(self):
         objects = [o for o in json.loads(dump(SCARLETT, SCARLETT)) if "Logitech" not in json.dumps(o.get("info") or {})]

@@ -38,6 +38,7 @@ both are missing (loaded()). A new shape (new code) restarts both services, neve
                                       booth-mic-select.service's ExecCondition: may_select (exit 0) or not (1)"""
 import copy
 import json
+import os
 import sys
 import threading
 import time
@@ -71,6 +72,8 @@ NO_INPUT = "no input"  # the Scarlett's card there, its source not in PipeWire (
 # the backups in order, by their PipeWire source's name: then the serial and profile
 BACKUPS = ((PRO_X_MIC, "alsa_input." + devices.PRO_X_USB), (BRIO_MIC, "alsa_input.usb-046d_Logitech_BRIO_"))
 CHOSEN = SCARLETT  # the mic heal() chose last, for the routing policy's notice
+SEEN = None  # the pw-dump heal() read last for its revive check, for running(); None when it read none
+_VERIFIED = {}  # plugin path → the stat of it and its folder when it last verified: unchanged, it isn't hashed again
 CLOSED = False  # Booth is shutting down (release()): no heal moves the selector again
 
 
@@ -136,14 +139,34 @@ STAGES = (("noise", "librnnoise_ladspa.so", "noise_suppressor_mono", ("Input",),
            "limiter_ceiling", -1.0, ceiling))
 
 
+def _stat(path, pin):
+    """What verify() checked that can change: the file (inode, size, times, never through a symlink) and its folder."""
+    try:
+        f, d = os.stat(path, follow_symlinks=False), os.stat(path.parent)
+    except OSError:
+        return None
+    return (pin, f.st_ino, f.st_size, f.st_mtime_ns, f.st_ctime_ns, f.st_mode, f.st_uid,
+            d.st_ino, d.st_mode, d.st_uid, d.st_ctime_ns)
+
+
 def verified(where=None, manifest=plugins.MANIFEST):
-    """{plugin file: its path} for each plugin that verifies now (plugins.verify): the only paths a config may hold."""
+    """{plugin file: its path} for each plugin that verifies now (plugins.verify): the only paths a config may hold. A
+    file and folder unchanged since they last verified aren't hashed again (the polls); write() and reload() clear that
+    first, so voice-run.conf is always written from a fresh hash."""
     found = {}
     for name in manifest:
+        path = Path(where or plugins.folder()) / name
+        key = _stat(path, manifest[name])
+        if key is not None and _VERIFIED.get(str(path)) == key:
+            found[name] = str(path)
+            continue
+        _VERIFIED.pop(str(path), None)
         try:
             found[name] = str(plugins.verify(name, where, manifest))
         except (plugins.Refused, OSError):
-            pass
+            continue
+        if key is not None:  # taken before the hash: a change since misses on the next call, so it is hashed again
+            _VERIFIED[str(path)] = key
     return found
 
 
@@ -162,10 +185,11 @@ def _running(file):
     return _load(run if run.exists() else file)
 
 
-def loaded(file=None):
-    """verified() narrowed to the plugins the running chain loaded: the stages that process the voice now."""
+def loaded(file=None, found=None):
+    """`found` (verified() now when not given) narrowed to the plugins the running chain loaded: the stages that process
+    the voice now."""
     kept = _plugins(_running(file or path())) or {}
-    return {k: v for k, v in verified().items() if kept.get(k) == v}
+    return {k: v for k, v in (verified() if found is None else found).items() if kept.get(k) == v}
 
 
 def missing(found):
@@ -342,6 +366,13 @@ def _save(cfg, file):
     return None
 
 
+def _mtime(file):
+    try:
+        return file.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
 def _put_back(file, text):
     """`file` as it was (None: absent), so the next apply sees its change again and retries it."""
     try:
@@ -393,7 +424,12 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             if shape(same) == shape(now):  # nothing else changed: no restart; its next start loads what verifies
                 chain = same
         restart = shape(now) != shape(chain)
-        if old != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
+        # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
+        # kept run conf holds older ones), else voice.conf's, what apply set live since
+        # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
+        live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
+        changed = old != chain or live != chain
+        if live != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
             said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
@@ -405,12 +441,12 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
         # the selector's own save first: a chain change that fails never holds back a new channel
         sel_said = sel is not None and sel != _load(select_file) and _save(sel, select_file)
         moved = sel_said is None
-        if old != chain and not said:
+        if changed and not said:  # also when only the run conf was behind: recorded newer, so sent once
             said = _save(chain, file)
         restart = restart and not said  # a chain that isn't written: nothing new to restart it with
         said = said or sel_said or None
         if not (restart or moved):
-            return said or ("live" if old != chain else "unchanged")
+            return said or ("live" if changed else "unchanged")
         # RESTART_SELECT: Booth Mic, and a call's link to it, stay; never with Booth Mic stopped (or starting), which
         # it would start (BindsTo): the new selector config stays, for whatever starts it next
         if not restart and not run(ACTIVE):
@@ -445,10 +481,26 @@ def _owned(run=devices._run):
 
 def may_select(select_file, owned=_owned):
     """booth-mic-select.service's ExecCondition: True when the selector config `select_file` may start. The Scarlett's
-    always; a backup's only while Booth runs to say it, else removed (Booth Mic silent until Booth heals and says it)."""
-    source = _named(_capture(_load(select_file), "target.object"))
+    always; a backup's only while Booth runs to say it, else removed (Booth Mic silent until Booth heals and says it):
+    only the very file read, never one Booth wrote while the bus was asked (store.save: always a new inode)."""
+    try:
+        with open(select_file) as f:
+            cfg, ino = json.loads(f.read()), os.fstat(f.fileno()).st_ino
+    except (OSError, ValueError):
+        return False
+    source = _named(_capture(cfg, "target.object"))
     if source in dict(BACKUPS) and not owned():
-        _put_back(select_file, None)
+        aside = select_file.with_name(f".{select_file.name}.refused")
+        try:  # moved aside atomically, then checked: a newer config goes back unless a newer one still is there
+            os.replace(select_file, aside)
+            if os.stat(aside).st_ino != ino:
+                try:
+                    os.link(aside, select_file)
+                except FileExistsError:
+                    pass
+            os.unlink(aside)
+        except OSError:
+            pass
         return False
     return source is not None
 
@@ -472,9 +524,10 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
     it started before it at login. Never without Booth Mic's input (BindsTo would pull a stopped booth-voice.service
     back up), and at most once a minute for the same config and source node, so a selector that won't stay up isn't
     restarted every tick. True when it restarted it."""
-    global CHOSEN
+    global CHOSEN, SEEN
     select_file = (file or path()).with_name(SELECT_CONF)
     with _LOCK:  # read, chosen and applied as one: a page poll's apply never lands between
+        SEEN = None
         if CLOSED:
             return False
         state = read(_choice(settings))
@@ -492,7 +545,7 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
             return False
         if said.startswith(("restarted", "selector restarted")):
             return True  # by apply, which recorded it: it is coming up
-        now = dump()
+        now = SEEN = dump()
         key = _key(sel, now, state["mic"]["node"])
         if key[1] is None or _node_id(now, INPUT) is None or _node_id(now, SELECTOR) is not None:
             return False
@@ -503,9 +556,9 @@ def heal(settings, read=scarlett.read, run=service.run, dump=_dump, file=None, c
         return restarted
 
 
-def describe(state, selecting=True, said="", running=True):
+def describe(state, selecting=True, said="", running=True, source=None):
     """The Voice processing group's description for a Scarlett poll (scarlett.read), whether the selector runs, what
-    apply said and whether Booth Mic runs."""
+    apply said, whether Booth Mic runs and, with the Scarlett unplugged, the mic its selector takes (current())."""
     if said.startswith("not stopped"):
         return STALE
     mic = state["mic"] if state else None
@@ -513,6 +566,8 @@ def describe(state, selecting=True, said="", running=True):
         return NOT_ROUTED
     if not running:
         return STOPPED
+    if state is None and source in dict(BACKUPS) and selecting:  # else silent: heal brings it back
+        return f"Booth Mic runs from the {source}: the Scarlett isn't connected"
     if not mic or not mic["node"] or not mic["position"] or not selecting:
         return WAITING
     return f"Booth Mic takes the Scarlett's capture channel {mic['channel']} ({mic['position']}), in mono"
@@ -531,12 +586,20 @@ def write(file=None, where=None):
     """booth-voice.service's ExecStartPre: voice-run.conf (`file`: the one its pipewire loads) from the saved settings
     and the plugins verified now in `where`, so a plugin changed since the last write is never loaded. No systemctl, no
     Scarlett: the unit is starting. None; "kept …" when it can't be written but the one there loads only plugins
-    verified now, at their verified paths (Booth Mic starts on it); "not …": then the unit doesn't start."""
-    file, found = file or path().with_name(RUN_CONF), verified(where)
-    cfg = json.loads(build(store.load(), found))
+    verified now, at their verified paths, in the shape this code builds from them (else every apply would restart it):
+    Booth Mic starts on it, touched so apply sends it the saved values live; "not …": then the unit doesn't start."""
+    _VERIFIED.clear()  # what pipewire loads: hashed now, never a poll's cached verdict
+    file, found, settings = file or path().with_name(RUN_CONF), verified(where), store.load()
+    cfg = json.loads(build(settings, found))
     said = None if _load(file) == cfg else _save(cfg, file)
-    kept = _plugins(_load(file)) if said else None
-    if kept is not None and all(found.get(k) == v for k, v in kept.items()):
+    on_disk = _load(file) if said else None
+    kept = _plugins(on_disk)
+    if (kept is not None and all(found.get(k) == v for k, v in kept.items())
+            and shape(on_disk) == shape(json.loads(build(settings, kept)))):
+        try:
+            os.utime(file)  # newer than voice.conf: its values may be older than what Booth set live
+        except OSError:
+            pass
         return f"kept the last config, {said}"
     return said
 
@@ -545,6 +608,7 @@ def reload(run=service.run, file=None):
     """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
     when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
     with _LOCK:
+        _VERIFIED.clear()  # an install's fresh plugins: hashed now
         return _plugins(_running(file or path())) == verified() or run(RESTART)
 
 

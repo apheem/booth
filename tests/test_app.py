@@ -346,7 +346,7 @@ class BackgroundLaunch(unittest.TestCase):
             app.Application.sync_voice(stub)
             sync.assert_not_called()
             threads[0]()
-        sync.assert_called_once_with(stub.settings)
+        sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)  # paused while the PRO X is off
 
     def test_every_heal_tick_brings_monitoring_back_even_when_booth_mics_heal_fails(self):
         threads, stub = [], mock.Mock(settings={"voice": {"monitor": True}}, healing=False)
@@ -357,7 +357,8 @@ class BackgroundLaunch(unittest.TestCase):
             app.Application.heal_voice(stub)
             with self.assertRaises(OSError):
                 threads[0]()
-        sync.assert_called_once_with(stub.settings)  # a closed window, the background service: every 10 s
+        # a closed window, the background service: every 10 s, paused while the PRO X is off
+        sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)
         self.assertFalse(stub.healing)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
@@ -713,6 +714,14 @@ class MicFallback(unittest.TestCase):
         self.assertEqual(stub.mic, {"said": voice.PRO_X_MIC})
         self.assertEqual(idle, [(stub.mic_moved, ([("notify", routing.MIC_SAID[voice.PRO_X_MIC]),
                                                    ("label", voice.PRO_X_MIC)],))])
+
+    def test_running_reads_the_pw_dump_heal_just_read(self):  # never a third pw-dump on an idle tick
+        with mock.patch.object(app.voice, "SEEN", "heal's dump", create=True), \
+                mock.patch.object(app.voice, "heal"), mock.patch.object(app.monitor, "sync"), \
+                mock.patch.object(app.voice, "running", return_value=True) as running, \
+                mock.patch.object(app.GLib, "idle_add"):
+            app.Application.heal_once(mock.Mock(settings={}, mic={}, healing=True))
+        running.assert_called_once_with("heal's dump")
 
     def test_booth_mic_not_running_is_its_own_source(self):  # #15's seam: a call may have moved to another mic
         stub, _ = self.heal_once({}, voice.SCARLETT, running=False)

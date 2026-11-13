@@ -2,10 +2,12 @@
 BRIO mic, each by name and its own discovered position, and goes back to the Scarlett when it returns. Only the selector
 ever restarts, so Booth Mic (booth_mic) and its node mute stay; the routing policy says each settled change once."""
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from booth import routing, voice
 from tests.test_headset import DUMP
@@ -54,6 +56,7 @@ def desk(*gone, positions=None):
 
 
 ABSENT = desk("alsa_input.usb-Focusrite", "alsa_output.usb-Focusrite")  # the Scarlett unplugged: gone from PipeWire
+SCARLETT_BACK_DUMP = json.dumps([node(71, voice.INPUT), node(40, MIC["node"])])  # the selector unloaded itself
 
 
 def capture(cfg):
@@ -221,6 +224,20 @@ class Fallback(unittest.TestCase):
                    file=self.file, clock=lambda: 1000.0, on=lambda: True)
         self.assertEqual(held, [True])
 
+    def test_heal_keeps_the_pw_dump_it_read_for_running_and_none_when_it_read_none(self):  # one pw-dump less a tick
+        self.heal(STATE, SCARLETT_BACK_DUMP)
+        self.assertEqual(voice.SEEN, SCARLETT_BACK_DUMP)
+        self.heal(None, "[]")  # unplugged, nothing to choose: no revive check
+        self.assertIsNone(voice.SEEN)
+
+    def test_a_scarlett_read_with_its_node_is_never_judged_by_a_second_pw_dump(self):  # read just now: no blip
+        dumps = []
+        chosen, cfg = self.heal(STATE, ABSENT)  # a later dump without the Scarlett: never NO_INPUT
+        self.assertEqual((chosen, cfg), (voice.SCARLETT, selector()))
+        voice.heal(ON, read=lambda choice: STATE, run=lambda cmd: True, dump=lambda: dumps.append(1) or "[]",
+                   file=self.file, clock=lambda: 1000.0, on=lambda: True)
+        self.assertEqual(len(dumps), 1)  # only the selector's revive check
+
     def test_the_scarlett_there_with_the_mic_not_routed_stops_never_falls_back(self):
         self.heal(None, ABSENT)  # on the PRO X
         self.ran.clear()
@@ -316,6 +333,12 @@ class Release(unittest.TestCase):
             voice.release(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
             self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False), mic["node"])
 
+    def test_booth_quitting_removes_the_config_before_the_stop_under_the_lock(self):  # nothing restarts it between
+        self.on(self.backups[1])
+        seen = []
+        voice.release(run=lambda cmd: seen.append((cmd, self.select.exists(), locked())) or True, file=self.file)
+        self.assertEqual(seen, [(STOP_SELECT, False, True)])
+
     def test_booth_quitting_leaves_the_scarlett_selector_running(self):
         self.on(MIC)
         voice.release(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
@@ -335,6 +358,38 @@ class Release(unittest.TestCase):
             self.assertTrue(self.select.exists())
             self.assertFalse(voice.may_select(self.select, owned=lambda: False))  # logout, reboot, Booth closed
             self.assertFalse(self.select.exists())  # Booth Mic silent until Booth heals and says it
+
+    def test_the_selector_unit_never_removes_a_config_booth_wrote_while_it_asked(self):
+        """Login: the unit's ExecCondition reads a crash-left backup config and asks the bus; Booth starts meanwhile
+        and writes the Scarlett's. That one stays: never removed by path on the strength of the old read."""
+        for mic in self.backups:
+            self.on(mic)
+
+            def owned():
+                voice._save(selector(), self.select)  # Booth, at login: back on the Scarlett
+                return False
+            self.assertFalse(voice.may_select(self.select, owned=owned))  # the backup it read never starts
+            self.assertEqual(json.loads(self.select.read_text()), selector(), mic["node"])
+            self.assertEqual(sorted(p.name for p in self.select.parent.iterdir()), [voice.SELECT_CONF])
+
+    def test_the_selector_unit_never_overwrites_an_even_newer_config_booth_wrote_after_its_check(self):
+        """As above, and Booth writes again between the unit moving its read aside and linking the newer one back:
+        that latest config is kept, the one moved aside is dropped."""
+        self.on(self.backups[1])
+        real, latest = os.replace, selector(self.backups[0])
+
+        def replace(src, dst):
+            real(src, dst)
+            if Path(src) == self.select:  # the unit's move aside: Booth's next save lands right after it
+                voice._save(latest, self.select)
+
+        def owned():
+            voice._save(selector(), self.select)
+            return False
+        with mock.patch.object(voice.os, "replace", replace):
+            self.assertFalse(voice.may_select(self.select, owned=owned))
+        self.assertEqual(json.loads(self.select.read_text()), latest)
+        self.assertEqual(sorted(p.name for p in self.select.parent.iterdir()), [voice.SELECT_CONF])
 
     def test_the_selector_unit_always_starts_the_scarlett_and_never_no_config(self):
         self.on(MIC)

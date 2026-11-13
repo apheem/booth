@@ -38,12 +38,14 @@ class Build(unittest.TestCase):
         self.assertEqual(capture["target.object"], "booth_mic")
         self.assertIs(capture["node.dont-reconnect"], True)
         self.assertEqual((capture["audio.channels"], capture["audio.position"]), (1, ["MONO"]))
+        self.assertEqual(capture["media.class"], "Stream/Input/Audio")  # an app's stream: never a source a call picks
         self.assertNotIn("node.passive", capture)  # it is what keeps Booth Mic running while on
 
     def test_plays_only_to_the_pro_x_sink_by_name_never_the_default(self):
         playback = loopback(json.loads(monitor.build(PRO_X)))["playback.props"]
         self.assertEqual(playback["target.object"], PRO_X)
         self.assertIs(playback["node.dont-reconnect"], True)  # the dongle gone: destroyed, never moved to a speaker
+        self.assertEqual(playback["media.class"], "Stream/Output/Audio")  # an app's stream: never a sink apps pick
         self.assertEqual((playback["audio.channels"], playback["audio.position"]), (1, ["MONO"]))  # both ears
         self.assertNotIn("stream.dont-remix", playback)  # mono upmixed to both sides by the stream, never left only
 
@@ -62,8 +64,13 @@ class Build(unittest.TestCase):
         # one GStreamer clock: 40 ms at quantum 1024, 35.5 at 256 (RNNoise's frames; the limiter alone 5 ms)
         self.assertGreaterEqual(monitor.DELAY_MS, 35)
         self.assertIn(f"{monitor.DELAY_MS} ms", monitor.LABEL)
-        self.assertIn("PRO X", monitor.LABEL)  # where it plays, and that the Scarlett stays in use
+        self.assertIn("PRO X headset", monitor.LABEL)  # where it plays, and that the Scarlett stays in use
         self.assertIn("Scarlett", monitor.LABEL)
+
+    def test_the_label_never_says_only_the_headset_hears_it(self):  # the PRO X sink's monitor carries it to any capture
+        self.assertNotIn("only", monitor.LABEL.lower())
+        self.assertIn("apps capturing the computer's sound", monitor.LABEL)
+        self.assertIn("hear it too", monitor.LABEL)
 
 
 class Sync(unittest.TestCase):
@@ -190,11 +197,41 @@ class Sync(unittest.TestCase):
     def test_a_stop_that_fails_keeps_the_config_so_the_next_tick_stops_it_again(self):
         self.sync()
         self.ok = False
-        self.assertTrue(self.sync(OFF).startswith("not stopped"))
+        said = self.sync(OFF)
+        self.assertTrue(said.startswith("not stopped"))
+        self.assertEqual(monitor.problem(said), f"Set, but {said}")  # on the switch's row
         self.assertTrue(self.file.exists())
         self.ok = True
         self.assertEqual(self.sync(OFF), "off")
         self.assertEqual(self.ran, [RESTART, STOP, STOP])
+
+    def sync_on(self, on):
+        return monitor.sync(ON, self.run_, lambda: self.now, self.file, lambda: self.t, on=on)
+
+    def test_the_pro_x_off_pauses_monitoring_with_the_switch_on_and_on_resumes_it(self):
+        self.assertEqual(self.sync(), "on")
+        self.now = dump(MIC, *MONITOR)  # its dongle's sink stays: the loopback would play into a dead headset
+        self.assertEqual(self.sync_on(False), monitor.PAUSED)
+        self.assertEqual((self.ran, self.file.exists()), ([RESTART, STOP], False))  # Booth Mic and its mic let go
+        self.assertEqual(monitor.problem(monitor.PAUSED), "Paused: the PRO X is off")
+        self.now = dump(MIC)
+        self.assertEqual(self.sync_on(False), monitor.PAUSED)  # the next tick: nothing to stop
+        self.assertEqual(len(self.ran), 2)
+        self.assertEqual(self.sync_on(True), "on")  # on again: played again
+        self.now = dump(MIC, *MONITOR)
+        self.assertEqual(self.sync_on(None), "on")  # not answered yet (Booth just started): never paused
+        self.assertEqual(self.ran, [RESTART, STOP, RESTART])
+        self.assertEqual(ON, {"voice": {"monitor": True}})  # the switch stays on
+
+    def test_a_pause_whose_stop_fails_says_so_and_stops_it_next_time(self):
+        self.sync()
+        self.ok = False
+        said = self.sync_on(False)
+        self.assertTrue(said.startswith("not stopped"), said)
+        self.assertTrue(self.file.exists())
+        self.ok = True
+        self.assertEqual(self.sync_on(False), monitor.PAUSED)
+        self.assertFalse(self.file.exists())
 
     def test_it_is_off_unless_switched_on(self):
         for settings in ({}, {"voice": {}}, {"voice": {"monitor": False}}):

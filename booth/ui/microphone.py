@@ -30,6 +30,7 @@ MASTER = "Off sends your mic to Booth Mic untouched"
 RUMBLE = "Cuts low rumble and desk thumps below 80 Hz"
 AUTO = "Booth turns it back off when the headset is on again"
 MISSING = "Plugin missing or changed, so it is bypassed: run ./install.sh again"
+PENDING = "Plugin installed: it loads when Booth Mic restarts, bypassed until then"  # verified, not in the running chain
 # Each plugin stage's rows (voice.STAGES's keys): title, subtitle, the knob's title, range, step and digits. The knobs
 # stay inside what the settings accept (booth.store).
 STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room between words", "Strength", 0, 100, 5, 0),
@@ -38,9 +39,10 @@ STAGES = {"noise": ("Noise Suppression", "Removes background noise, and the room
 
 
 class MicrophonePage(Adw.PreferencesPage):
-    def __init__(self, settings):
+    def __init__(self, settings, headset_monitor=None):
         super().__init__()
         self.settings, self.quiet, self.polling, self.items, self.unsaved = settings, False, False, {}, ""
+        self.headset_monitor = headset_monitor  # monitoring is paused while the PRO X is off
         self.writer = headset.Writer(self.spawn)
         self.group = Adw.PreferencesGroup(title="Scarlett Solo")
         self.input = Adw.ComboRow(title="Input", model=Gtk.StringList.new(list(scarlett.INPUTS)))
@@ -89,7 +91,7 @@ class MicrophonePage(Adw.PreferencesPage):
         self.rumble.connect("notify::active", self.on_voice, "rumble", RUMBLE)
         self.monitoring = Adw.SwitchRow(title="Hear Processed Voice in Headphones", subtitle=monitor.LABEL)
         self.monitoring.connect("notify::active", self.on_monitoring)
-        self.stages, self.missing = {}, []  # missing: until the first poll checks the plugins
+        self.stages, self.missing = {}, {}  # {stage: MISSING or PENDING}, from the first poll's plugin check
         for key, _file, label, _ins, _out, knob, default, mapping in voice.STAGES:
             title, subtitle, knob_title, lo, hi, step, digits = STAGES[key]
             value = v.get(knob, default)
@@ -144,7 +146,7 @@ class MicrophonePage(Adw.PreferencesPage):
         return GLib.SOURCE_CONTINUE
 
     def read(self, since):
-        state, selecting, said, missing, running = None, True, "", None, True
+        state, selecting, said, missing, running, source = None, True, "", None, True, None
         try:
             with voice._LOCK:  # read and applied as one: never a stale Scarlett written over a backup heal moved to
                 state = scarlett.read(self.choice())
@@ -152,17 +154,21 @@ class MicrophonePage(Adw.PreferencesPage):
                     said = voice.apply(self.settings, state)  # not routed: the selector stops
                     selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
                     running = selecting or voice.running()  # the selector runs only with Booth Mic (BindsTo)
-            missing = voice.missing(voice.loaded())  # verified and running: one verified since waits for a restart
+                else:  # on a backup, or silent: said so, and a stopped Booth Mic is never metered
+                    running, source, selecting = voice.running(), voice.current(), voice.selecting()
+            found = voice.verified()  # verified and running: one verified since waits for a restart
+            missing = dict.fromkeys(voice.missing(voice.loaded(found=found)), PENDING)
+            missing.update(dict.fromkeys(voice.missing(found), MISSING))
         finally:  # always: show() clears polling, else the page stops following outside changes
-            GLib.idle_add(self.show, state, since, selecting, said, missing, running)
+            GLib.idle_add(self.show, state, since, selecting, said, missing, running, source)
 
-    def show(self, state, since, selecting=True, said="", missing=None, running=True):
+    def show(self, state, since, selecting=True, said="", missing=None, running=True, source=None):
         self.polling = False
         if missing is not None and missing != self.missing:  # None: not checked, the rows stay as they are
             self.missing, self.quiet = missing, True
             for stage in self.stages.values():  # a missing plugin shows off: it is bypassed, whatever was saved
                 stage.switch.set_active(stage.key not in missing and self.settings["voice"].get(stage.key, True))
-                stage.switch.set_subtitle(MISSING if stage.key in missing else stage.subtitle)
+                stage.switch.set_subtitle(missing.get(stage.key, stage.subtitle))
             self.quiet = False
             self.sensitize()
         self.record, problem = meter.source(state)
@@ -173,7 +179,7 @@ class MicrophonePage(Adw.PreferencesPage):
         if not running:
             self.after.idle(voice.STOPPED)
         self.meter_update()
-        self.voice.set_description(voice.describe(state, selecting, said, running))
+        self.voice.set_description(voice.describe(state, selecting, said, running, source))
         self.show_monitoring(monitor.LAST)  # the latest sync, the switch's or a heal tick's
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
@@ -279,7 +285,7 @@ class MicrophonePage(Adw.PreferencesPage):
         self.show_monitoring(None)
 
         def sync():
-            said = monitor.sync(self.settings)
+            said = monitor.sync(self.settings, on=self.headset_monitor.on if self.headset_monitor else None)
             GLib.idle_add(self.show_monitoring, said)
         threading.Thread(target=sync, daemon=True).start()
 
