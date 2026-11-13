@@ -74,6 +74,7 @@ STALE = "Booth Mic may still be using the old channel: couldn't stop it"
 STOPPED = "Booth Mic isn't running: see systemctl --user status booth-voice.service"
 HELD = "not restarted while muted: Booth Mic restarts once you unmute"
 HELD_RELOAD = "install.sh: Booth Mic is muted: its new plugins load the next time Booth Mic starts"
+HELD_UNREAD = "install.sh: Booth's settings couldn't be read: Booth Mic's new plugins load the next time it starts"
 _LOCK = threading.RLock()  # the page's poll, the service's start and heal may run at once
 HEAL_BACKOFF_S = 60
 _HEALED = {}  # (selector config, Scarlett node object.serial) → when heal last restarted the selector for it
@@ -823,15 +824,15 @@ def write(file=None, where=None):
 def reload(run=service.run, file=None):
     """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
     when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed;
-    HELD_RELOAD: held, muted (_held), so they load at its next start."""
+    HELD_RELOAD: held, muted (_held), so they load at its next start; HELD_UNREAD: held, the settings unreadable."""
     with _LOCK:
         _VERIFIED.clear()  # an install's fresh plugins: hashed now
         if _plugins(_running(file or path())) == verified():
             return True
         try:
             settings = _saved()
-        except OSError:  # unreadable: _held still reads booth_mic's own mute
-            settings = {}
+        except OSError:  # unreadable: its mute unknown, so held as if muted (fail closed, as _held is)
+            return HELD_UNREAD if _held({"voice": {"muted": True}}, _dump) else run(RESTART)
         return HELD_RELOAD if _held(settings, _dump) else run(RESTART)
 
 
@@ -844,15 +845,16 @@ def main():
         return 1 if said and said.startswith("not ") else 0
     if args == ["--reload"]:
         done = reload()
-        if done == HELD_RELOAD:
+        if isinstance(done, str):
             print(done, file=sys.stderr)
         return 0 if done else 1
     if args[:1] == ["--select"] and len(args) == 2:
         return 0 if may_select(Path(args[1])) else 1
     try:
         settings = _saved()
-    except OSError:
-        settings = store.load()
+    except OSError as e:  # EIO: never synced from defaults (another sound, unmuted), as --write
+        print(f"booth.voice: settings not read ({e.strerror or e}) — Booth Mic left as it is", file=sys.stderr)
+        return 1
     print(sync(settings))
     return 0
 

@@ -1535,6 +1535,33 @@ class Muted(unittest.TestCase):
             self.assertEqual(voice.write(run), "not read: the settings (Input/output error)")  # the unit doesn't start
         self.assertFalse(run.exists())
 
+    def test_pr62_install_sync_with_an_unreadable_settings_file_changes_nothing(self):  # as --write: never defaults
+        synced, err = [], io.StringIO()
+        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))
+        with mock.patch.object(voice.store.Path, "read_bytes", eio), mock.patch.object(voice.sys, "argv", ["x"]), \
+                mock.patch.object(voice, "sync", synced.append), contextlib.redirect_stderr(err), \
+                mock.patch.object(voice.store, "save", side_effect=AssertionError("recorded")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(voice.main(), 1)  # install.sh's "couldn't set up Booth Mic (above)": a warning
+        self.assertEqual(synced, [])  # nothing sent live, no voice.conf recorded
+        self.assertEqual(err.getvalue(),
+                         "booth.voice: settings not read (Input/output error) — Booth Mic left as it is\n")
+
+    def test_pr62_reload_holds_a_running_booth_mic_whose_settings_cant_be_read(self):  # its mute unknown: fail closed
+        self.file.write_text(voice.build(ON, {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}))
+        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))
+        for dump, want in ((CHAIN_DUMP, voice.HELD_UNREAD), ("", voice.HELD_UNREAD), ("[]", True)):
+            self.ran.clear()
+            with mock.patch.object(voice, "verified", lambda: FOUND), mock.patch.object(voice, "_dump", lambda: dump), \
+                    mock.patch.object(voice.store.Path, "read_bytes", eio):
+                self.assertEqual(voice.reload(run=lambda c: self.ran.append(c) or True, file=self.file), want, dump)
+            self.assertEqual(self.ran, [] if want is not True else [RESTART], dump)  # not running: no gap
+        err = io.StringIO()
+        with mock.patch.object(voice, "reload", lambda: voice.HELD_UNREAD), \
+                mock.patch.object(voice.sys, "argv", ["x", "--reload"]), contextlib.redirect_stderr(err):
+            self.assertEqual(voice.main(), 0)
+        self.assertEqual(err.getvalue(), voice.HELD_UNREAD + "\n")
+
     def test_install_says_a_muted_booth_mic_loads_its_new_plugins_at_its_next_start(self):  # never "couldn't restart"
         err = io.StringIO()
         with mock.patch.object(voice, "reload", lambda: voice.HELD_RELOAD), \
