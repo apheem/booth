@@ -1161,6 +1161,11 @@ class NotConnected(unittest.TestCase):
         read_ctrls.assert_called_once_with(DEV)  # after the restore: the new page shows the saved values
         stub.window.show_camera.assert_called_once_with(DEV, ctrls)
 
+    def test_a_page_whose_read_failed_gets_a_new_page_for_the_same_brio(self):  # found, but its controls weren't read
+        stub, _, restore, read_ctrls, ctrls = self.check(mock.Mock(node=DEV, ctrls={}), DEV)
+        restore.assert_called_once_with(stub.settings)
+        stub.window.show_camera.assert_called_once_with(DEV, ctrls)
+
     def test_with_no_window_nothing_is_probed(self):
         _, discover, _, _, _ = self.check(None, DEV, window=False)
         discover.assert_not_called()  # a window opened later reads the camera in start()
