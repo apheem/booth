@@ -31,6 +31,8 @@ not, and `booth-mic-select.service` (`pipewire -c ~/.config/booth/voice-select.c
 mic channel; only that one restarts when the mic channel changes. The first install makes Booth Mic the default mic; a
 re-install leaves your choice alone. With no Scarlett, Booth Mic is silent until Booth sees it again; with the mic routed
 to no capture channel, Booth stops `booth-mic-select.service` and Booth Mic is silent until it is routed again.
+`booth-monitor.service` (`pipewire -c ~/.config/booth/monitor.conf`) plays Booth Mic in the PRO X headset while the
+Microphone page's "Hear Processed Voice in Headphones" switch is on; it is never enabled: Booth starts and stops it.
 To check an install matches the repo:
 
     diff -rq -x __pycache__ booth ~/.local/share/booth/booth

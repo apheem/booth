@@ -7,21 +7,25 @@ while the window exists, as on the Headphones page: the card is found by name an
 A poll only ever shows what it read; writes come from the user's own clicks, and 48V on only after the dialog.
 
 On top, the raw before-meter (booth.meter) on the mic channel, with the gain coaching; `mini` is the same meter for the
-sidebar. Each poll says which channel and node to meter; it runs while either is on screen (see meter.wanted).
+sidebar. Each poll says which channel and node to meter; it runs while either is on screen (see meter.wanted). Below it
+the after-meter, the same Meter on Booth Mic (mono), only while the page itself is on screen: never for the sidebar, so
+a glance at the sidebar never holds Booth Mic, and through it the Scarlett, open.
 
 Below, Voice processing (booth.voice): the master switch, the rumble filter and the plugin stages, each a switch, one
 knob and the raw controls the knob sets. A switch or a knob is saved and applied live to Booth Mic; each poll also brings
 Booth Mic's config up to date with the mic it found (a no-op when nothing changed) and checks the plugins: a stage whose
-plugin is missing or changed says so, greyed out, and is bypassed."""
+plugin is missing or changed says so, greyed out, and is bypassed. Last, processed monitoring's switch (booth.monitor),
+saved and handed to monitor.sync off the main loop."""
 import threading
 import types
 
 from gi.repository import Adw, GLib, Gtk
 
-from booth import headset, meter, routing, scarlett, store, voice
+from booth import headset, meter, monitor, routing, scarlett, store, voice
 from booth.ui.levelmeter import LevelMeter
 
 POLL_S = 2
+AFTER = {"node": voice.NODE, "channel": 1, "channels": 1}  # the after-meter's record: Booth Mic, mono, by name
 MASTER = "Off sends your mic to Booth Mic untouched"
 RUMBLE = "Cuts low rumble and desk thumps below 80 Hz"
 AUTO = "Booth turns it back off when the headset is on again"
@@ -62,9 +66,15 @@ class MicrophonePage(Adw.PreferencesPage):
         for row in self.rows.values():
             row.set_sensitive(False)  # until the first poll finds the Scarlett
         self.levels = Adw.PreferencesGroup(title="Input Level", description=meter.COACHING)
-        self.bar, self.mini = LevelMeter(24), LevelMeter(6, margin_top=4)
-        self.levels.add(self.bar)
+        self.bar, self.mini, self.after = LevelMeter(24), LevelMeter(6, margin_top=4), LevelMeter(24)
+        for title, bar in (("Before", self.bar), ("After", self.after)):
+            line = Gtk.Box(spacing=12, margin_top=6)
+            line.append(Gtk.Label(label=title, xalign=0, width_chars=6))
+            line.append(bar)
+            self.levels.add(line)
         self.meter = meter.Meter(self.on_level, self.on_meter_failed)
+        self.after_meter = meter.Meter(self.after.set_level, self.after.idle)
+        self.after_record = AFTER
         self.record, self.root = None, None
         for widget in (self, self.mini):
             widget.connect("map", self.on_map)
@@ -75,6 +85,8 @@ class MicrophonePage(Adw.PreferencesPage):
         self.rumble = Adw.SwitchRow(title="Rumble Filter", subtitle=RUMBLE)
         self.master.connect("notify::active", self.on_voice, "enabled", MASTER)
         self.rumble.connect("notify::active", self.on_voice, "rumble", RUMBLE)
+        self.monitoring = Adw.SwitchRow(title="Hear Processed Voice in Headphones", subtitle=monitor.LABEL)
+        self.monitoring.connect("notify::active", self.on_monitoring)
         self.stages, self.missing = {}, []  # missing: until the first poll checks the plugins
         for key, _file, label, _ins, _out, knob, default, mapping in voice.STAGES:
             title, subtitle, knob_title, lo, hi, step, digits = STAGES[key]
@@ -99,6 +111,7 @@ class MicrophonePage(Adw.PreferencesPage):
         for stage in self.stages.values():
             stage.switch.set_active(v.get(stage.key, True))
         self.auto.set_active(settings.setdefault("routing", {}).get(routing.SETTING, True))
+        self.monitoring.set_active(v.get("monitor", False))
         self.quiet = False
         self.sensitize()
         self.voice.add(self.master)
@@ -106,6 +119,7 @@ class MicrophonePage(Adw.PreferencesPage):
         for stage in self.stages.values():
             for row in (stage.switch, stage.knob, stage.details):
                 self.voice.add(row)
+        self.voice.add(self.monitoring)
         self.add(self.levels)
         self.add(self.group)
         self.add(self.voice)
@@ -119,6 +133,7 @@ class MicrophonePage(Adw.PreferencesPage):
         """The window closed: no more polls, and the Scarlett is released."""
         GLib.source_remove(self.timer)
         self.meter.stop()
+        self.after_meter.stop()
 
     def poll(self):
         if not self.polling:  # a slow amixer never piles up threads
@@ -151,6 +166,9 @@ class MicrophonePage(Adw.PreferencesPage):
         self.levels.set_description(problem or meter.COACHING)
         if problem:
             self.on_meter_failed(problem)
+        self.after_record = AFTER if running else None
+        if not running:
+            self.after.idle(voice.STOPPED)
         self.meter_update()
         self.voice.set_description(voice.describe(state, selecting, said, running))
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
@@ -181,8 +199,9 @@ class MicrophonePage(Adw.PreferencesPage):
         self.meter_update()
 
     def meter_update(self, *_):
-        on = self.root is not None and meter.wanted(self.get_mapped(), self.mini.get_mapped(), self.root.is_suspended())
-        self.meter.want(self.record, on)
+        suspended = self.root is None or self.root.is_suspended()
+        self.meter.want(self.record, meter.wanted(self.get_mapped(), self.mini.get_mapped(), suspended))
+        self.after_meter.want(self.after_record, meter.wanted(self.get_mapped(), False, suspended))
 
     def on_level(self, peak, decay):
         for m in (self.bar, self.mini):
@@ -242,6 +261,23 @@ class MicrophonePage(Adw.PreferencesPage):
             row.set_subtitle(AUTO)
         except OSError as e:  # set for this session: the user must know it won't last
             row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
+
+    def on_monitoring(self, row, _param):
+        """Saved, then monitor.sync starts or stops the loopback off the main loop; what didn't happen is said."""
+        if self.quiet:
+            return
+        self.settings["voice"]["monitor"] = row.get_active()
+        try:
+            store.save(self.settings)
+            row.set_subtitle(monitor.LABEL)
+        except OSError as e:  # applied anyway: the user must know it won't last
+            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
+
+        def sync():
+            said = monitor.sync(self.settings)
+            if said.startswith("not "):
+                GLib.idle_add(row.set_subtitle, f"Set, but {said}")
+        threading.Thread(target=sync, daemon=True).start()
 
     def on_input(self, row, _param):
         self.settings["microphone"]["input"] = list(scarlett.INPUTS)[row.get_selected()]

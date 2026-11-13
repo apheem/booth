@@ -157,6 +157,15 @@ class Store(unittest.TestCase):
         store.save(settings, self.path)
         self.assertEqual(store.load(self.path)["voice"], settings["voice"])
 
+    def test_the_monitoring_switch_round_trips_and_only_as_a_boolean(self):
+        settings = store.load(self.path)
+        settings["voice"]["monitor"] = True
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], {"monitor": True})
+        for text in ('{"voice": {"monitor": 1}}', '{"voice": {"monitor": "on"}}', '{"voice": {"monitor": null}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)  # never a truthy value read as on
+
     def test_a_bad_stage_or_knob_value_counts_as_corrupt(self):
         # the stage rows show and apply them; a knob out of range would reach the plugin
         self.path.parent.mkdir(parents=True)

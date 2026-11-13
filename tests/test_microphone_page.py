@@ -7,7 +7,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import meter, plugins, scarlett, voice
+from booth import meter, monitor, plugins, scarlett, voice
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
@@ -38,7 +38,7 @@ class _W:
 
     def __init__(self, *_args, **kwargs):
         self.handlers, self.active, self.selected, self.sensitive = {}, False, 0, True
-        self.description = self.subtitle = self.model = None
+        self.description, self.subtitle, self.model = None, kwargs.get("subtitle"), None
         self.title, self.adjustment = kwargs.get("title"), kwargs.get("adjustment")
         self.value, self.rows = (self.adjustment or {}).get("value"), []
         self.responses = []
@@ -147,6 +147,7 @@ class PageCase(unittest.TestCase):
         self.running = True  # voice.running: Booth Mic's own process is in PipeWire
         self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
+        self.monitored, self.monitor_said = [], "on"  # every monitor.sync's switch; what it returns
 
         real_send = scarlett.send
 
@@ -164,6 +165,7 @@ class PageCase(unittest.TestCase):
                                                         SpinRow=_W, ExpanderRow=_W, AlertDialog=dialog,
                                                         ResponseAppearance=ns(DESTRUCTIVE=2))),
                 mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295,
+                                                        Box=_W, Label=_W,
                                                         Adjustment=ns(new=lambda value, lower, upper, *_: dict(
                                                             value=value, lower=lower, upper=upper)))),
                 mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
@@ -179,7 +181,9 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "verified", lambda: dict.fromkeys(plugins.MANIFEST, "/verified")),
                 mock.patch.object(microphone.voice, "loaded", lambda: self.found, create=True),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
-                mock.patch.object(microphone.meter, "Meter", _Gst)):
+                mock.patch.object(microphone.meter, "Meter", _Gst),
+                mock.patch.object(microphone.monitor, "sync",
+                                  lambda settings: self.monitored.append(dict(settings["voice"])) or self.monitor_said)):
             patch.start()
             self.addCleanup(patch.stop)
         self.page = Page()
@@ -619,6 +623,103 @@ class Meters(PageCase):
         with mock.patch.object(microphone.GLib, "source_remove", lambda _t: None):
             self.page.stop()
         self.assertEqual(self.gst.stopped, 1)
+
+
+class AfterMeter(PageCase):
+    """Booth Mic's after-meter: the same Meter on booth_mic, mono, on the page only, never while it isn't on screen."""
+
+    def setUp(self):
+        super().setUp()
+        self.gst = self.page.after_meter
+
+    map = Meters.map
+
+    def test_it_reads_booth_mic_mono_by_name(self):
+        self.assertEqual(microphone.AFTER, {"node": "booth_mic", "channel": 1, "channels": 1})
+        self.assertIn('target-object="booth_mic"', meter.launch(microphone.AFTER["node"], microphone.AFTER["channels"]))
+
+    def test_runs_only_while_the_page_is_on_screen(self):
+        self.show(state())
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, False))
+        self.map(self.page)
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, True))
+        self.map(self.page, False)
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, False))
+
+    def test_the_sidebar_meter_alone_never_opens_booth_mic(self):
+        self.show(state())
+        self.page.mini.get_mapped = lambda: self.page.mini.mapped
+        self.page.mini.get_root = lambda: self.page.root_
+        self.map(self.page.mini)
+        self.assertTrue(self.page.meter.wants[-1][1])  # the before-meter runs for the sidebar
+        self.assertFalse(self.gst.wants[-1][1])
+
+    def test_a_minimised_window_stops_it(self):
+        self.show(state())
+        self.map(self.page)
+        self.page.root_.suspended = True
+        self.page.root_.emit("notify::suspended", None)
+        self.assertFalse(self.gst.wants[-1][1])
+
+    def test_its_levels_go_to_the_after_bar_only(self):
+        self.gst.post(-20.0, -18.0)
+        self.assertEqual(self.page.after.level, (-20.0, -18.0))
+        self.assertIsNone(vars(self.page.bar).get("level"))
+        self.gst.failed(meter.UNAVAILABLE)
+        self.assertEqual((self.page.after.said, vars(self.page.bar).get("level")), (meter.UNAVAILABLE, None))
+
+    def test_booth_mic_stopped_says_so_and_runs_nothing(self):
+        self.page.show(state(), self.page.writer.writes, True, "", None, False)
+        self.assertEqual(self.gst.wants[-1][0], None)
+        self.assertEqual(self.page.after.said, voice.STOPPED)
+
+    def test_an_unplugged_scarlett_still_meters_booth_mic(self):
+        self.show(None)  # Booth Mic carries silence (or, with #20, a backup mic): it is what the call hears
+        self.assertEqual(self.gst.wants[-1][0], microphone.AFTER)
+
+    def test_closing_the_window_stops_both_meters(self):
+        with mock.patch.object(microphone.GLib, "source_remove", lambda _t: None):
+            self.page.stop()
+        self.assertEqual((self.page.meter.stopped, self.gst.stopped), (1, 1))
+
+
+class Monitoring(PageCase):
+    """The "Hear processed voice in headphones" switch: off by default, saved, and handed to monitor.sync off the main
+    loop; never voice.apply, never the Scarlett."""
+
+    def test_it_starts_off_and_says_the_delay_where_it_plays_and_what_it_keeps_open(self):
+        self.assertFalse(self.page.monitoring.active)
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)
+        self.assertEqual(self.monitored, [])  # showing the saved state starts nothing
+
+    def test_the_saved_switch_is_shown_at_start(self):
+        page = Page()
+        page.root_ = _Root()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {"monitor": True}})
+        self.assertTrue(page.monitoring.active)
+        self.assertEqual(self.monitored, [])
+
+    def test_a_click_is_saved_and_synced_never_touching_booth_mic(self):
+        self.click(self.page.monitoring, True)
+        self.assertEqual((self.settings["voice"], self.saved), ({"monitor": True}, [self.settings]))
+        self.assertEqual(self.monitored, [{"monitor": True}])
+        self.click(self.page.monitoring, False)
+        self.assertEqual(self.monitored[-1], {"monitor": False})
+        self.assertEqual((self.applied, self.ran), ([], []))  # never Booth Mic's chain, never the Scarlett
+
+    def test_what_didnt_happen_is_said_on_the_row(self):
+        self.monitor_said = "not started: see systemctl --user status booth-monitor.service"
+        self.click(self.page.monitoring, True)
+        self.assertEqual(self.page.monitoring.subtitle, f"Set, but {self.monitor_said}")
+        self.monitor_said = "off"
+        self.click(self.page.monitoring, False)
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)
+
+    def test_a_failed_save_says_so_and_still_syncs(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.click(self.page.monitoring, True)
+        self.assertEqual(self.page.monitoring.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(self.monitored, [{"monitor": True}])
 
 
 class WindowClose(unittest.TestCase):

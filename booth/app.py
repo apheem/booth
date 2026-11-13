@@ -14,7 +14,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from booth import camera, devices, headset, routing, service, store, voice  # noqa: E402
+from booth import camera, devices, headset, monitor, routing, service, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
 APP_ID = "io.github.apheem.Booth"
@@ -160,8 +160,12 @@ class Application(Adw.Application):
         threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
 
     def sync_voice(self):
-        """Booth Mic's config up to date with the Scarlett and its service started (amixer, pw-dump: off the main loop)."""
-        threading.Thread(target=lambda: voice.sync(self.settings), daemon=True).start()
+        """Booth Mic's config up to date with the Scarlett and its service started, then processed monitoring as its
+        switch says (amixer, pw-dump, systemctl: off the main loop)."""
+        def sync():
+            voice.sync(self.settings)
+            monitor.sync(self.settings)
+        threading.Thread(target=sync, daemon=True).start()
 
     def heal_voice(self):
         if not self.healing:  # a slow heal (amixer, pw-dump, systemctl) never overlaps the next tick
@@ -173,7 +177,10 @@ class Application(Adw.Application):
         try:
             voice.heal(self.settings)
         finally:
-            self.healing = False
+            try:  # monitoring back after Booth Mic or the PRO X dongle came back, window or not
+                monitor.sync(self.settings)
+            finally:
+                self.healing = False
 
     def low_battery(self, percent):
         note = Gio.Notification.new("Headset battery low")
