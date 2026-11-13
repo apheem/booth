@@ -33,6 +33,7 @@ from booth import headset, meter, monitor, routing, scarlett, stereo, store, voi
 from booth.ui.levelmeter import LevelMeter
 
 POLL_S = 2
+SAVE_MS = 500  # a voice change's save (store.save fsyncs): at most about twice a second, never per knob notify
 AFTER = {"node": voice.NODE, "channel": 1, "channels": 1}  # the after-meter's record: Booth Mic, mono, by name
 MASTER = "Off sends your mic to Booth Mic untouched"
 RUMBLE = "Cuts low rumble and desk thumps below 80 Hz"
@@ -115,6 +116,7 @@ class MicrophonePage(Adw.PreferencesPage):
         self.preset = Adw.ComboRow(title="Preset", subtitle=PRESET, model=Gtk.StringList.new(PRESETS))
         self.preset.connect("notify::selected", self.on_preset)
         # every voice change: one apply in a worker, coalesced; voice_row: the row that changed last, told if it failed
+        self.pending, self.save_timer = {}, 0  # rows whose change isn't saved yet → their subtitle; the save's timer
         self.throttle = voice.Throttle(self.apply_voice, lambda work: threading.Thread(target=work, daemon=True).start())
         self.voice_row = None
         self.stages, self.knobs, self.missing = {}, {}, {}  # missing: {stage: MISSING or PENDING}, from a poll
@@ -181,7 +183,8 @@ class MicrophonePage(Adw.PreferencesPage):
         return self.settings["microphone"].get("input", scarlett.DEFAULT_INPUT)
 
     def stop(self):
-        """The window closed: no more polls, and the Scarlett is released."""
+        """The window closed: no more polls, and the Scarlett is released; a pending voice change saved."""
+        self.save_voice()
         GLib.source_remove(self.timer)
         self.meter.stop()
         self.after_meter.stop()
@@ -439,13 +442,23 @@ class MicrophonePage(Adw.PreferencesPage):
         self.settings["voice"].update(values)
         self.sensitize()
         self.show_preset()
-        try:
-            store.save(self.settings)
-            row.set_subtitle(subtitle)
-        except OSError as e:  # applied anyway: the user must know it won't last
-            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
+        self.pending[row] = subtitle
+        self.save_timer = self.save_timer or GLib.timeout_add(SAVE_MS, self.save_voice)
         self.voice_row = row
         self.throttle.kick()
+
+    def save_voice(self):
+        """The voice changes since the last save, saved: SAVE_MS after the first, so the latest always lands; also on
+        the window's close and Booth's quit (booth.app)."""
+        self.save_timer, rows, self.pending = 0, self.pending, {}
+        if rows:
+            try:
+                store.save(self.settings)
+            except OSError as e:  # applied anyway: the user must know it won't last
+                rows = dict.fromkeys(rows, f"Set, but not saved: {e.strerror or e}")
+            for row, subtitle in rows.items():
+                row.set_subtitle(subtitle)
+        return GLib.SOURCE_REMOVE
 
     def apply_voice(self):
         """The throttle's worker: the settings as they are now, live; a switch never moves the selector: the polls do."""

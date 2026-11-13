@@ -513,7 +513,7 @@ class Verification(unittest.TestCase):
         where, manifest = plugin_folder(self, good=names, bad=())
         run = self.tmp_file().with_name(voice.RUN_CONF)
         with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
-                mock.patch.object(voice.store, "load", lambda: ON):
+                mock.patch.object(voice.store, "load", lambda **_: ON):
             REAL_VERIFIED(where, manifest)  # a poll's: cached
             for _ in range(2):
                 self.assertEqual(sorted(self.hashed(lambda: voice.write(run, where))), sorted(names))
@@ -627,7 +627,7 @@ class Verification(unittest.TestCase):
         where, manifest = plugin_folder(self, good=list(plugins.MANIFEST), bad=())
         elsewhere = file.parent / "not-the-installed-plugins"
         with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
-                mock.patch.object(voice.store, "load", lambda: ON):
+                mock.patch.object(voice.store, "load", lambda **_: ON):
             with mock.patch.object(voice.plugins, "folder", lambda: where):
                 voice.apply(ON, STATE, run=lambda cmd: True, dump=lambda: CHAIN_DUMP, file=file)
             file.write_text(voice.build(ON, {}))  # the chain an old Booth wrote
@@ -647,7 +647,7 @@ class Verification(unittest.TestCase):
         file = Path(tmp.name) / "voice.conf"
         file.write_text(voice.build(ON, FOUND))  # written while every plugin verified
         settings = {"voice": {"noise": False}}
-        with mock.patch.object(voice.store, "load", lambda: settings):
+        with mock.patch.object(voice.store, "load", lambda **_: settings):
             self.assertIsNone(voice.write(file))  # all three changed since (none verifies now): none is ever loaded
         self.assertEqual(json.loads(file.read_text()), config(settings, {}))
         self.assertEqual(ladspa(json.loads(file.read_text())), [])
@@ -657,7 +657,7 @@ class Verification(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         file = Path(tmp.name) / "voice.conf"
         file.mkdir()  # a folder where the file goes: the write fails
-        with mock.patch.object(voice.store, "load", lambda: ON):
+        with mock.patch.object(voice.store, "load", lambda **_: ON):
             self.assertIn("not saved", voice.write(file))
             with mock.patch.object(voice, "path", lambda: file.with_name("voice.conf")), \
                     mock.patch.object(voice, "RUN_CONF", file.name), mock.patch.object(voice.sys, "argv", ["x", "--write"]):
@@ -667,7 +667,7 @@ class Verification(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         file = Path(tmp.name) / "voice.conf"
-        with mock.patch.object(voice.store, "load", lambda: ON), mock.patch.object(voice, "path", lambda: file), \
+        with mock.patch.object(voice.store, "load", lambda **_: ON), mock.patch.object(voice, "path", lambda: file), \
                 mock.patch.object(voice.sys, "argv", ["x", "--write"]), \
                 mock.patch.object(voice.service, "run", side_effect=AssertionError("ran")), \
                 mock.patch.object(voice.scarlett, "read", side_effect=AssertionError("read the Scarlett")):
@@ -684,7 +684,7 @@ class Verification(unittest.TestCase):
         good = {n: str(where / n) for n in manifest}
         settings = {"voice": {"noise": False}}
         with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
-                mock.patch.object(voice.store, "load", lambda: settings), \
+                mock.patch.object(voice.store, "load", lambda **_: settings), \
                 mock.patch.object(voice.sys, "argv", ["x", "--write", str(run), str(where)]):
             for running, code in ((good, 0), (dict(list(good.items())[:1]), 0),
                                   (dict(good, **{"sc4m_1916.so": "/elsewhere/sc4m_1916.so"}), 1)):
@@ -728,7 +728,7 @@ class Verification(unittest.TestCase):
         where, manifest = plugin_folder(self, good=list(plugins.MANIFEST), bad=())
         with mock.patch.dict(plugins.MANIFEST, manifest), mock.patch.object(voice, "verified", REAL_VERIFIED), \
                 mock.patch.object(voice.plugins, "folder", lambda: where), \
-                mock.patch.object(voice.store, "load", lambda: ON):
+                mock.patch.object(voice.store, "load", lambda **_: ON):
             voice.apply(ON, None, run=lambda c: True, dump=lambda: CHAIN_DUMP, file=file)  # Booth Mic, all verified
             (where / "sc4m_1916.so").write_bytes(b"changed after the chain started")  # stays 0644, user-owned
             pre_start = []
@@ -755,7 +755,7 @@ class KeptRunConf(unittest.TestCase):
         self.run_conf = self.file.with_name(voice.RUN_CONF)
 
     def full_disk(self, settings):
-        return mock.patch.multiple(voice.store, load=lambda: settings,
+        return mock.patch.multiple(voice.store, load=lambda **_: settings,
                                    save=mock.Mock(side_effect=OSError(28, "No space left on device")))
 
     def test_a_kept_run_conf_with_older_values_gets_the_saved_ones_live_once(self):
@@ -1343,6 +1343,10 @@ class Heal(unittest.TestCase):
 
 
 MUTED = {"voice": {"muted": True}}
+# booth_mic muted live (GNOME's Ctrl+Alt+M, Booth closed: nothing recorded it), and its input
+LIVE_MUTED = json.dumps([{"id": 70, "type": "PipeWire:Interface:Node",
+                          "info": {"props": {"node.name": "booth_mic"}, "params": {"Props": [{"mute": True}]}}},
+                         node(71, "booth.mic.input")])
 
 
 class Muted(unittest.TestCase):
@@ -1375,7 +1379,7 @@ class Muted(unittest.TestCase):
         self.assertEqual((pairs["master:Gain 1"], pairs["master:Gain 2"]), (0.0, 0.0))
 
     def test_the_pre_start_writes_a_silent_chain_while_muted(self):
-        with mock.patch.object(voice.store, "load", lambda: MUTED):
+        with mock.patch.object(voice.store, "load", lambda **_: MUTED):
             self.assertIsNone(voice.write(self.file))
         self.assertEqual(flow(json.loads(self.file.read_text())), {})
 
@@ -1388,7 +1392,7 @@ class Muted(unittest.TestCase):
     def test_a_new_shape_never_restarts_a_running_booth_mic_while_muted(self):
         before = self.old_shape()
         said = self.apply(MUTED)
-        self.assertTrue(said.startswith("not "), said)  # not recorded: the first apply after unmuting restarts it
+        self.assertEqual(said, voice.HELD)  # not recorded: the first apply after unmuting restarts it
         self.assertNotIn(RESTART, self.ran)
         self.assertEqual(self.file.read_text(), before)
         self.ran.clear()
@@ -1412,7 +1416,7 @@ class Muted(unittest.TestCase):
         for settings, dump, want in ((MUTED, CHAIN_DUMP, []), (MUTED, "[]", [RESTART]), (ON, CHAIN_DUMP, [RESTART])):
             self.ran.clear()
             with mock.patch.object(voice, "verified", lambda: FOUND), \
-                    mock.patch.object(voice.store, "load", lambda: settings), mock.patch.object(voice, "_dump", lambda: dump):
+                    mock.patch.object(voice.store, "load", lambda **_: settings), mock.patch.object(voice, "_dump", lambda: dump):
                 got = voice.reload(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
             self.assertEqual(got, True if want else voice.HELD_RELOAD, (settings, dump))
             self.assertEqual(self.ran, want, (settings, dump))
@@ -1429,7 +1433,7 @@ class Muted(unittest.TestCase):
     def test_skeptic_reload_never_restarts_while_muted_on_a_pw_dump_blip(self):
         self.file.write_text(voice.build(MUTED, {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}))
         with mock.patch.object(voice, "verified", lambda: FOUND), \
-                mock.patch.object(voice.store, "load", lambda: MUTED), mock.patch.object(voice, "_dump", lambda: ""):
+                mock.patch.object(voice.store, "load", lambda **_: MUTED), mock.patch.object(voice, "_dump", lambda: ""):
             self.assertEqual(voice.reload(run=lambda c: self.ran.append(c) or True, file=self.file), voice.HELD_RELOAD)
         self.assertEqual(self.ran, [])
 
@@ -1449,21 +1453,114 @@ class Muted(unittest.TestCase):
     def test_skeptic_a_kept_live_run_conf_while_muted_is_said_as_a_mismatch(self):  # enforce mutes its node
         run = self.file.with_name(voice.RUN_CONF)
         run.write_text(voice.build(ON, {}))  # last written while unmuted
-        with mock.patch.object(voice.store, "load", lambda: MUTED), \
+        with mock.patch.object(voice.store, "load", lambda **_: MUTED), \
                 mock.patch.object(voice, "verified", lambda w=None: {}), \
                 mock.patch.object(voice, "_save", lambda cfg, f: "not saved: No space left on device"):
             said = voice.write(run)
         self.assertEqual(said, "kept the last config, not saved: No space left on device; it isn't silent though "
                                "Booth Mic is muted: booth.mute --enforce mutes its node")
         run.write_text(voice.build({"voice": {"enabled": False}}, {}))  # older values, unmuted record: no mismatch
-        with mock.patch.object(voice.store, "load", lambda: ON), mock.patch.object(voice, "verified", lambda w=None: {}), \
+        with mock.patch.object(voice.store, "load", lambda **_: ON), mock.patch.object(voice, "verified", lambda w=None: {}), \
                 mock.patch.object(voice, "_save", lambda cfg, f: "not saved: No space left on device"):
             self.assertEqual(voice.write(run), "kept the last config, not saved: No space left on device")
         run.write_text(voice.build({"voice": {"muted": True, "rumble": False}}, {}))  # older values, silent: no mismatch
-        with mock.patch.object(voice.store, "load", lambda: MUTED), \
+        with mock.patch.object(voice.store, "load", lambda **_: MUTED), \
                 mock.patch.object(voice, "verified", lambda w=None: {}), \
                 mock.patch.object(voice, "_save", lambda cfg, f: "not saved: No space left on device"):
             self.assertEqual(voice.write(run), "kept the last config, not saved: No space left on device")
+
+    def test_w5_a_live_node_mute_with_no_record_still_holds_a_restart(self):  # #21 W5 final
+        self.old_shape()
+        self.assertEqual(self.apply(ON, dump=LIVE_MUTED), voice.HELD)
+        self.assertNotIn(RESTART, self.ran)
+
+    def test_w5_reload_holds_on_a_live_node_mute_and_records_it(self):
+        self.file.write_text(voice.build(ON, {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}))
+        saved = []
+        with mock.patch.object(voice, "verified", lambda: FOUND), mock.patch.object(voice.store, "save", saved.append), \
+                mock.patch.object(voice.store, "load", lambda **_: {"voice": {}}), \
+                mock.patch.object(voice, "_dump", lambda: LIVE_MUTED):
+            self.assertEqual(voice.reload(run=lambda c: self.ran.append(c) or True, file=self.file), voice.HELD_RELOAD)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(saved, [{"voice": {"muted": True}}])  # a later PipeWire restart's enforce re-mutes it
+
+    def test_w5_the_pre_start_records_a_live_node_mute_and_writes_a_silent_chain(self):
+        saved = []
+        with mock.patch.object(voice.store, "load", lambda **_: {"voice": {}}), \
+                mock.patch.object(voice.store, "save", lambda s, f=None: saved.append(s) if f is None else real_save(s, f)), \
+                mock.patch.object(voice, "_dump", lambda: LIVE_MUTED):
+            self.assertIsNone(voice.write(self.file))
+        self.assertEqual(flow(json.loads(self.file.read_text())), {})
+        self.assertEqual(saved, [{"voice": {"muted": True}}])
+
+    def test_w5_install_sync_records_a_live_node_mute(self):
+        saved = []
+        with mock.patch.object(voice.store, "load", lambda **_: {"voice": {}}), \
+                mock.patch.object(voice.store, "save", saved.append), mock.patch.object(voice, "_dump", lambda: LIVE_MUTED), \
+                mock.patch.object(voice, "sync", lambda settings: "synced"), mock.patch.object(voice.sys, "argv", ["x"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(voice.main(), 0)
+        self.assertEqual(saved, [{"voice": {"muted": True}}])
+
+    def test_w5_a_held_shape_change_sends_only_what_the_running_chain_has_once(self):  # #21 W5 final item 3
+        before = self.old_shape()  # rumble's filter isn't in the running chain: its controls can never land
+        has = {f"{n['name']}:{k}" for n in voice._graph_nodes(json.loads(before)) for k in n.get("control", {})}
+        props = {}
+
+        def run(cmd):
+            self.ran.append(cmd)
+            props.update((k, v) for k, v in itertools.batched(json.loads(cmd[4])["params"], 2) if k in has)
+            return True
+        said = REAL_APPLY(MUTED, None, run=run, dump=lambda: with_props(CHAIN_DUMP, props), file=self.file)
+        self.assertEqual(said, voice.HELD)  # never "didn't take rumble:Freq": the mute landed
+        self.assertEqual((props["master:Gain 1"], props["master:Gain 2"]), (0.0, 0.0))
+        self.assertEqual(set(sent(self.ran)), has)  # only what it has, each call once
+        self.assertEqual(len(self.ran), -(-len(has) // voice.CHUNK) + 1)
+
+    def test_w5_a_held_chain_whose_run_conf_cant_be_read_still_gets_the_mute(self):
+        self.old_shape()
+        self.file.with_name(voice.RUN_CONF).write_text("not json")
+        self.assertEqual(self.apply(MUTED), voice.HELD)
+        self.assertEqual(sent(self.ran), {"master:Gain 1": 0.0, "master:Gain 2": 0.0})
+
+    def test_w5_an_unreadable_settings_file_keeps_the_last_run_conf_never_defaults(self):  # #17 W5 final
+        run = self.file.with_name(voice.RUN_CONF)
+        last = voice.build(MUTED, {})
+        run.write_text(last)
+        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))  # the settings file's read, in store.load
+        with mock.patch.object(voice.store.Path, "read_bytes", eio), mock.patch.object(voice, "verified", lambda w=None: {}):
+            self.assertEqual(voice.write(run), "kept the last config, not read: the settings (Input/output error)")
+            self.assertEqual(run.read_text(), last)
+            run.unlink()
+            self.assertEqual(voice.write(run), "not read: the settings (Input/output error)")  # the unit doesn't start
+        self.assertFalse(run.exists())
+
+    def test_pr62_install_sync_with_an_unreadable_settings_file_changes_nothing(self):  # as --write: never defaults
+        synced, err = [], io.StringIO()
+        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))
+        with mock.patch.object(voice.store.Path, "read_bytes", eio), mock.patch.object(voice.sys, "argv", ["x"]), \
+                mock.patch.object(voice, "sync", synced.append), contextlib.redirect_stderr(err), \
+                mock.patch.object(voice.store, "save", side_effect=AssertionError("recorded")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(voice.main(), 1)  # install.sh's "couldn't set up Booth Mic (above)": a warning
+        self.assertEqual(synced, [])  # nothing sent live, no voice.conf recorded
+        self.assertEqual(err.getvalue(),
+                         "booth.voice: settings not read (Input/output error) — Booth Mic left as it is\n")
+
+    def test_pr62_reload_holds_a_running_booth_mic_whose_settings_cant_be_read(self):  # its mute unknown: fail closed
+        self.file.write_text(voice.build(ON, {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}))
+        eio = mock.Mock(side_effect=OSError(5, "Input/output error"))
+        for dump, want in ((CHAIN_DUMP, voice.HELD_UNREAD), ("", voice.HELD_UNREAD), ("[]", True)):
+            self.ran.clear()
+            with mock.patch.object(voice, "verified", lambda: FOUND), mock.patch.object(voice, "_dump", lambda: dump), \
+                    mock.patch.object(voice.store.Path, "read_bytes", eio):
+                self.assertEqual(voice.reload(run=lambda c: self.ran.append(c) or True, file=self.file), want, dump)
+            self.assertEqual(self.ran, [] if want is not True else [RESTART], dump)  # not running: no gap
+        err = io.StringIO()
+        with mock.patch.object(voice, "reload", lambda: voice.HELD_UNREAD), \
+                mock.patch.object(voice.sys, "argv", ["x", "--reload"]), contextlib.redirect_stderr(err):
+            self.assertEqual(voice.main(), 0)
+        self.assertEqual(err.getvalue(), voice.HELD_UNREAD + "\n")
 
     def test_install_says_a_muted_booth_mic_loads_its_new_plugins_at_its_next_start(self):  # never "couldn't restart"
         err = io.StringIO()
@@ -1549,7 +1646,7 @@ class Tone(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         file = Path(tmp.name) / "voice-run.conf"
         settings = {"voice": {"tone": True, "tone_warmth": -4.0, "tone_air": 2.5}}
-        with mock.patch.object(voice.store, "load", lambda: settings):
+        with mock.patch.object(voice.store, "load", lambda **_: settings):
             self.assertIsNone(voice.write(file))
         nodes = self.tone_nodes(json.loads(file.read_text()))
         self.assertEqual((nodes["tone_warmth"]["control"]["Gain"], nodes["tone_air"]["control"]["Gain"]), (-4.0, 2.5))
@@ -1685,7 +1782,15 @@ class Readback(unittest.TestCase):
         said = REAL_APPLY(MUTED, None, **self.chain(drop=lambda cmd, n: "tone_air:Gain" in cmd[4] and n == 1))
         self.assertEqual(said, "live")
         self.assertEqual([c for c in self.ran if "tone_air:Gain" in c[4]].__len__(), 2)
+        # only the missed call goes again: every other one, read back as landed, once
+        self.assertEqual(len(self.ran), len(voice.set_params_cmds(CHAIN_DUMP, config(MUTED))) + 1)
         self.assertEqual(json.loads(self.file.read_text()), config(MUTED))
+
+    def test_a_mute_whose_master_never_lands_is_not_applied_though_the_old_gains_are_close(self):  # #21 cnf59
+        self.props.update(sent(voice.set_params_cmds(CHAIN_DUMP, config(ON))))  # running ON: master Gain 1 is 1.0
+        said = REAL_APPLY(MUTED, None, **self.chain(drop=lambda cmd, n: "master:" in cmd[4]))
+        self.assertEqual(said, "not applied: Booth Mic didn't take master:Gain 1")  # 1.0 stale, never 0.0's
+        self.assertEqual(json.loads(self.file.read_text()), config(ON))  # not recorded
 
     def test_a_value_the_chain_stores_as_a_float32_has_landed(self):  # 0.707 reads back 0.7070000171661377
         f32 = lambda v: struct.unpack("f", struct.pack("f", v))[0]  # noqa: E731
@@ -1705,6 +1810,8 @@ class Throttle(unittest.TestCase):
     def sleep(self, s):
         self.assertGreaterEqual(s, 0)
         self.now += s
+        self.sleeps = getattr(self, "sleeps", 0) + 1  # a worker that never clears `dirty` fails here, never hangs
+        self.assertLess(self.sleeps, 1000, "the worker never stopped")
 
     def send(self):
         self.sent.append((round(self.now, 3), self.value))  # apply() reads the settings when it runs: the latest
@@ -1767,6 +1874,19 @@ class Throttle(unittest.TestCase):
         self.change(2)
         self.run_worker()
         self.assertEqual(self.sent[-1][1], 2)
+
+    def test_a_change_made_while_a_send_raised_still_lands_without_another_change(self):  # #17 aud58
+        def send():
+            self.change(2)  # the knob moved while pw-cli ran, then the send failed
+            raise OSError("pw-cli gone")
+        self.t.send = send
+        self.change(1)
+        with self.assertRaises(OSError):
+            self.run_worker()
+        self.t.send = self.send
+        self.assertEqual(len(self.workers), 1)  # a new worker for it, with no next kick
+        self.run_worker()
+        self.assertEqual(self.sent, [(100.05, 2)])
 
     def test_the_default_gap_is_about_20_a_second(self):
         self.assertEqual(voice.Throttle(self.send, self.workers.append).gap, 0.05)

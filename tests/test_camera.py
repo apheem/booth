@@ -569,6 +569,7 @@ class PageQuietTest(unittest.TestCase):
 
         spawn, settings, moved = FakeSpawn(), {"version": 1, "camera": {}}, []
         page = mock.Mock(quiet=False, values={"zoom_absolute": 300}, ctrls=brio())
+        page.ctrls["zoom_absolute"]["value"] = 300  # read zoomed in: Ctrl+0 is its default, never the value read
         page.setter = camera.Setter(settings, DEV, spawn, lambda s: None, {})
         page.changed = lambda name, v: CameraPage.changed(page, name, v)
         page.show = lambda names: CameraPage.show(page, names)

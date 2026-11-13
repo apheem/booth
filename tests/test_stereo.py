@@ -32,7 +32,7 @@ def node(i, name, serial, cls="Stream/Input/Audio/Internal", description=None):
 MIC_INPUT = node(97, "booth.mic.input", 900, "Audio/Sink/Internal")
 BOOTH_MIC = node(106, "booth_mic", 906, "Audio/Source", "Booth Mic")
 UP = (node(140, "booth.stereo.input", 940, "Audio/Sink/Internal"),
-      node(141, "booth_stereo", 941, "Audio/Source", "Booth Stereo (for recording)"),
+      node(141, "booth_stereo", 941, "Audio/Source", "Booth Stereo — recording only, not for calls"),
       node(142, "booth.stereo.voice", 942), node(143, "booth.stereo.voice.out", 943, "Stream/Output/Audio/Internal"))
 OTHER_UP = (node(144, "booth.stereo.other", 944), node(145, "booth.stereo.other.out", 945, "Stream/Output/Audio/Internal"))
 
@@ -99,7 +99,7 @@ class Build(unittest.TestCase):
                     self.assertIs(source["capture.props"]["node.passive"], True)  # nothing runs until an app records
                     out = source["playback.props"]
                     self.assertEqual((out["node.name"], out["media.class"], out["node.description"]),
-                                     ("booth_stereo", "Audio/Source", "Booth Stereo (for recording)"))
+                                     ("booth_stereo", "Audio/Source", "Booth Stereo — recording only, not for calls"))
                     chain = m["chain"]
                     cap, play = chain["capture.props"], chain["playback.props"]
                     # the selected mic, before processing and before the mute: booth.mic.input's monitor
@@ -244,7 +244,10 @@ class Choices(unittest.TestCase):
     def test_the_scarlett_computer_sound_then_each_source_and_a_saved_one_thats_gone(self):
         found = [(BRIO, "BRIO")]
         self.assertEqual(stereo.choices(settings(), found),
-                         [("scarlett", "Scarlett instrument input"), ("computer", "Computer sound"), (BRIO, "BRIO")])
+                         [("scarlett", "Scarlett Instrument input"), ("computer", "Computer sound"), (BRIO, "BRIO")])
+        # the input the mic isn't on, as the Scarlett side takes it: the XLR while the mic is on the Instrument
+        mic_on_instrument = dict(settings(), microphone={"input": "Instrument"})
+        self.assertEqual(stereo.choices(mic_on_instrument, found)[0], ("scarlett", "Scarlett XLR input"))
         self.assertEqual(stereo.choices(settings(source="alsa_input.gone"), found)[-1],
                          ("alsa_input.gone", "alsa_input.gone (not connected)"))
 
@@ -368,6 +371,28 @@ class Sync(unittest.TestCase):
         self.props, self.base, self.t = None, DUMP, self.t + stereo.BACKOFF_S  # not running: no recording on it
         self.sync(s)
         self.assertEqual((self.ran[-1], len(self.notes)), (RESTART, 1))
+
+    def test_w5_a_mic_input_that_wasnt_saved_never_restarts_it(self):  # #19 W5 final: its pre-start reads the saved
+        self.up()
+        self.disk = settings()  # the save of the Instrument failed: its pre-start still builds the XLR's other side
+        s = dict(settings(), microphone={"input": "Instrument"})
+        self.sync(s)
+        self.t += stereo.BACKOFF_S
+        self.sync(s)
+        self.assertEqual(self.ran, [])  # never a restart a minute
+
+    def test_w5_a_restart_on_the_same_computer_output_says_nothing(self):  # p02: only a new default output is said
+        s = settings(source="computer")
+        self.up(s)
+        self.sync(settings("R", "computer"))  # the user's side change, same output
+        self.assertEqual((self.ran, self.notes), ([RESTART], []))
+
+    def test_w5_a_knob_tick_while_muted_never_silences_booth_stereo(self):  # p06: live() builds it unmuted too
+        self.up()
+        with mock.patch.object(stereo, "LAST", "Right: x"):
+            stereo.live(settings(muted=True, tone_air=-6.0), self.run_, self.dump_)
+        self.assertEqual(self.props["tone_air:Gain"], -6.0)
+        self.assertEqual((self.props["master:Gain 1"], self.props["master:Gain 2"]), (1.0, 0.0))
 
     def test_a_knob_tick_only_sets_its_chains_values_live_never_a_shape_or_restart_decision(self):  # #10
         self.up()
