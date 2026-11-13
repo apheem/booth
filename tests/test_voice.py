@@ -30,6 +30,14 @@ def rerouted(item):
     return {"ctrls": ctrls, "mic": scarlett.mic(ctrls, DUMP, "XLR")}
 
 
+def xlr_on_channel_1(dump=DUMP):
+    """scarlett.read after a reroute that put the XLR on capture channel 1 (FL), the computer's playback on 2."""
+    ctrls = copy.deepcopy(CTRLS)
+    for pcm, item in (("PCM 01 Capture Enum", "DSP 2"), ("PCM 02 Capture Enum", "PCM 1")):
+        ctrls[pcm]["values"] = [ctrls[pcm]["items"].index(item)]
+    return {"ctrls": ctrls, "mic": scarlett.mic(ctrls, dump, "XLR")}
+
+
 def plugged(mic):
     return {"ctrls": CTRLS, "mic": mic}
 
@@ -303,15 +311,24 @@ class Apply(unittest.TestCase):
         self.assertEqual(self.ran[-1], RESTART_SELECT)
         self.assertEqual(json.loads(self.file.read_text()), config())  # not recorded: the next apply retries it
 
-    def test_a_new_channel_with_booth_mics_input_down_is_saved_never_restarted(self):
-        self.apply()
+    def test_a_new_channel_restarts_the_selector_whatever_pw_dump_says(self):
         instrument = scarlett.mic(CTRLS, DUMP, "Instrument")
+        for blip in ("", json.dumps([node(40, MIC["node"])])):  # pw-dump timed out; Booth Mic's input not listed
+            self.apply()
+            self.ran.clear()
+            said = voice.apply(ON, plugged(instrument), run=lambda cmd: self.ran.append(cmd) or True,
+                               dump=lambda: blip, file=self.file)
+            self.assertEqual((said, self.ran), ("selector restarted", [RESTART_SELECT]), blip)
+            self.assertEqual(json.loads(self.select.read_text()), selector(instrument))
+            self.apply()  # back to the XLR for the next blip
+
+    def test_a_pw_dump_that_fails_stops_a_selector_whose_channel_moved(self):
+        self.apply()
         self.ran.clear()
-        said = voice.apply(ON, plugged(instrument), run=lambda cmd: self.ran.append(cmd) or True,
-                           dump=lambda: json.dumps([node(40, MIC["node"])]), file=self.file)
-        self.assertFalse(said.startswith("not "), said)
-        self.assertEqual(self.ran, [])  # BindsTo would pull a stopped booth-voice.service back up
-        self.assertEqual(json.loads(self.select.read_text()), selector(instrument))  # heal starts it with the chain
+        moved = xlr_on_channel_1(dump="")  # no node: only the ALSA routing says the mic left capture 2
+        self.assertEqual((moved["mic"]["channel"], moved["mic"]["node"]), (1, None))
+        self.apply(state=moved)
+        self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False))
 
     def test_a_selector_that_wont_stop_keeps_its_config_and_is_stopped_next_time(self):
         self.apply()
@@ -557,16 +574,43 @@ class Heal(unittest.TestCase):
         self.assertTrue(self.heal(after, t=1020.0))
         self.assertEqual(self.ran, [RESTART_SELECT] * 2)
 
-    def test_heal_moves_the_selector_but_starts_it_only_with_booth_mics_input(self):
+    def test_heal_moves_the_selector_and_restarts_it_at_once(self):
         self.saved()
         name = MIC["node"].replace("analog-surround-40", "pro-input-0")
         moved = plugged(dict(MIC, node=name, position="AUX1"))
-        self.assertFalse(self.heal(json.dumps([node(41, name)]), state=moved))  # booth-voice.service down
-        self.assertEqual(self.ran, [])
+        self.assertTrue(self.heal(json.dumps([node(41, name)]), state=moved))  # apply's restart: never left saved only
+        self.assertEqual(self.ran, [RESTART_SELECT])
         self.assertEqual(module(json.loads(self.select.read_text()), "libpipewire-module-loopback")
                          ["capture.props"]["target.object"], name)
-        self.assertTrue(self.heal(json.dumps([node(71, "booth.mic.input"), node(41, name)]), state=moved, t=1010.0))
-        self.assertEqual(self.ran, [RESTART_SELECT])
+
+    def test_a_pw_dump_blip_never_leaves_the_running_selector_on_the_old_channel(self):
+        """Skeptic repro: the selector runs on FR; the XLR is rerouted to FL (FR now carries the computer's playback);
+        apply's pw-dump comes back empty. The new channel is never recorded while the running selector stays on FR."""
+        self.saved()
+
+        def position():
+            return module(json.loads(self.select.read_text()), "libpipewire-module-loopback")["capture.props"][
+                "audio.position"] if self.select.exists() else None
+
+        running, calls = [position()], []
+        up = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"]), node(80, "booth.mic.select")])
+
+        def dump():
+            calls.append(1)
+            return "" if len(calls) % 3 == 1 else up  # the first one apply asks for, then every third, blips
+
+        def run(cmd):
+            self.ran.append(cmd)
+            if cmd == RESTART_SELECT:
+                running[0] = position()
+            return True
+
+        self.assertEqual(running, [["FR"]])
+        for tick in range(20):
+            voice.heal(ON, read=lambda choice: xlr_on_channel_1(), run=run, dump=dump, file=self.file,
+                       clock=lambda: 1000.0 + 10 * tick)
+            self.assertFalse(position() == ["FL"] and running[0] == ["FR"], f"tick {tick}: saved FL, running FR")
+        self.assertEqual((position(), running[0]), (["FL"], ["FL"]))
 
     def test_heal_takes_the_chosen_input(self):
         self.saved()
