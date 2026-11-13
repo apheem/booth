@@ -1359,7 +1359,7 @@ class Muted(unittest.TestCase):
     def test_a_held_restart_still_moves_the_selector(self):  # only the selector restarts: Booth Mic and its mute stay
         self.old_shape()
         self.assertIn("not restarted", self.apply(MUTED, state=STATE))
-        self.assertEqual(self.ran, [ACTIVE, RESTART_SELECT])
+        self.assertEqual([c[:2] for c in self.ran[:1]] + self.ran[1:], [["pw-cli", "set-param"], ACTIVE, RESTART_SELECT])
         self.assertEqual(json.loads(self.file.with_name(voice.SELECT_CONF).read_text()), selector())
 
     def test_reload_never_restarts_a_running_booth_mic_while_muted(self):
@@ -1372,6 +1372,54 @@ class Muted(unittest.TestCase):
                 got = voice.reload(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
             self.assertEqual(got, True if want else voice.HELD_RELOAD, (settings, dump))
             self.assertEqual(self.ran, want, (settings, dump))
+
+    def test_skeptic_a_failed_pw_dump_never_restarts_a_running_booth_mic_while_muted(self):  # fail closed
+        self.old_shape()
+        for blip in ("", "not json", "{}"):  # devices._run's "" on a timeout or OSError; anything but a list
+            self.ran.clear()
+            calls = iter([blip] + [CHAIN_DUMP] * 20)  # _held's read fails; Booth Mic IS running
+            said = voice.apply(MUTED, None, run=lambda c: self.ran.append(c) or True, dump=lambda: next(calls),
+                               file=self.file)
+            self.assertNotIn(RESTART, self.ran, f"{blip!r}: {said}")
+
+    def test_skeptic_reload_never_restarts_while_muted_on_a_pw_dump_blip(self):
+        self.file.write_text(voice.build(MUTED, {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}))
+        with mock.patch.object(voice, "verified", lambda: FOUND), \
+                mock.patch.object(voice.store, "load", lambda: MUTED), mock.patch.object(voice, "_dump", lambda: ""):
+            self.assertEqual(voice.reload(run=lambda c: self.ran.append(c) or True, file=self.file), voice.HELD_RELOAD)
+        self.assertEqual(self.ran, [])
+
+    def test_skeptic_a_held_restart_still_silences_the_running_chain_live(self):
+        old = config(ON)  # running unmuted, a shape change pending (an earlier restart failed)
+        module(old, "libpipewire-module-filter-chain")["filter.graph"]["nodes"].pop(1)
+        self.file.write_text(json.dumps(old))
+        self.assertEqual(self.apply(MUTED), voice.HELD)  # only the restart waits: not recorded, so it's retried
+        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"]])
+        pairs = dict(itertools.batched(json.loads(self.ran[0][4])["params"], 2))
+        self.assertEqual((pairs["master:Gain 1"], pairs["master:Gain 2"]), (0.0, 0.0))
+        self.ran.clear()
+        self.assertTrue(voice.apply(MUTED, None, run=lambda c: self.ran.append(c) or c[0] != "pw-cli",
+                                    dump=lambda: CHAIN_DUMP, file=self.file).startswith("not applied"))  # said
+        self.assertNotIn(RESTART, self.ran)
+
+    def test_skeptic_a_kept_live_run_conf_while_muted_is_said_as_a_mismatch(self):  # enforce mutes its node
+        run = self.file.with_name(voice.RUN_CONF)
+        run.write_text(voice.build(ON, {}))  # last written while unmuted
+        with mock.patch.object(voice.store, "load", lambda: MUTED), \
+                mock.patch.object(voice, "verified", lambda w=None: {}), \
+                mock.patch.object(voice, "_save", lambda cfg, f: "not saved: No space left on device"):
+            said = voice.write(run)
+        self.assertEqual(said, "kept the last config, not saved: No space left on device; it isn't silent though "
+                               "Booth Mic is muted: booth.mute --enforce mutes its node")
+        run.write_text(voice.build({"voice": {"enabled": False}}, {}))  # older values, unmuted record: no mismatch
+        with mock.patch.object(voice.store, "load", lambda: ON), mock.patch.object(voice, "verified", lambda w=None: {}), \
+                mock.patch.object(voice, "_save", lambda cfg, f: "not saved: No space left on device"):
+            self.assertEqual(voice.write(run), "kept the last config, not saved: No space left on device")
+        run.write_text(voice.build({"voice": {"muted": True, "rumble": False}}, {}))  # older values, silent: no mismatch
+        with mock.patch.object(voice.store, "load", lambda: MUTED), \
+                mock.patch.object(voice, "verified", lambda w=None: {}), \
+                mock.patch.object(voice, "_save", lambda cfg, f: "not saved: No space left on device"):
+            self.assertEqual(voice.write(run), "kept the last config, not saved: No space left on device")
 
     def test_install_says_a_muted_booth_mic_loads_its_new_plugins_at_its_next_start(self):  # never "couldn't restart"
         err = io.StringIO()

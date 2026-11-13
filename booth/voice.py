@@ -501,8 +501,16 @@ def _restarted(key, clock):
 
 def _held(settings, dump):
     """#21: muted with Booth Mic running, so no restart: while booth_mic is gone a call falls back to the raw mic,
-    unmuted. A Booth Mic that isn't running has no gap to fall back in, so it still starts."""
-    return bool((settings.get("voice") or {}).get("muted")) and _node_id(dump(), NODE) is not None
+    unmuted. A Booth Mic that isn't running has no gap to fall back in, so it still starts. Fail closed: only a pw-dump
+    that read a list without booth_mic says it isn't running, never a failed or empty one."""
+    if not (settings.get("voice") or {}).get("muted"):
+        return False
+    text = dump()
+    try:
+        listed = isinstance(json.loads(text), list)
+    except (TypeError, ValueError):
+        listed = False
+    return not listed or _node_id(text, NODE) is not None
 
 
 def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
@@ -532,14 +540,15 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             if shape(same) == shape(now):  # nothing else changed: no restart; its next start loads what verifies
                 chain = same
         restart = shape(now) != shape(chain)
-        if restart and _held(settings, dump):  # not recorded: the first apply after unmuting restarts it
+        held = restart and _held(settings, dump)
+        if held:  # not recorded: the first apply after unmuting restarts it; its values (a mute's 0s) still go live
             said = HELD
         # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
         # kept run conf holds older ones), else voice.conf's, what apply set live since
         # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
         live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
         changed = old != chain or live != chain
-        if live != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
+        if live != chain and (held or not restart) and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
             said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
@@ -710,6 +719,10 @@ def write(file=None, where=None):
             os.utime(file)  # newer than voice.conf: its values may be older than what Booth set live
         except OSError:
             pass
+        master = lambda c: [n.get("control") for n in _graph_nodes(c) if n.get("name") == "master"]  # noqa: E731
+        if (settings.get("voice") or {}).get("muted") and master(on_disk) != master(cfg):
+            return f"kept the last config, {said}; it isn't silent though Booth Mic is muted: booth.mute --enforce " \
+                   "mutes its node"
         return f"kept the last config, {said}"
     return said
 

@@ -920,16 +920,17 @@ class Mute(unittest.TestCase):
         self.assertEqual(gtk.ToggleButton.call_args.kwargs["action_name"], "app.mute")
         adw.HeaderBar.return_value.pack_start.assert_called_once_with(gtk.ToggleButton.return_value)
 
-    def failed(self, on):
-        """The button (or Ctrl+M) set to `on` with wpctl refusing it; its workers and main-loop calls run → the stub and
-        the notifications sent, as their texts."""
+    def failed(self, on, said="live"):
+        """The button (or Ctrl+M) set to `on` with wpctl refusing it, voice.apply saying `said`; its workers and
+        main-loop calls run → the stub and the notifications sent, as their texts."""
         idle = []
 
         def press(s):
-            s.mute_failed = lambda on: app.Application.mute_failed(s, on)
+            s.mute_failed = lambda on, said=None: app.Application.mute_failed(s, on, said)
             app.Application.on_mute(s, None, GLib.Variant.new_boolean(on))
         stub, threads, _ = self.spawned(press, settings={"voice": {"muted": not on}}, mute_known=9001)
-        with mock.patch.object(app.mute, "write", return_value=False), mock.patch.object(app.voice, "apply"), \
+        with mock.patch.object(app.mute, "write", return_value=False), \
+                mock.patch.object(app.voice, "apply", return_value=said) as self.applied, \
                 mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
                 mock.patch.object(app.store, "save"), mock.patch.object(app.Gio.Notification, "new", lambda text: text), \
                 mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()):
@@ -950,8 +951,19 @@ class Mute(unittest.TestCase):
         self.assertIs(stub.settings["voice"]["muted"], True)  # never turned live by it
         write.assert_called_once_with(True)  # the mute tried again
 
+    def test_skeptic_a_failed_mute_says_the_chain_is_silenced_only_when_it_is(self):
+        for said in ("unchanged", voice.HELD, "restarted"):
+            self.assertEqual(self.failed(True, said)[1],
+                             ["Couldn't mute Booth Mic in GNOME — the chain is silenced; try again"], said)
+        for said in ("not applied: Booth Mic didn't take the change", "not restarted: Booth Mic's service didn't start"):
+            stub, notes = self.failed(True, said)
+            self.assertEqual(notes, [f"Couldn't mute Booth Mic in GNOME, and its chain couldn't be silenced ({said}); "
+                                     "try again"])
+            self.assertIs(stub.settings["voice"]["muted"], True)
+
     def test_a_failed_unmute_keeps_the_chain_silent_and_says_so(self):  # the node keeps its mute
         stub, notes = self.failed(False)
+        self.assertEqual(self.applied.call_count, 1)  # the unmute's own: never one more with the record still live
         self.assertIs(stub.settings["voice"]["muted"], True)
         self.assertEqual(stub.mute_action.set_state.call_args, mock.call(GLib.Variant.new_boolean(True)))
         self.assertEqual(len(notes), 1)

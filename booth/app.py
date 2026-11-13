@@ -220,18 +220,24 @@ class Application(Adw.Application):
         """The header button or Ctrl+M: Booth Mic's node mute set, and recorded at once."""
         on = value.get_boolean()
         self.record_mute(on)
-        threading.Thread(target=lambda: mute.write(on) or GLib.idle_add(self.mute_failed, on), daemon=True).start()
 
-    def mute_failed(self, on):
+        def write():  # refused: a mute's silence applied again here, so mute_failed says whether it landed
+            if not mute.write(on):
+                GLib.idle_add(self.mute_failed, on, voice.apply(self.settings, None) if on else None)
+        threading.Thread(target=write, daemon=True).start()
+
+    def mute_failed(self, on, said=None):
         """wpctl didn't take the button's `on`: the node keeps its mute, and the button shows it (pressing it again
         tries again). Fail closed: the chain stays (or goes back to) silent, and the node is no longer followed, so its
-        next sighting puts the mute back instead of turning the record live."""
+        next sighting puts the mute back instead of turning the record live. `said`: voice.apply's, for a mute."""
         self.mute_known = None
         self.record_mute(True)
         self.mute_action.set_state(GLib.Variant.new_boolean(not on))
+        silenced = said in ("live", "unchanged", "restarted", voice.HELD)  # the muted chain set live, or started
         self.send_notification("mute-failed", Gio.Notification.new(
-            "Couldn't mute Booth Mic in GNOME — the chain is silenced; try again" if on else
-            "Couldn't unmute Booth Mic in GNOME — it stays muted; try again"))
+            "Couldn't unmute Booth Mic in GNOME — it stays muted; try again" if not on else
+            "Couldn't mute Booth Mic in GNOME — the chain is silenced; try again" if silenced else
+            f"Couldn't mute Booth Mic in GNOME, and its chain couldn't be silenced ({said}); try again"))
         return GLib.SOURCE_REMOVE
 
     def muted(self):

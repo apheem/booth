@@ -235,6 +235,30 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("not saved", r.stderr)
 
+    def test_skeptic_booth_voice_mutes_a_new_booth_mic_when_the_saved_record_is_muted_with_no_booth(self):  # #21
+        """A kept voice-run.conf may carry live gains: the unit's ExecStartPost, the installed booth.mute, mutes the
+        new booth_mic's node by name when the saved record is muted; never unmutes, never fails the start."""
+        self.assertEqual(self.install().returncode, 0)
+        unit = (self.unit.parent / "booth-voice.service").read_text().splitlines()
+        line = next(ln for ln in unit if ln.startswith("ExecStartPost="))
+        self.assertLess(unit.index(next(ln for ln in unit if ln.startswith("ExecStart="))), unit.index(line))
+        argv = shlex.split(line.removeprefix("ExecStartPost=").replace("%%", "%").replace("$$", "$"))
+        self.assertEqual(argv, ["-/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.mute",
+                                "--enforce"])  # "-": a booth_mic left unmuted beats none (the raw mic, unmuted)
+        stubs = Path(self.env["PATH"].split(":")[0])
+        (stubs / "pw-dump").write_text("#!/bin/sh\necho '" + json.dumps([{"id": 106, "info": {
+            "props": {"node.name": "booth_mic", "object.serial": 87}, "params": {"Props": [{"mute": False}]}}}]) + "'\n")
+        (stubs / "wpctl").write_text(STUB)
+        (stubs / "wpctl").chmod(0o755)
+        settings = self.home / ".config/booth/settings.json"
+        for record, want in (({"muted": True}, ["wpctl set-mute 106 1"]), ({"muted": False}, [])):
+            settings.write_text(json.dumps({"voice": record}))
+            self.calls.write_text("")
+            r = subprocess.run([argv[0].removeprefix("-")] + argv[1:], env=self.env, cwd=self.home,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual([c for c in self.calls.read_text().splitlines() if c.startswith("wpctl")], want, record)
+
     def test_the_pre_start_rewrites_the_config_pipewire_loads_whatever_the_units_environment(self):
         self.assertEqual(self.install().returncode, 0)
         conf = self.home / ".config/booth/voice-run.conf"
@@ -614,6 +638,12 @@ class Install(unittest.TestCase):
         self.assertEqual([re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], w) for w in m.groups()],
                          [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice-run.conf"),
                           str(self.home / ".local/share/booth/plugins")])
+        line = next(ln for ln in voice_unit.read_text().splitlines() if ln.startswith("ExecStartPost="))
+        m = re.fullmatch(r'ExecStartPost=-/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
+                         r'booth\.mute --enforce', line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
+                         str(self.home / ".local/share/booth"))
         line = next(ln for ln in select_unit.read_text().splitlines() if ln.startswith("ExecCondition="))
         m = re.fullmatch(rf'ExecCondition=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
                          rf'booth\.voice --select {word}', line)
