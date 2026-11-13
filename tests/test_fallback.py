@@ -11,8 +11,8 @@ from unittest import mock
 
 from booth import routing, voice
 from tests.test_headset import DUMP
-from tests.test_voice import (ACTIVE, MIC, ON, RESTART_SELECT, STATE, STOP_SELECT, UNITS, module, node, rerouted,
-                              selector)
+from tests.test_voice import (ACTIVE, MIC, ON, RESTART_SELECT, STATE, STOP_SELECT, UNITS, landing, module, node,
+                              rerouted, selector)
 
 PROX_MIC = "alsa_input.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.mono-fallback"  # the fixture's, MONO
 BRIO_MIC = "alsa_input.usb-046d_Logitech_BRIO_FAKESER1-03.analog-stereo"  # the fixture's, FL,FR
@@ -182,7 +182,7 @@ class Fallback(unittest.TestCase):
 
     def test_muted_every_fallback_moves_only_the_selector_and_booth_mic_stays_silent(self):  # #21
         muted = {"voice": {"muted": True}}
-        voice.apply(muted, STATE, run=lambda cmd: True, dump=desk, file=self.file)  # muted live: silent
+        landing(muted, STATE, run=lambda cmd: True, dump=desk, file=self.file)  # muted live (and read back): silent
         for state, dump, on in ((None, ABSENT, True), (None, ABSENT, False), (STATE, desk(), True)):
             voice.heal(muted, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or True,
                        dump=lambda: dump, file=self.file, clock=lambda: 1000.0, on=lambda: on)

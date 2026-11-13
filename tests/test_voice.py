@@ -7,6 +7,7 @@ import io
 import itertools
 import json
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -25,11 +26,42 @@ STAGE_KEYS = ("noise", "leveling", "limiter")
 REAL_VERIFIED = getattr(voice, "verified", None)
 
 
+REAL_APPLY = voice.apply
+
+
+def landing(settings, state, run=None, dump=None, *rest, **kw):
+    """voice.apply on a fake PipeWire: a set-param its `run` reports done lands on booth.mic.input's Props, which `dump`
+    then lists, as pw-dump does (the real chain's shape). Without it nothing a test sends reads back (see Readback)."""
+    props, real_run, real_dump = {}, run or REAL_APPLY.__defaults__[0], dump or REAL_APPLY.__defaults__[1]
+
+    def sent(cmd):
+        done = real_run(cmd)
+        if done and cmd[:2] == ["pw-cli", "set-param"]:
+            props.update(itertools.batched(json.loads(cmd[4])["params"], 2))
+        return done
+
+    return REAL_APPLY(settings, state, sent, lambda: with_props(real_dump(), props), *rest, **kw)
+
+
+def with_props(text, props):
+    """`pw-dump` JSON `text` with booth.mic.input's Props holding `props` ({node:control: value}), as the filter-chain
+    lists them: after the adapter's own Props. Anything that isn't a list of objects comes back as it was."""
+    try:
+        objects = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    for o in objects if isinstance(objects, list) else ():
+        if isinstance(o, dict) and ((o.get("info") or {}).get("props") or {}).get("node.name") == voice.INPUT:
+            o["info"]["params"] = {"Props": [{"volume": 1.0}, {"params": [x for p in props.items() for x in p]}]}
+    return json.dumps(objects)
+
+
 def setUpModule():
-    """No plugin verifies unless a test says so: apply() never reads the real plugin folder."""
-    patch = mock.patch.object(voice, "verified", lambda where=None: {}, create=True)
-    patch.start()
-    unittest.addModuleCleanup(patch.stop)
+    """No plugin verifies unless a test says so: apply() never reads the real plugin folder. apply() runs on landing()."""
+    for patch in (mock.patch.object(voice, "verified", lambda where=None: {}, create=True),
+                  mock.patch.object(voice, "apply", landing)):
+        patch.start()
+        unittest.addModuleCleanup(patch.stop)
 
 CTRLS = scarlett.parse_contents(read("scarlett/amixer-contents.txt"))
 MIC = scarlett.mic(CTRLS, DUMP, "XLR")
@@ -81,6 +113,20 @@ real_save = voice.store.save
 
 
 CHAIN_DUMP = json.dumps([node(70, "booth_mic"), node(71, "booth.mic.input")])  # Booth Mic, then its input
+SET = ["pw-cli", "set-param", "71"]  # a live change on Booth Mic's input, in one or more calls of voice.CHUNK
+
+
+def calls(ran):
+    """`ran`'s commands, each first 3 words, with a run of set-params (one live change, in chunks) as one SET."""
+    return [k for k, _ in itertools.groupby(c[:3] for c in ran)]
+
+
+def sent(cmds):
+    """{node:control: value} every set-param in `cmds` sent, a later call's value winning."""
+    return dict(p for c in cmds if c[:2] == ["pw-cli", "set-param"]
+                for p in itertools.batched(json.loads(c[4])["params"], 2))
+
+
 SCARLETT_BACK = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"])])  # the selector unloaded itself
 SELECTING = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"]), node(80, "booth.mic.select")])
 
@@ -250,17 +296,17 @@ class Bypass(unittest.TestCase):
 
     def test_the_live_change_sets_every_control_on_the_chain_input_node(self):
         cfg = config({"voice": {"rumble": False}})
-        cmd = voice.set_params_cmd(CHAIN_DUMP, cfg)
-        self.assertEqual(cmd[:4], ["pw-cli", "set-param", "71", "Props"])
-        params = json.loads(cmd[4])["params"]
-        pairs = dict(zip(params[::2], params[1::2]))
+        cmds = voice.set_params_cmds(CHAIN_DUMP, cfg)
+        self.assertEqual({tuple(c[:4]) for c in cmds}, {("pw-cli", "set-param", "71", "Props")})
+        pairs = sent(cmds)
         self.assertEqual((pairs["rumble_mix:Gain 1"], pairs["rumble_mix:Gain 2"]), (0.0, 1.0))
         self.assertEqual((pairs["master:Gain 1"], pairs["master:Gain 2"]), (1.0, 0.0))
-        self.assertTrue(all(isinstance(v, float) for v in params[1::2]))  # pw-cli reads 1 as an Int
+        self.assertEqual(len(pairs), sum(len(n.get("control", {})) for n in voice._graph_nodes(cfg)))  # every one
+        self.assertTrue(all(isinstance(v, float) for v in pairs.values()))  # pw-cli reads 1 as an Int
 
     def test_no_chain_running_no_live_change(self):
-        self.assertIsNone(voice.set_params_cmd("[]", config()))
-        self.assertIsNone(voice.set_params_cmd("not json", config()))
+        self.assertIsNone(voice.set_params_cmds("[]", config()))
+        self.assertIsNone(voice.set_params_cmds("not json", config()))
 
 
 class Stages(unittest.TestCase):
@@ -327,13 +373,11 @@ class Stages(unittest.TestCase):
         self.assertEqual(len({json.dumps(c, sort_keys=True) for c in configs}), len(configs))
 
     def test_a_stage_toggle_is_set_live_on_its_own_mixer(self):
-        cmd = voice.set_params_cmd(CHAIN_DUMP, config({"voice": {"leveling": False}}, FOUND))
-        params = json.loads(cmd[4])["params"]
-        pairs = dict(zip(params[::2], params[1::2]))
+        pairs = sent(voice.set_params_cmds(CHAIN_DUMP, config({"voice": {"leveling": False}}, FOUND)))
         self.assertEqual((pairs["leveling_mix:Gain 1"], pairs["leveling_mix:Gain 2"]), (0.0, 1.0))
         self.assertEqual((pairs["noise_mix:Gain 1"], pairs["noise_mix:Gain 2"]), (1.0, 0.0))
         self.assertEqual(pairs["limiter:Limit (dB)"], -1.0)  # the knobs ride along: live too
-        self.assertTrue(all(isinstance(v, float) for v in params[1::2]))
+        self.assertTrue(all(isinstance(v, float) for v in pairs.values()))
 
     def test_the_knobs_reach_their_stages(self):
         cfg = config({"voice": {"noise_strength": 100, "leveling_amount": 0, "limiter_ceiling": -3.5}}, FOUND)
@@ -519,7 +563,7 @@ class Verification(unittest.TestCase):
         ran.clear()
         with mock.patch.object(voice, "verified", lambda: changed):
             self.assertEqual(apply(), "live")
-            self.assertEqual([c[:2] for c in ran], [["pw-cli", "set-param"]])  # no systemctl: Booth Mic stays up
+            self.assertEqual(calls(ran), [SET])  # no systemctl: Booth Mic stays up
             cfg = json.loads(file.read_text())
             self.assertEqual(sorted(n["plugin"] for n in ladspa(cfg)), sorted(FOUND.values()))  # the running chain
             self.assertEqual(flow(cfg), {"limiter(noise(rumble(in)))": 1.0})  # leveling dry
@@ -532,7 +576,7 @@ class Verification(unittest.TestCase):
         with mock.patch.object(voice, "verified", lambda: FOUND):  # it verifies again: wet, live
             self.assertEqual(apply(), "live")
         self.assertEqual(flow(json.loads(file.read_text())), {"limiter(leveling(noise(rumble(in))))": 1.0})
-        self.assertEqual([c[:2] for c in ran], [["pw-cli", "set-param"]])
+        self.assertEqual(calls(ran), [SET])
 
     def test_a_plugin_that_verifies_only_since_booth_mic_started_waits_for_the_next_start(self):
         """Also an old Booth's chain (no stages) after an install that fetched the plugins: no restart under a call."""
@@ -672,7 +716,7 @@ class Verification(unittest.TestCase):
             self.assertEqual(voice.loaded(file), changed)
             self.assertEqual(voice.apply(ON, None, run=lambda cmd: ran.append(cmd) or True, dump=lambda: CHAIN_DUMP,
                                          file=file), "live")
-        self.assertEqual([c[:2] for c in ran], [["pw-cli", "set-param"]])
+        self.assertEqual(calls(ran), [SET])
         self.assertEqual(flow(json.loads(file.read_text())), {"limiter(noise(rumble(in)))": 1.0})  # leveling dry
         self.assertEqual(run.read_text(), voice.build(ON, changed))  # never written by apply
 
@@ -689,8 +733,9 @@ class Verification(unittest.TestCase):
             (where / "sc4m_1916.so").write_bytes(b"changed after the chain started")  # stays 0644, user-owned
             pre_start = []
 
-            def dump():  # the pre-start runs while this poll waits on pw-dump
-                pre_start.append(voice.write(run, where))
+            def dump():  # the pre-start runs while this poll waits on its first pw-dump
+                if not pre_start:
+                    pre_start.append(voice.write(run, where))
                 return CHAIN_DUMP
             voice.apply(ON, None, run=lambda c: True, dump=dump, file=file)
             self.assertEqual(pre_start, [None])
@@ -726,8 +771,8 @@ class KeptRunConf(unittest.TestCase):
             with self.full_disk(off):
                 self.assertTrue(voice.write(self.run_conf).startswith("kept"))  # exit 0: starts on processing ON
             said = voice.apply(off, None, run=lambda c: ran.append(c) or True, dump=lambda: CHAIN_DUMP, file=self.file)
-            self.assertEqual(([c[:3] for c in ran], said), ([["pw-cli", "set-param", "71"]], "live"))
-            self.assertIn('"master:Gain 1", 0.0', ran[0][-1])
+            self.assertEqual((calls(ran), said), ([SET], "live"))
+            self.assertEqual(sent(ran)["master:Gain 1"], 0.0)
             ran.clear()
             self.assertEqual(voice.apply(off, None, run=lambda c: ran.append(c) or True, dump=lambda: CHAIN_DUMP,
                                          file=self.file), "unchanged")
@@ -796,7 +841,7 @@ class Apply(unittest.TestCase):
         self.apply()
         self.ran.clear()
         self.apply({"voice": {"rumble": False}})
-        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"]])
+        self.assertEqual(calls(self.ran), [SET])
         self.assertEqual(json.loads(self.file.read_text()), config({"voice": {"rumble": False}}))
 
     def test_another_input_restarts_only_the_selector_never_booth_mic(self):
@@ -856,7 +901,7 @@ class Apply(unittest.TestCase):
             said = self.apply({"voice": {"rumble": False}}, state=plugged(instrument))
         self.assertIn("not saved", said)
         self.assertEqual(json.loads(self.select.read_text()), selector(instrument))
-        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"], ACTIVE[:3], RESTART_SELECT[:3]])
+        self.assertEqual(calls(self.ran), [SET, ACTIVE[:3], RESTART_SELECT[:3]])
         self.assertEqual(self.ran[-1], RESTART_SELECT)
 
     def test_a_live_change_booth_mic_didnt_take_never_holds_back_a_new_channel(self):
@@ -968,7 +1013,7 @@ class Apply(unittest.TestCase):
         self.apply()
         self.ran.clear()
         self.apply({"voice": {"enabled": False}}, state=None)
-        self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
+        self.assertEqual(calls(self.ran), [SET])
 
     def test_a_live_change_that_fails_is_not_recorded_and_the_next_apply_retries(self):
         self.apply()
@@ -977,7 +1022,7 @@ class Apply(unittest.TestCase):
         self.assertEqual(self.file.read_text(), before)  # still the old state: the next apply sees the change
         self.ran, self.fails = [], ()
         self.assertEqual(self.apply({"voice": {"rumble": False}}), "live")
-        self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
+        self.assertEqual(calls(self.ran), [SET])
         self.assertEqual(json.loads(self.file.read_text()), config({"voice": {"rumble": False}}))
 
     def test_stage_switched_off_during_a_pw_dump_blip_is_recorded_but_never_applied(self):
@@ -994,7 +1039,7 @@ class Apply(unittest.TestCase):
                 self.assertEqual((self.ran, json.loads(self.file.read_text())), ([], config(ON, FOUND)), blip)
             self.ran = []
             self.assertEqual(self.apply(off, None), "live")
-            self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
+            self.assertEqual(calls(self.ran), [SET])
         with mock.patch.object(voice, "verified", lambda: {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}):
             self.assertTrue(voice.apply(off, None, run=lambda cmd: True, dump=lambda: "",
                                         file=self.file).startswith("not applied"))  # leveling forced dry: not sent
@@ -1007,7 +1052,7 @@ class Apply(unittest.TestCase):
             self.assertEqual(self.apply({"voice": {"rumble": False}}), "not saved: No space left on device")
         self.ran.clear()
         self.apply({"voice": {"rumble": False}})
-        self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
+        self.assertEqual(calls(self.ran), [SET])
 
     def test_a_corrupt_config_is_replaced_and_restarted(self):
         self.file.parent.mkdir(parents=True)
@@ -1325,9 +1370,8 @@ class Muted(unittest.TestCase):
         self.apply(ON)
         self.ran.clear()
         self.apply(MUTED)
-        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"]])
-        params = json.loads(self.ran[0][4])["params"]
-        pairs = dict(zip(params[::2], params[1::2]))
+        self.assertEqual(calls(self.ran), [SET])
+        pairs = sent(self.ran)
         self.assertEqual((pairs["master:Gain 1"], pairs["master:Gain 2"]), (0.0, 0.0))
 
     def test_the_pre_start_writes_a_silent_chain_while_muted(self):
@@ -1359,7 +1403,7 @@ class Muted(unittest.TestCase):
     def test_a_held_restart_still_moves_the_selector(self):  # only the selector restarts: Booth Mic and its mute stay
         self.old_shape()
         self.assertIn("not restarted", self.apply(MUTED, state=STATE))
-        self.assertEqual([c[:2] for c in self.ran[:1]] + self.ran[1:], [["pw-cli", "set-param"], ACTIVE, RESTART_SELECT])
+        self.assertEqual(calls(self.ran), [SET, ACTIVE[:3], RESTART_SELECT[:3]])
         self.assertEqual(json.loads(self.file.with_name(voice.SELECT_CONF).read_text()), selector())
 
     def test_reload_never_restarts_a_running_booth_mic_while_muted(self):
@@ -1394,8 +1438,8 @@ class Muted(unittest.TestCase):
         module(old, "libpipewire-module-filter-chain")["filter.graph"]["nodes"].pop(1)
         self.file.write_text(json.dumps(old))
         self.assertEqual(self.apply(MUTED), voice.HELD)  # only the restart waits: not recorded, so it's retried
-        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"]])
-        pairs = dict(itertools.batched(json.loads(self.ran[0][4])["params"], 2))
+        self.assertEqual(calls(self.ran), [SET])
+        pairs = sent(self.ran)
         self.assertEqual((pairs["master:Gain 1"], pairs["master:Gain 2"]), (0.0, 0.0))
         self.ran.clear()
         self.assertTrue(voice.apply(MUTED, None, run=lambda c: self.ran.append(c) or c[0] != "pw-cli",
@@ -1480,10 +1524,9 @@ class Tone(unittest.TestCase):
         self.assertEqual(len({json.dumps(c, sort_keys=True) for c in configs}), len(configs))
 
     def test_a_tone_knob_goes_live_as_node_colon_control_on_the_input_node(self):
-        cmd = voice.set_params_cmd(CHAIN_DUMP, config({"voice": {"tone": True, "tone_presence": 4.5}}, FOUND))
-        self.assertEqual(cmd[:4], ["pw-cli", "set-param", "71", "Props"])
-        params = json.loads(cmd[4])["params"]
-        pairs = dict(zip(params[::2], params[1::2]))
+        cmds = voice.set_params_cmds(CHAIN_DUMP, config({"voice": {"tone": True, "tone_presence": 4.5}}, FOUND))
+        self.assertEqual({tuple(c[:4]) for c in cmds}, {("pw-cli", "set-param", "71", "Props")})
+        pairs = sent(cmds)
         self.assertEqual((pairs["tone_presence:Gain"], pairs["tone_presence:Freq"], pairs["tone_presence:Q"]),
                          (4.5, 4000.0, 1.0))
         self.assertEqual((pairs["tone_warmth:Gain"], pairs["tone_air:Gain"]), (0.0, 0.0))
@@ -1498,8 +1541,8 @@ class Tone(unittest.TestCase):
         ran.clear()
         said = voice.apply({"voice": {"tone": True, "tone_air": 3.0}}, None, run=lambda c: ran.append(c) or True,
                            dump=lambda: CHAIN_DUMP, file=file)
-        self.assertEqual((said, [c[:3] for c in ran]), ("live", [["pw-cli", "set-param", "71"]]))
-        self.assertIn('"tone_air:Gain", 3.0', ran[0][-1])
+        self.assertEqual((said, calls(ran)), ("live", [SET]))
+        self.assertEqual(sent(ran)["tone_air:Gain"], 3.0)
 
     def test_the_services_pre_start_writes_the_saved_tone_values(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1565,7 +1608,7 @@ class Presets(unittest.TestCase):
         self.assertEqual(voice.preset_of({k: v for k, v in voice.PRESETS["Broadcast"].items() if k != "rumble"}),
                          "Broadcast")  # absent: its default, on
 
-    def test_a_preset_is_one_live_set_param_with_every_stage_never_a_restart(self):
+    def test_a_preset_is_one_live_change_with_every_stage_never_a_restart(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         file, ran = Path(tmp.name) / "voice.conf", []
@@ -1575,11 +1618,80 @@ class Presets(unittest.TestCase):
             ran.clear()
             said = voice.apply({"voice": dict(voice.PRESETS["Noisy room"])}, None, run=run, dump=lambda: CHAIN_DUMP,
                                file=file)
-        self.assertEqual((said, len(ran), ran[0][:3]), ("live", 1, ["pw-cli", "set-param", "71"]))
-        params = json.loads(ran[0][4])["params"]
-        pairs = dict(zip(params[::2], params[1::2]))
+        self.assertEqual((said, calls(ran)), ("live", [SET]))
+        pairs = sent(ran)
         self.assertEqual((pairs["noise:VAD Threshold (%)"], pairs["tone_mix:Gain 1"], pairs["tone_warmth:Gain"],
                           pairs["leveling:Threshold level (dB)"]), (81.0, 1.0, -3.0, -12.0))
+
+
+class Readback(unittest.TestCase):
+    """PipeWire 1.0.5's pw-cli sends an empty Props above ~25 controls (prints `Object: size 8`) and still exits 0, so
+    nothing lands: every live change goes in calls of at most 12 controls, master's gains alone and first when they
+    silence the chain and last when they don't, and counts only once pw-dump reads every control back."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.file = Path(tmp.name) / "voice.conf"
+        landing(ON, None, run=lambda c: True, dump=lambda: CHAIN_DUMP, file=self.file)  # Booth Mic runs, recorded
+        self.ran, self.props = [], {}
+
+    def chain(self, drop=lambda cmd, n: False, store=lambda v: v):
+        """A fake chain whose pw-cli always exits 0: a call lands unless `drop(cmd, how many times it was sent)`."""
+        def run(cmd):
+            self.ran.append(cmd)
+            if not drop(cmd, self.ran.count(cmd)):
+                self.props.update((k, store(v)) for k, v in itertools.batched(json.loads(cmd[4])["params"], 2))
+            return True
+        return dict(run=run, dump=lambda: with_props(CHAIN_DUMP, self.props), file=self.file)
+
+    def test_no_call_carries_more_than_twelve_controls_even_for_the_largest_chain(self):
+        for muted in (False, True):
+            cfg = config({"voice": {"tone": True, "muted": muted}}, FOUND)
+            total = sum(len(n.get("control", {})) for n in voice._graph_nodes(cfg))
+            cmds = voice.set_params_cmds(CHAIN_DUMP, cfg)
+            self.assertGreater(total, 25)  # one call of these sent nothing, live
+            self.assertLessEqual(max(len(json.loads(c[4])["params"]) // 2 for c in cmds), 12, muted)
+            self.assertEqual(len(sent(cmds)), total)
+
+    def test_a_mute_sends_master_alone_and_first_anything_else_sends_it_last(self):
+        muting = voice.set_params_cmds(CHAIN_DUMP, config({"voice": {"tone": True, "muted": True}}, FOUND))
+        self.assertEqual(json.loads(muting[0][4])["params"], ["master:Gain 1", 0.0, "master:Gain 2", 0.0])
+        self.assertNotIn("master:", "".join(c[4] for c in muting[1:]))
+        live = voice.set_params_cmds(CHAIN_DUMP, config({"voice": {"tone": True}}, FOUND))
+        self.assertEqual(json.loads(live[-1][4])["params"][-4:], ["master:Gain 1", 1.0, "master:Gain 2", 0.0])
+        self.assertNotIn("master:", "".join(c[4] for c in live[:-1]))
+
+    def test_a_set_param_that_exits_0_but_never_lands_is_not_applied_and_not_recorded(self):  # fix-skeptic, #59
+        before = self.file.read_text()
+        said = REAL_APPLY(MUTED, None, run=lambda c: self.ran.append(c) or True, dump=lambda: CHAIN_DUMP, file=self.file)
+        self.assertTrue(said.startswith("not applied: Booth Mic didn't take master:Gain 1, master:Gain 2, "), said)
+        self.assertEqual(self.file.read_text(), before)  # the next apply sends it all again
+        cmds = voice.set_params_cmds(CHAIN_DUMP, config(MUTED))
+        self.assertEqual(self.ran, cmds + cmds)  # every call, then once more
+
+    def test_a_call_that_never_lands_is_named_and_the_mute_before_it_still_landed(self):
+        self.props.update(sent(voice.set_params_cmds(CHAIN_DUMP, config(ON))))  # the chain runs ON's values
+        knob = {"voice": {"muted": True, "tone_air": 3.0}}
+        said = REAL_APPLY(knob, None, **self.chain(drop=lambda cmd, n: "tone_air:Gain" in cmd[4]))
+        dropped = next(c for c in voice.set_params_cmds(CHAIN_DUMP, config(knob)) if "tone_air:Gain" in c[4])
+        self.assertGreater(len(sent([dropped])), 1)  # the rest of its call already held its values: never named
+        self.assertEqual(said, "not applied: Booth Mic didn't take tone_air:Gain")
+        self.assertEqual((self.props["master:Gain 1"], self.props["master:Gain 2"]), (0.0, 0.0))  # silent anyway
+        self.assertEqual(self.ran.count(dropped), 2)
+        self.assertEqual(json.loads(self.file.read_text()), config(ON))  # not recorded
+
+    def test_a_call_that_lands_only_when_sent_again_is_live(self):
+        said = REAL_APPLY(MUTED, None, **self.chain(drop=lambda cmd, n: "tone_air:Gain" in cmd[4] and n == 1))
+        self.assertEqual(said, "live")
+        self.assertEqual([c for c in self.ran if "tone_air:Gain" in c[4]].__len__(), 2)
+        self.assertEqual(json.loads(self.file.read_text()), config(MUTED))
+
+    def test_a_value_the_chain_stores_as_a_float32_has_landed(self):  # 0.707 reads back 0.7070000171661377
+        f32 = lambda v: struct.unpack("f", struct.pack("f", v))[0]  # noqa: E731
+        self.assertNotEqual(f32(0.707), 0.707)
+        self.assertEqual(REAL_APPLY(MUTED, None, **self.chain(store=f32)), "live")
+        self.assertEqual(len(self.ran), len(voice.set_params_cmds(CHAIN_DUMP, config(MUTED))))  # none sent again
 
 
 class Throttle(unittest.TestCase):

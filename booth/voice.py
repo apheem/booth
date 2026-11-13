@@ -42,7 +42,9 @@ while muted (_held), since a call falls back to the raw mic, unmuted, while boot
     python3 -m booth.voice --select voice-select.conf
                                       booth-mic-select.service's ExecCondition: may_select (exit 0) or not (1)"""
 import copy
+import itertools
 import json
+import math
 import os
 import sys
 import threading
@@ -436,13 +438,55 @@ def selecting(dump=None):
     return _node_id(_dump() if dump is None else dump, SELECTOR) is not None
 
 
-def set_params_cmd(dump, cfg):
-    """The live change to every control in `cfg`, on the running chain's input node (by name, now), or None."""
+CHUNK = 12  # controls per pw-cli call: 1.0.5 sends an empty Props above ~25 (prints `Object: size 8`) and exits 0
+
+
+def set_params_cmds(dump, cfg):
+    """The live change to every control in `cfg`, on the running chain's input node (by name, now): pw-cli calls of at
+    most CHUNK controls; or None. Master's gains alone and first when they silence the chain (a mute lands even if a
+    later call fails), else last (the voice goes live only after everything else)."""
     node = _node_id(dump, INPUT)
     if node is None:
         return None
-    params = [x for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items() for x in (f"{n['name']}:{k}", v)]
-    return ["pw-cli", "set-param", str(node), "Props", json.dumps({"params": params})]
+    pairs = [(f"{n['name']}:{k}", v) for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items()]
+    master = [p for p in pairs if p[0].startswith("master:")]
+    rest = [p for p in pairs if p not in master]
+    silent = not any(v for _, v in master)
+    chunks = ([master] if silent else []) + list(itertools.batched(rest if silent else rest + master, CHUNK))
+    return [["pw-cli", "set-param", str(node), "Props", json.dumps({"params": [x for p in c for x in p]})]
+            for c in chunks]
+
+
+def _live_params(dump):
+    """{node:control: value} the chain's input node reports in its Props in `pw-dump` JSON now ({}: none read)."""
+    props = (((_node(dump, INPUT) or {}).get("info") or {}).get("params") or {}).get("Props")
+    return {k: v for p in props if isinstance(p, dict) and isinstance(p.get("params"), list)
+            for k, v in zip(p["params"][::2], p["params"][1::2])} if isinstance(props, list) else {}
+
+
+def _same(want, have):
+    try:  # the chain stores floats: 0.707 reads back as 0.7070000171661377
+        return math.isclose(float(want), float(have), rel_tol=1e-5, abs_tol=1e-6)
+    except (TypeError, ValueError):
+        return want == have
+
+
+def set_live(cfg, run, dump):
+    """Every control in `cfg` set on the running chain (set_params_cmds), then read back from pw-dump, never trusted to
+    pw-cli's exit status; a call whose controls didn't all land is sent once more. → the controls that didn't land
+    ([]: every one did), or None when the chain's input node isn't there (pw-dump failed): nothing sent."""
+    cmds = set_params_cmds(dump(), cfg)
+    if cmds is None:
+        return None
+    sent = [(c, list(itertools.batched(json.loads(c[4])["params"], 2))) for c in cmds]
+    for _ in range(2):
+        for cmd, _pairs in sent:
+            run(cmd)
+        have = _live_params(dump())
+        sent = [(c, ps) for c, ps in sent if not all(k in have and _same(v, have[k]) for k, v in ps)]
+        if not sent:
+            return []
+    return [k for _c, ps in sent for k, v in ps if not (k in have and _same(v, have[k]))]
 
 
 def _text(file):
@@ -523,7 +567,7 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
     restarted, only while Booth Mic runs: with it stopped the selector is stopped and its new config kept for its next
     start, never the old channel. Returns what it did, with "not …" when it couldn't: then that change isn't recorded
     (a failed chain restart puts the old voice.conf back; a failed selector restart removes its config), so the next
-    apply retries. A live change is recorded only once set-param took it.
+    apply retries. A live change is recorded only once every control read back as set (set_live).
     A chain change that fails never holds back the selector."""
     file = file or path()
     select_file = file.with_name(SELECT_CONF)
@@ -548,8 +592,9 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
         # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
         live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
         changed = old != chain or live != chain
-        if live != chain and (held or not restart) and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
-            said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
+        if live != chain and (held or not restart) and (missed := set_live(chain, run, dump)) != []:
+            # not recorded: the next apply sends every control again
+            said = f"not applied: Booth Mic didn't take {', '.join(missed) if missed else 'the change'}"
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
         kept = mic and not mic["node"] and mic["channel"] == _capture(_load(select_file), CHANNEL)
