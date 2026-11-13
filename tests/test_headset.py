@@ -1,9 +1,11 @@
 """The PRO X headset: the dongle's hardware-volume fix (amixer), and its volume and default output through wpctl, with
 the card and sink resolved fresh on every use. Fixtures are the live device's output."""
+import contextlib
+import io
 import json
 import unittest
 
-from booth import devices, headset
+from booth import devices, headset, hidpp
 from tests.fixture import read
 
 CGET, CONTENTS = read("headset/amixer-cget-pcm.txt"), read("headset/amixer-contents.txt")
@@ -179,6 +181,390 @@ class State(unittest.TestCase):
         self.assertEqual(headset.status({"volume": 0.63, "default": False}), "Volume 63 %")
         self.assertEqual(headset.status({"volume": 1.5, "default": False}), "Volume 150 %")  # boosted elsewhere: the truth
         self.assertEqual(headset.status(None), "Not connected")
+
+    def test_sidebar_subtitle_with_the_battery(self):
+        on, off = monitor((3990, False)), monitor(hidpp.OFF)
+        self.assertEqual(headset.status({"volume": 0.63, "default": False}, on), "~75 % · Volume 63 %")
+        self.assertEqual(headset.status({"volume": 0.63, "default": False}, off), "Off · Volume 63 %")
+        self.assertEqual(headset.status(None, off), "Not connected")  # the dongle itself is gone
+        self.assertEqual(headset.status({"volume": 0.63, "default": False}, headset.HeadsetMonitor()), "Volume 63 %")
+
+
+def monitor(*readings):
+    """A HeadsetMonitor after these battery readings, recording its events and notifications."""
+    m = headset.HeadsetMonitor(notify=lambda pct: m.log.append(("notify", pct)))
+    m.log = []
+    m.listeners.append(lambda event: m.log.append(event))
+    for r in readings:
+        m.update(r)
+    return m
+
+
+class Battery(unittest.TestCase):
+    """The service's 10 s battery poll: on/off and battery events, smoothing, and the warn-once rule."""
+
+    def test_the_first_answer_is_on_and_a_battery_level(self):
+        m = monitor((3990, False))
+        self.assertEqual((m.on, m.percent, m.charging, m.log), (True, 75, False, ["on", "battery"]))
+
+    def test_the_error_reply_is_off_at_once(self):
+        m = monitor(hidpp.OFF)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["off"]))
+        m = monitor((3990, False), hidpp.OFF)
+        self.assertEqual((m.on, m.log[-1]), (False, "off"))
+
+    def test_one_missed_reply_does_not_flap_off_and_on(self):  # adjudication: a single ~1 s timeout is a miss
+        m = monitor((3990, False), None, (3990, False))
+        self.assertEqual((m.on, m.percent, m.log), (True, 75, ["on", "battery"]))
+
+    def test_one_missed_reply_keeps_the_smoothing(self):
+        m = monitor((3990, False), None, (3830, False))  # a load spike after a miss still moves only part of the way
+        self.assertEqual(m.percent, monitor((3990, False), (3830, False)).percent)
+        self.assertGreater(m.percent, 50)
+
+    def test_two_missed_replies_in_a_row_are_off(self):
+        m = monitor((3990, False), None)
+        self.assertEqual((m.on, m.percent), (True, 75))
+        m.update(None)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
+
+    def test_misses_count_only_in_a_row(self):
+        m = monitor((3990, False), None, (3990, False), None)
+        self.assertEqual((m.on, m.log), (True, ["on", "battery"]))
+
+    def test_no_answer_before_the_first_reply_is_off_after_two_misses(self):
+        m = monitor(None)
+        self.assertEqual((m.on, m.log), (None, []))
+        m.update(None)
+        self.assertEqual((m.on, m.log), (False, ["off"]))
+
+    def test_going_off_drops_the_last_level(self):  # no stale percent for a headset that no longer answers
+        m = monitor((3990, False), hidpp.OFF)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
+
+    def test_on_off_on_emits_each_change_once(self):
+        m = monitor((3990, False), (3990, False), None, None, (3990, False))
+        self.assertEqual(m.log, ["on", "battery", "off", "on", "battery"])
+
+    def test_an_unchanged_level_emits_nothing(self):
+        m = monitor((3990, False))
+        m.log.clear()
+        m.update((3990, False))
+        self.assertEqual(m.log, [])
+
+    def test_a_level_change_alone_is_a_battery_event(self):
+        m = monitor((3990, False))
+        m.log.clear()
+        m.update((3830, False))  # smoothed, still discharging, but the estimate moved
+        self.assertLess(m.percent, 75)
+        self.assertEqual(m.log, ["battery"])
+
+    def test_readings_are_smoothed(self):
+        m = monitor((3990, False), (3830, False))  # one low read (a load spike) moves it only part of the way
+        self.assertGreater(m.percent, 50)
+        self.assertLess(m.percent, 75)
+        for _ in range(30):
+            m.update((3830, False))
+        self.assertEqual(m.percent, 50)  # a lasting change gets there
+
+    def test_charging_or_coming_back_on_starts_the_smoothing_afresh(self):
+        m = monitor((3830, False), (4150, True))  # plugged in: the voltage jumps, and that is the truth
+        self.assertEqual((m.percent, m.charging), (100, True))
+        m = monitor((3830, False), hidpp.OFF, (4150, False))  # swapped/charged while off
+        self.assertEqual(m.percent, 100)
+
+    def test_a_charging_change_alone_is_a_battery_event(self):
+        m = monitor((4150, False))
+        m.log.clear()
+        m.update((4150, True))
+        self.assertEqual(m.log, ["battery"])
+
+    def test_one_warning_per_discharge_at_15_percent(self):
+        m = monitor(*[(3710, False)] * 5)  # ~13 %
+        self.assertEqual([e for e in m.log if e[0] == "notify"], [("notify", 13)])
+
+    def test_exactly_15_percent_warns(self):
+        m = monitor((3717, False))  # 3717 mV → 15 % on the curve
+        self.assertEqual((m.percent, [e for e in m.log if e[0] == "notify"]), (15, [("notify", 15)]))
+
+    def test_above_15_percent_no_warning(self):
+        m = monitor((3746, False))  # ~21 %
+        self.assertNotIn("notify", [e[0] for e in m.log])
+
+    def test_it_rearms_only_above_30_percent(self):
+        m = monitor((3710, False))
+        for mv in [3780] * 30:  # back to 30 %: not re-armed
+            m.update((mv, False))
+        for _ in range(30):
+            m.update((3710, False))
+        self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 1)
+        for _ in range(30):
+            m.update((3830, False))  # 50 %: re-armed
+        for _ in range(30):
+            m.update((3710, False))
+        self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 2)
+
+    def test_off_and_on_again_low_is_the_same_discharge(self):
+        m = monitor((3710, False), hidpp.OFF, (3710, False))
+        self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 1)
+
+    def test_no_warning_while_charging(self):
+        m = monitor((3710, True))
+        self.assertNotIn("notify", [e[0] for e in m.log])
+
+    def test_a_listener_that_raises_does_not_stop_the_others_or_the_warning(self):
+        m = headset.HeadsetMonitor(notify=lambda pct: seen.append(("notify", pct)))
+        seen = []
+        m.listeners += [lambda e: 1 / 0, seen.append]
+        with contextlib.redirect_stderr(io.StringIO()):
+            m.update((3710, False))
+        self.assertEqual(seen, ["on", "battery", ("notify", 13)])
+
+    def test_card_texts(self):
+        self.assertEqual(headset.card(monitor((3990, False))), ("PRO X Wireless — Connected", "~75 % (est.)"))
+        self.assertEqual(headset.card(monitor((3990, True))), ("PRO X Wireless — Connected", "~75 % (est.), charging"))
+        self.assertEqual(headset.card(monitor(hidpp.OFF)), ("PRO X Wireless — Off", None))
+        self.assertEqual(headset.card(headset.HeadsetMonitor()), ("PRO X Wireless", None))  # before the first poll
+
+
+class Poll(unittest.TestCase):
+    def test_the_query_runs_off_the_main_loop_and_polls_never_pile_up(self):
+        spawned = []
+        m = headset.HeadsetMonitor(spawn=lambda work, done: spawned.append((work, done)))
+        self.assertIs(m.poll(), True)  # a GLib timeout that keeps going
+        m.poll()  # the first one hasn't answered yet
+        self.assertEqual(len(spawned), 1)
+        work, done = spawned[0]
+        self.assertIs(work, headset.hidpp.battery)
+        done((3990, False))
+        self.assertEqual((m.on, m.percent), (True, 75))
+        m.poll()
+        self.assertEqual(len(spawned), 2)
+
+
+class Settings(unittest.TestCase):
+    """Sidetone and auto power-off through the monitor: one HID++ exchange at a time with the battery poll, the saved
+    values (only the user's) re-sent on every "on", and `refused` the kinds whose user-sent value got no echo."""
+
+    def setUp(self):
+        self.spawned, self.log, self.saved = [], [], {}
+        self.m = headset.HeadsetMonitor(spawn=lambda work, done: self.spawned.append((work, done)),
+                                        settings={"headphones": self.saved})
+        self.m.listeners.append(self.log.append)
+
+    def sent(self):
+        """The requests of every settings exchange spawned so far."""
+        return [work.args[0] for work, _ in self.spawned if getattr(work, "func", None) is hidpp.setting]
+
+    def finish(self, result):
+        self.spawned[-1][1](result)
+
+    def on(self):
+        self.m.poll()
+        self.finish((3990, False))
+
+    def test_on_sends_the_saved_values_one_exchange_at_a_time(self):
+        self.saved.update(sidetone=64, auto_off=10)
+        self.on()
+        self.assertEqual(len(self.sent()), 1)  # the second waits for the first's reply
+        self.finish(True)
+        self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(64), hidpp.auto_off_request(10)]))
+        self.finish(True)
+        self.assertFalse(self.m.busy)
+
+    def test_nothing_saved_sends_nothing(self):  # never a value the user didn't choose: it would overwrite theirs
+        self.on()
+        self.assertEqual((self.sent(), self.m.busy), ([], False))
+
+    def test_only_the_saved_kinds_are_sent_again(self):
+        self.saved.update(sidetone=64)
+        self.on()
+        self.finish(True)
+        self.assertEqual((self.sent(), self.m.busy), ([hidpp.sidetone_request(64)], False))
+
+    def test_every_on_sends_them_again(self):  # they may reset at power-on
+        self.saved.update(sidetone=64, auto_off=10)
+        self.on()
+        self.assertEqual(len(self.sent()), 1)
+        self.finish(True)
+        self.finish(True)
+        self.m.poll()
+        self.finish(hidpp.OFF)
+        self.on()
+        self.assertEqual(len(self.sent()), 3)
+        self.finish(True)
+        self.assertEqual(len(self.sent()), 4)
+
+    def test_a_battery_poll_waits_while_a_setting_is_in_flight(self):
+        self.on()
+        self.m.poll()
+        self.assertEqual(len(self.spawned), 2)  # the battery query, then one setting: no second thread on the node
+
+    def test_a_setting_asked_during_a_battery_query_waits_for_its_reply(self):
+        self.m.poll()
+        self.m.set("sidetone", 10)
+        self.assertEqual(self.sent(), [])
+        self.finish(None)  # a miss: still off is unknown, nothing re-sent, the user's ask goes now
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)])
+
+    def test_a_drag_sends_only_the_last_value_and_kinds_never_drop_each_other(self):
+        self.m.poll()
+        for level in (10, 20, 30):
+            self.m.set("sidetone", level)
+        self.m.set("auto_off", 5)
+        self.finish(None)
+        self.finish(True)
+        self.finish(True)
+        self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(30), hidpp.auto_off_request(5)]))
+
+    def poll(self, reading):
+        self.m.poll()
+        self.finish(reading)
+
+    def test_a_users_value_acknowledged_refuses_nothing(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(True)
+        self.assertEqual((self.m.refused, self.log[-1], self.m.busy), (set(), "ack", False))
+        self.poll((3990, False))
+        self.assertEqual(len(self.sent()), 1)  # acknowledged: never sent again
+
+    def test_a_newer_value_is_never_overwritten_by_an_older_ones_retry(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.m.set("sidetone", 20)  # asked while 10 is in flight
+        self.finish(None)  # 10 unanswered: 20 goes now
+        self.finish(True)
+        self.m.set("auto_off", 5)
+        self.finish(None)  # 5 unanswered, held for the next poll
+        self.m.set("auto_off", 15)  # asked before that poll
+        self.finish(True)
+        self.poll((3990, False))
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10), hidpp.sidetone_request(20),
+                                       hidpp.auto_off_request(5), hidpp.auto_off_request(15)])
+
+    def test_the_off_reply_keeps_a_users_value_for_the_next_on(self):  # captured 11ff ff 05 1a 05…: the headset is off
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(False)
+        self.poll(hidpp.OFF)
+        self.poll(hidpp.OFF)
+        self.assertEqual((self.m.refused, self.sent(), self.m.busy), (set(), [hidpp.sidetone_request(10)], False))
+        self.on()
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)] * 2)
+        self.finish(None)
+        self.poll((3990, False))  # the try before "off" was no strike: this is the first
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 3))
+
+    def test_the_dongle_unplugged_mid_ask_keeps_it_for_the_next_on(self):
+        self.on()
+        self.m.set("auto_off", 5)
+        self.finish(False)  # find() found no node: setting() says False
+        self.poll(hidpp.OFF)  # battery() with no node
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 1))
+        self.on()
+        self.assertEqual(self.sent(), [hidpp.auto_off_request(5)] * 2)
+        self.finish(False)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+
+    def test_an_ask_without_a_poll_answering_on_just_before_it_is_no_strike(self):
+        self.m.set("sidetone", 10)  # before the first answer
+        self.finish(None)
+        self.poll((3990, False))
+        self.finish(None)  # its second try: the first strike
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+        self.finish(True)  # its third try
+        self.poll(None)  # a miss: on stays, but unconfirmed
+        self.m.set("auto_off", 5)
+        self.finish(None)
+        self.poll((3990, False))
+        self.finish(None)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+
+    def test_one_dropped_reply_waits_for_a_poll_that_answers(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(None)
+        self.poll(None)  # a miss: no verdict, nothing sent again yet
+        self.assertEqual((self.m.refused, len(self.sent()), self.m.busy), (set(), 1, False))
+        self.poll((3990, False))
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)] * 2)
+        self.finish(None)
+        self.poll((3990, False))  # the first try was followed by a miss: this is only its first strike
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 3))
+
+    def test_no_ack_twice_while_on_before_and_after_each_ask_is_refused(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(False)
+        self.poll((3990, False))
+        self.assertEqual((self.m.refused, self.sent()), (set(), [hidpp.sidetone_request(10)] * 2))  # its second try
+        self.finish(None)
+        acks = self.log.count("ack")
+        self.poll((3990, False))
+        self.assertEqual((self.m.refused, len(self.sent()), self.m.busy), ({"sidetone"}, 2, False))
+        self.assertEqual(self.log.count("ack"), acks + 1)  # the page hears of it
+        self.m.set("sidetone", 20)
+        self.finish(True)
+        self.assertEqual(self.m.refused, {"sidetone"})  # until Booth restarts
+
+    def test_a_new_value_from_the_user_starts_its_tries_afresh(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(None)
+        self.poll((3990, False))  # 10's first strike; its second try goes out
+        self.m.set("sidetone", 20)
+        self.finish(True)
+        self.finish(None)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+        self.assertEqual(self.sent()[-1], hidpp.sidetone_request(20))
+
+    def test_a_resend_on_on_without_an_ack_refuses_nothing(self):
+        self.saved.update(sidetone=64, auto_off=10)
+        self.on()
+        self.finish(False)
+        self.finish(None)
+        self.poll((3990, False))
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 2))  # not the user's ask now: no retry
+
+    def test_off_keeps_the_refusals(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(False)
+        self.poll((3990, False))
+        self.finish(False)
+        self.poll((3990, False))
+        self.poll(hidpp.OFF)
+        self.on()
+        self.assertEqual((self.m.refused, self.log[-2:]), ({"sidetone"}, ["on", "battery"]))
+
+    def test_a_value_asked_during_a_poll_that_finds_it_off_waits_for_the_next_on(self):
+        self.on()
+        self.m.poll()
+        self.m.set("sidetone", 10)
+        self.saved["sidetone"] = 10  # the page saves it as it asks: the "on" re-send must not take it over
+        self.finish(hidpp.OFF)
+        self.assertEqual((self.sent(), self.m.busy, self.m.refused), ([], False, set()))
+        self.m.poll()
+        self.finish(hidpp.OFF)
+        self.assertEqual(self.sent(), [])
+        self.on()
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)])
+        self.finish(False)  # still the user's value: its refusal counts
+        self.poll((3990, False))
+        self.finish(False)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, {"sidetone"})
+
+    def test_without_the_settings_nothing_is_sent(self):  # the monitor before the app loaded them
+        m = headset.HeadsetMonitor(spawn=lambda work, done: self.spawned.append((work, done)))
+        m.poll()
+        self.finish((3990, False))
+        self.assertEqual(self.sent(), [])
 
 
 class WriterTest(unittest.TestCase):

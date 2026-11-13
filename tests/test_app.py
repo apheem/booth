@@ -266,6 +266,7 @@ class BackgroundLaunch(unittest.TestCase):
                 mock.patch.object(app, "Window") as window:
             app.Application.do_activate(stub)
         self.assertEqual(stub.settings, {"version": 1, "camera": {}})  # loaded once, for the whole process
+        self.assertIs(stub.headset_monitor.settings, stub.settings)  # the same dict: sidetone re-sent as last saved
         stub.watch.assert_called_once_with()
         window.assert_not_called()
         self.assertEqual(threads, [])
@@ -281,8 +282,12 @@ class BackgroundLaunch(unittest.TestCase):
     def watch(self, background):
         stub = mock.Mock(held=False, background=background)
         folders = {path: mock.Mock(name=path) for path in ("/dev/v4l/by-id", "/dev/snd/by-id")}
-        with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get):
+        with mock.patch.object(app.Gio.File, "new_for_path", side_effect=folders.get), \
+                mock.patch.object(app.GLib, "timeout_add_seconds") as every:
             app.Application.watch(stub)
+        stub.headset_monitor.poll.assert_called_once_with()  # the battery now, in every primary instance
+        # then every 10 s, window or not: the battery, and Booth Mic's selector restarted if its Scarlett is back
+        self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll), mock.call(10, stub.heal_voice)])
         monitor = folders["/dev/v4l/by-id"].monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
@@ -292,7 +297,43 @@ class BackgroundLaunch(unittest.TestCase):
         dongle.connect.assert_called_once_with("changed", stub.on_snd_by_id)
         self.assertIsInstance(stub.dongle, service.Debounce)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
+        stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
         return stub
+
+    def test_sync_voice_writes_booth_mics_config_and_starts_its_service_off_the_main_loop(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}})
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync") as sync:
+            app.Application.sync_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+        sync.assert_called_once_with(stub.settings)
+
+    def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "heal") as heal:
+            self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
+            heal.assert_not_called()
+            threads[0]()
+        heal.assert_called_once_with(stub.settings)  # the chosen input: heal reads the Scarlett's routing itself
+
+    def test_a_slow_heal_is_never_overlapped_by_the_next_tick(self):
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "heal") as heal:
+            for tick in range(3):  # amixer, pw-dump and systemctl still running: the ticks are skipped
+                self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
+            self.assertEqual(len(threads), 1)
+            threads[0]()
+            heal.side_effect = OSError("boom")  # a heal that fails still lets the next one run
+            app.Application.heal_voice(stub)
+            with self.assertRaises(OSError):
+                threads[1]()
+            app.Application.heal_voice(stub)
+        self.assertEqual((len(threads), heal.call_count), (3, 2))
 
     def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
         stub = self.watch(background=True)
@@ -521,6 +562,46 @@ class DongleReplug(unittest.TestCase):
             self.assertEqual(len(threads), 1)
             threads[0].target()
         fix.assert_called_once_with()
+
+
+class HeadsetBattery(unittest.TestCase):
+    def test_the_monitor_queries_on_a_worker_and_reports_on_the_main_loop(self):
+        idle, threads = [], []
+
+        class Recorded(Inline):
+            def start(self):
+                threads.append(self)
+        with mock.patch.object(app.threading, "Thread", Recorded), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            app.off_main(lambda: (3990, False), "done")
+            self.assertEqual(idle, [])  # nothing on the caller's (main) loop yet
+            threads[0].target()
+        self.assertEqual(idle, [("done", ((3990, False),))])
+
+    def test_a_query_that_raises_still_reports_back_as_off(self):  # else the monitor stays busy and never polls again
+        idle = []
+        with mock.patch.object(app.threading, "Thread", Inline), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                self.assertRaises(ZeroDivisionError):
+            app.off_main(lambda: 1 / 0, "done")
+        self.assertEqual(idle, [("done", (None,))])
+
+    def test_the_application_owns_one_monitor_wired_to_its_notification_and_worker(self):
+        booth = app.Application()
+        self.assertIs(booth.headset_monitor.spawn, app.off_main)
+        with mock.patch.object(booth, "send_notification") as send:
+            booth.headset_monitor.update((3710, False))
+        (nid, note), = [c.args for c in send.call_args_list]
+        self.assertEqual(nid, "headset-battery")
+        self.assertIsInstance(note, Gio.Notification)
+
+    def test_the_low_battery_notification_says_the_estimate(self):
+        with mock.patch.object(app.Gio, "Notification") as notification:
+            stub = mock.Mock()
+            app.Application.low_battery(stub, 13)
+        notification.new.assert_called_once_with("Headset battery low")
+        notification.new.return_value.set_body.assert_called_once_with("PRO X Wireless is at ~13 % (est.).")
+        stub.send_notification.assert_called_once_with("headset-battery", notification.new.return_value)
 
 
 class RunInBackgroundSwitch(unittest.TestCase):

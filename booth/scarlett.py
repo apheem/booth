@@ -101,14 +101,15 @@ def _source(dump):
 
 def mic(ctrls, dump, choice):
     """The chosen input as the meters and the voice chain take it: {"input": "XLR", "channel": 2, "position": "FR",
-    "node": the PipeWire source's name}, position and node None when PipeWire has no Scarlett source; None when the
-    input reaches no capture channel."""
+    "node": the PipeWire source's name, "channels": its channel count}, position, node and channels None when PipeWire
+    has no Scarlett source; None when the input reaches no capture channel."""
     channel = routing(ctrls).get(choice)
     if channel is None:
         return None
     node, positions = _source(dump)
     position = positions[channel - 1] if node and channel <= len(positions) else None
-    return {"input": choice, "channel": channel, "position": position, "node": node}
+    return {"input": choice, "channel": channel, "position": position, "node": node,
+            "channels": len(positions) if node else None}
 
 
 def describe(record):

@@ -88,7 +88,7 @@ class Mic(unittest.TestCase):
 
     def test_xlr_is_capture_channel_2_fr_on_the_4_channel_source(self):
         self.assertEqual(scarlett.mic(scarlett.parse_contents(CONTENTS), DUMP, "XLR"),
-                         {"input": "XLR", "channel": 2, "position": "FR", "node": SOURCE})
+                         {"input": "XLR", "channel": 2, "position": "FR", "node": SOURCE, "channels": 4})
 
     def test_instrument_is_channel_1_fl(self):
         rec = scarlett.mic(scarlett.parse_contents(CONTENTS), DUMP, "Instrument")
@@ -98,10 +98,14 @@ class Mic(unittest.TestCase):
         pro = dump(lambda o: node(o, SOURCE)["info"]["props"].update({"audio.position": "AUX0,AUX1,AUX2,AUX3"}))
         self.assertEqual(scarlett.mic(scarlett.parse_contents(CONTENTS), pro, "XLR")["position"], "AUX1")
 
+    def test_the_channel_count_comes_from_the_source_node(self):  # the meter takes every channel, unmixed
+        stereo = dump(lambda o: node(o, SOURCE)["info"]["props"].update({"audio.position": "FL,FR"}))
+        self.assertEqual(scarlett.mic(scarlett.parse_contents(CONTENTS), stereo, "XLR")["channels"], 2)
+
     def test_no_source_node_still_gives_the_channel(self):
         gone = dump(lambda o: o.remove(node(o, SOURCE)))
         self.assertEqual(scarlett.mic(scarlett.parse_contents(CONTENTS), gone, "XLR"),
-                         {"input": "XLR", "channel": 2, "position": None, "node": None})
+                         {"input": "XLR", "channel": 2, "position": None, "node": None, "channels": None})
         self.assertEqual(scarlett.mic(scarlett.parse_contents(CONTENTS), "", "XLR")["channel"], 2)
 
     def test_an_unrouted_input_is_none(self):

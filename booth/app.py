@@ -14,12 +14,24 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from booth import camera, devices, headset, service, store  # noqa: E402
+from booth import camera, devices, headset, service, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
 APP_ID = "io.github.apheem.Booth"
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
 RESTORING = camera.WRITING  # the startup, replug and window-open restores and the page's writes never interleave
+BATTERY_S = 10  # the PRO X battery poll: also how soon "headset off" is noticed
+
+
+def off_main(work, done):
+    """Run work() on a worker, then done(its result) on the main loop; done(None) when it raises."""
+    def run():
+        result = None
+        try:
+            result = work()
+        finally:  # always: done() clears the caller's busy flag, else it never runs work again
+            GLib.idle_add(done, result)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def camera_page(window):
@@ -57,7 +69,8 @@ class Application(Adw.Application):
         super().__init__(application_id=APP_ID)
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
-        self.snd_monitor, self.dongle = None, None
+        self.snd_monitor, self.dongle, self.healing = None, None, False
+        self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # #12 subscribes to its listeners
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
         self.run_in_background = Gio.SimpleAction.new_stateful("run-in-background", None, GLib.Variant.new_boolean(False))
@@ -79,7 +92,8 @@ class Application(Adw.Application):
     def do_activate(self):
         if self.monitor is None:  # the primary instance's first activate
             self.settings = store.load()  # once: every window, page, Setter and restore shares this dict, so a save
-            self.watch()  # never drops another writer's value
+            self.headset_monitor.settings = self.settings  # never drops another writer's value
+            self.watch()
             if self.background:
                 return
         if self.window is not None:
@@ -102,6 +116,11 @@ class Application(Adw.Application):
                                                                                        None)
         self.snd_monitor.connect("changed", self.on_snd_by_id)
         self.fix_headset()
+        self.sync_voice()
+        self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
+        GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
+        # Booth Mic's selector back within 10 s of its Scarlett: a replug, a login race or a profile switch (no by-id event)
+        GLib.timeout_add_seconds(BATTERY_S, self.heal_voice)
         if self.background:
             self.hold()
             self.held = True
@@ -120,6 +139,27 @@ class Application(Adw.Application):
 
     def fix_headset(self):
         threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
+
+    def sync_voice(self):
+        """Booth Mic's config up to date with the Scarlett and its service started (amixer, pw-dump: off the main loop)."""
+        threading.Thread(target=lambda: voice.sync(self.settings), daemon=True).start()
+
+    def heal_voice(self):
+        if not self.healing:  # a slow heal (amixer, pw-dump, systemctl) never overlaps the next tick
+            self.healing = True
+            threading.Thread(target=self.heal_once, daemon=True).start()  # off the main loop
+        return True
+
+    def heal_once(self):
+        try:
+            voice.heal(self.settings)
+        finally:
+            self.healing = False
+
+    def low_battery(self, percent):
+        note = Gio.Notification.new("Headset battery low")
+        note.set_body(f"PRO X Wireless is at ~{percent} % (est.).")
+        self.send_notification("headset-battery", note)
 
     def restore_saved(self):
         # one writer: the page queues it behind its own writes, even a closed one's whose last write isn't saved yet

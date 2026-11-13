@@ -77,6 +77,24 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_sidetone_and_auto_off_round_trip_at_their_limits(self):
+        for sidetone, auto_off in ((0, 0), (1, 1), (128, 90)):
+            settings = store.load(self.path)
+            settings["headphones"].update(sidetone=sidetone, auto_off=auto_off)
+            store.save(settings, self.path)
+            self.assertEqual(store.load(self.path)["headphones"], {"sidetone": sidetone, "auto_off": auto_off})
+
+    def test_a_bad_sidetone_or_auto_off_counts_as_corrupt(self):
+        # both are sent to the headset on every power-on: only whole numbers in the headset's range
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"headphones": {"sidetone": 129}}', '{"headphones": {"sidetone": -1}}',
+                     '{"headphones": {"sidetone": "64"}}', '{"headphones": {"sidetone": 6.5}}', '{"headphones": {"sidetone": 64.0}}',
+                     '{"headphones": {"sidetone": true}}', '{"headphones": {"auto_off": 91}}',
+                     '{"headphones": {"auto_off": -1}}', '{"headphones": {"auto_off": null}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+            self.assertFalse(self.path.exists(), text)
+
     def test_the_microphone_input_choice_round_trips(self):
         settings = store.load(self.path)
         self.assertEqual(settings["microphone"], {})  # no choice saved: XLR
@@ -88,6 +106,20 @@ class Store(unittest.TestCase):
         # the Microphone page selects the saved input by name: anything but a known input would break it
         self.path.parent.mkdir(parents=True)
         for text in ('{"microphone": 7}', '{"microphone": {"input": 7}}', '{"microphone": {"input": "Line"}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
+    def test_the_voice_switches_round_trip(self):
+        settings = store.load(self.path)
+        self.assertEqual(settings["voice"], {})  # nothing saved: processing and the rumble filter on
+        settings["voice"].update(enabled=False, rumble=True)
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["voice"], {"enabled": False, "rumble": True})
+
+    def test_a_bad_voice_value_counts_as_corrupt(self):
+        # the Voice processing switches show and apply them as booleans
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"voice": []}', '{"voice": {"enabled": 1}}', '{"voice": {"rumble": "off"}}'):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
