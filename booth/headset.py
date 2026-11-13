@@ -148,8 +148,9 @@ class HeadsetMonitor:
                 the first answer
       percent   the smoothed estimate, 0..100, or None when off
       charging  True while charging
-      refused   the kinds ("sidetone", "auto_off") whose value the user sent got no acknowledgement; kept until
-                Booth restarts (a re-send on "on" never adds one)
+      refused   the kinds ("sidetone", "auto_off") whose value the user sent got no acknowledgement on two tries, each
+                with a poll answering on before and after it (off, an unplug or a miss only keeps it for the next
+                "on"); kept until Booth restarts (a re-send on "on" never adds one); "ack" is emitted when one is added
     `notify(percent)` is called once per discharge at <= WARN_AT %. `spawn(work, done)` runs work() off the main loop
     and done(its result) back on it. `settings`: the app's shared settings dict, whose "headphones" sidetone and
     auto_off, when saved, are re-sent on every "on" (never a value the user didn't choose); None sends nothing."""
@@ -158,6 +159,8 @@ class HeadsetMonitor:
         self.notify, self.spawn, self.listeners, self.settings = notify, spawn, [], settings
         self.on, self.percent, self.charging, self.mv, self.armed, self.busy = None, None, False, None, True, False
         self.misses, self.queue, self.refused = 0, {}, set()  # queue: {kind: (value, the user's ask now)}
+        # a user's value with no ack: {kind: (value, on before its ask)}, judged by the next poll; struck: one strike
+        self.held, self.struck = {}, set()
 
     def poll(self):
         """A GLib timeout callback: ask the headset, unless an exchange (a poll's or a setting's) hasn't answered."""
@@ -168,6 +171,19 @@ class HeadsetMonitor:
 
     def _done(self, reading):
         self.busy = False
+        on = reading is not None and reading != hidpp.OFF
+        for kind, (value, sure) in list(self.held.items()):
+            if not on:  # off (the error reply, an unplug) or a miss: no verdict; it goes again once a poll says on
+                self.held[kind] = value, False
+                continue
+            del self.held[kind]
+            if sure and kind in self.struck:  # on before and after the ask, twice: this headset doesn't take it
+                self.refused.add(kind)
+                self._emit(["ack"])
+                continue
+            if sure:
+                self.struck.add(kind)
+            self.queue.setdefault(kind, (value, True))  # before update(): an "on" re-send must not take it over
         self.update(reading)
         self._next()
 
@@ -175,18 +191,23 @@ class HeadsetMonitor:
         """Send the headset "sidetone" (0..128) or "auto_off" (minutes) once no exchange is in flight: never two
         threads on the node. A newer value replaces a queued one of its kind; kinds never drop each other."""
         self.queue[kind] = value, True
+        self.held.pop(kind, None)
+        self.struck.discard(kind)  # a new value gets its own two tries
         self._next()
 
     def _next(self):
         if not self.busy and self.queue and self.on is not False:  # off: kept for the next "on", which re-sends
             self.busy = True
             kind, (value, user) = self.queue.popitem()
-            self.spawn(functools.partial(hidpp.setting, REQUESTS[kind](value)), lambda ok: self._acked(kind, user, ok))
+            sure = self.on is True and not self.misses  # the last poll answered on
+            self.spawn(functools.partial(hidpp.setting, REQUESTS[kind](value)),
+                       lambda ok: self._acked(kind, value, user, sure, ok))
 
-    def _acked(self, kind, user, ok):
+    def _acked(self, kind, value, user, sure, ok):
         self.busy = False
-        if user and ok is not True:  # refused, unanswered or raised: its row hides rather than half-works
-            self.refused.add(kind)
+        # the error reply, an unplug, a dropped reply: the next poll decides (unless a newer ask of it is queued)
+        if user and ok is not True and kind not in self.queue:
+            self.held[kind] = value, sure
         self._emit(["ack"])
         self._next()
 

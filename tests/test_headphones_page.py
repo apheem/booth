@@ -2,6 +2,7 @@
 when the worker raises, so Writer.busy and the page's polling flag never stay stuck; "Use for all sound" keeps the
 sink it replaces in the settings, saved on the main loop."""
 import contextlib
+import traceback
 import types
 import unittest
 from unittest import mock
@@ -121,8 +122,25 @@ class _W:
     """A widget stand-in: GTK can't start without a display, so the page's rows are these."""
     active = False
 
-    def __init__(self, *_args, **kwargs):
-        self.handlers, self.set = {}, {f"set_{k}": (v,) for k, v in kwargs.items()}
+    def __init__(self, *args, **kwargs):  # args: new_with_range's, kept so a test can pin the range
+        self.args, self.handlers, self.set = args, {}, {f"set_{k}": (v,) for k, v in kwargs.items()}
+        self.value = args[-3] if len(args) >= 3 else 0  # (…, lower, upper, step): GTK starts at lower
+
+    def set_value(self, value):  # as in GTK: a change fires the value's signals, connected or not by the page yet
+        self.set["set_value"] = (value,)
+        if value != self.value:
+            self.value = value
+            for signal, handler in list(self.handlers.items()):
+                try:  # PyGObject prints a handler's exception and goes on
+                    if signal == "value-changed":
+                        handler(self)
+                    elif signal == "notify::value":
+                        handler(self, None)
+                except Exception:
+                    traceback.print_exc()
+
+    def get_value(self):
+        return self.value
 
     def connect(self, signal, handler):
         self.handlers[signal] = handler
@@ -147,7 +165,10 @@ def stand_ins():
     with mock.patch.object(headphones, "super", lambda *a: ns(__init__=lambda: None), create=True), \
             mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W,
                                                     SpinRow=ns(new_with_range=_W))), \
-            mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0))), \
+            mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0),
+                                                    EventControllerScroll=ns(new=_W),
+                                                    EventControllerScrollFlags=ns(BOTH_AXES="both", VERTICAL="v"),
+                                                    PropagationPhase=ns(CAPTURE="capture"))), \
             mock.patch.object(headphones.GLib, "timeout_add_seconds", lambda *a: 1), \
             mock.patch.object(headphones.GLib, "idle_add", lambda f, *a: f(*a)), \
             mock.patch.object(headphones.threading, "Thread", Inline):
@@ -220,9 +241,37 @@ class Settings(unittest.TestCase):
         return self.sidetone.set["set_visible"], self.auto_off.set["set_visible"]
 
     def test_the_saved_values_are_shown_and_nothing_is_sent_for_them(self):
-        self.assertEqual(self.page.sidetone.set["set_value"], (64,))
-        self.assertEqual(self.sidetone.set["set_subtitle"], (headphones.SUBTITLES["sidetone"],))
-        self.assertEqual(self.spawned, [])
+        self.settings["headphones"]["auto_off"] = 30
+        page = Page()
+        with stand_ins(), mock.patch.object(headphones.store, "save") as save:
+            headphones.HeadphonesPage.__init__(page, self.settings, lambda text: None, self.monitor)
+        self.assertEqual((page.sidetone.set["set_value"], page.hidpp_rows["auto_off"].set["set_value"]), ((64,), (30,)))
+        self.assertEqual(page.hidpp_rows["sidetone"].set["set_subtitle"], (headphones.SUBTITLES["sidetone"],))
+        self.assertEqual((self.spawned, self.monitor.queue, save.called), ([], {}, False))
+
+    def test_a_scroll_over_sidetone_or_auto_off_is_caught_before_the_widget_sees_it(self):  # GTK4 scrolls the value
+        for widget in (self.page.sidetone, self.auto_off):
+            controller = widget.set["add_controller"][0]
+            self.assertEqual(controller.args, ("both",))
+            self.assertEqual(controller.set["set_propagation_phase"], ("capture",))
+            self.assertIs(controller.handlers["scroll"], headphones.pass_scroll)
+
+    def test_the_caught_scroll_moves_the_page_as_its_scrolled_window_would_and_never_the_value(self):
+        adj = mock.Mock(get_value=lambda: 100.0, get_page_size=lambda: 512.0)
+        controller = mock.Mock(get_unit=lambda: headphones.Gdk.ScrollUnit.WHEEL)
+        controller.get_widget().get_ancestor.return_value.get_vadjustment.return_value = adj
+        self.assertIs(headphones.pass_scroll(controller, 0, 1), True)  # True: the widget never gets it
+        controller.get_widget().get_ancestor.assert_called_with(headphones.Gtk.ScrolledWindow)
+        self.assertAlmostEqual(adj.set_value.call_args[0][0], 164.0)  # a wheel notch: page_size ** (2/3), as GTK does
+        controller.get_unit = lambda: headphones.Gdk.ScrollUnit.SURFACE
+        headphones.pass_scroll(controller, 3, -12.5)  # a touchpad: its own pixels; sideways moves nothing
+        self.assertAlmostEqual(adj.set_value.call_args[0][0], 87.5)
+        controller.get_widget().get_ancestor.return_value = None
+        self.assertIs(headphones.pass_scroll(controller, 0, 1), True)
+
+    def test_the_widget_ranges(self):  # HeadsetControl's 0..128 sidetone; the headset's 0..90 minutes
+        self.assertEqual(self.page.sidetone.args[1:3], (0, 128))
+        self.assertEqual(self.auto_off.args[:2], (0, 90))
 
     def test_an_unsaved_one_shows_not_set_rather_than_a_value(self):  # the headset can't report its own
         page = Page()
@@ -255,6 +304,12 @@ class Settings(unittest.TestCase):
         with mock.patch.object(headphones.store, "save"):
             self.page.on_setting("auto_off", 10)
         self.spawned[-1][1](None)
+        self.monitor.poll()
+        self.spawned[-1][1]((3990, False))  # still on: its second try
+        self.assertEqual(self.visible(), ((True,), (True,)))
+        self.spawned[-1][1](None)
+        self.monitor.poll()
+        self.spawned[-1][1]((3990, False))
         self.assertEqual(self.visible(), ((True,), (False,)))
         self.assertEqual(self.page.note.set["set_title"], ("This headset doesn't accept auto power-off",))
         self.assertEqual(self.page.note.set["set_visible"], (True,))

@@ -417,32 +417,128 @@ class Settings(unittest.TestCase):
         self.finish(True)
         self.assertEqual(sorted(self.sent()), sorted([hidpp.sidetone_request(30), hidpp.auto_off_request(5)]))
 
-    def test_a_users_value_without_an_ack_is_refused(self):
+    def poll(self, reading):
+        self.m.poll()
+        self.finish(reading)
+
+    def test_a_users_value_acknowledged_refuses_nothing(self):
+        self.on()
         self.m.set("sidetone", 10)
         self.finish(True)
-        self.assertEqual((self.m.refused, self.log), (set(), ["ack"]))
+        self.assertEqual((self.m.refused, self.log[-1], self.m.busy), (set(), "ack", False))
+        self.poll((3990, False))
+        self.assertEqual(len(self.sent()), 1)  # acknowledged: never sent again
+
+    def test_a_newer_value_is_never_overwritten_by_an_older_ones_retry(self):
+        self.on()
         self.m.set("sidetone", 10)
-        self.finish(False)  # refused: the captured error reply
+        self.m.set("sidetone", 20)  # asked while 10 is in flight
+        self.finish(None)  # 10 unanswered: 20 goes now
+        self.finish(True)
         self.m.set("auto_off", 5)
-        self.finish(None)  # no answer, or the exchange raised
-        self.assertEqual(self.m.refused, {"sidetone", "auto_off"})
-        self.m.set("sidetone", 10)
+        self.finish(None)  # 5 unanswered, held for the next poll
+        self.m.set("auto_off", 15)  # asked before that poll
         self.finish(True)
-        self.assertEqual(self.m.refused, {"sidetone", "auto_off"})  # until Booth restarts
-        self.assertFalse(self.m.busy)
+        self.poll((3990, False))
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10), hidpp.sidetone_request(20),
+                                       hidpp.auto_off_request(5), hidpp.auto_off_request(15)])
+
+    def test_the_off_reply_keeps_a_users_value_for_the_next_on(self):  # captured 11ff ff 05 1a 05…: the headset is off
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(False)
+        self.poll(hidpp.OFF)
+        self.poll(hidpp.OFF)
+        self.assertEqual((self.m.refused, self.sent(), self.m.busy), (set(), [hidpp.sidetone_request(10)], False))
+        self.on()
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)] * 2)
+        self.finish(None)
+        self.poll((3990, False))  # the try before "off" was no strike: this is the first
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 3))
+
+    def test_the_dongle_unplugged_mid_ask_keeps_it_for_the_next_on(self):
+        self.on()
+        self.m.set("auto_off", 5)
+        self.finish(False)  # find() found no node: setting() says False
+        self.poll(hidpp.OFF)  # battery() with no node
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 1))
+        self.on()
+        self.assertEqual(self.sent(), [hidpp.auto_off_request(5)] * 2)
+        self.finish(False)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+
+    def test_an_ask_without_a_poll_answering_on_just_before_it_is_no_strike(self):
+        self.m.set("sidetone", 10)  # before the first answer
+        self.finish(None)
+        self.poll((3990, False))
+        self.finish(None)  # its second try: the first strike
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+        self.finish(True)  # its third try
+        self.poll(None)  # a miss: on stays, but unconfirmed
+        self.m.set("auto_off", 5)
+        self.finish(None)
+        self.poll((3990, False))
+        self.finish(None)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+
+    def test_one_dropped_reply_waits_for_a_poll_that_answers(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(None)
+        self.poll(None)  # a miss: no verdict, nothing sent again yet
+        self.assertEqual((self.m.refused, len(self.sent()), self.m.busy), (set(), 1, False))
+        self.poll((3990, False))
+        self.assertEqual(self.sent(), [hidpp.sidetone_request(10)] * 2)
+        self.finish(None)
+        self.poll((3990, False))  # the first try was followed by a miss: this is only its first strike
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 3))
+
+    def test_no_ack_twice_while_on_before_and_after_each_ask_is_refused(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(False)
+        self.poll((3990, False))
+        self.assertEqual((self.m.refused, self.sent()), (set(), [hidpp.sidetone_request(10)] * 2))  # its second try
+        self.finish(None)
+        acks = self.log.count("ack")
+        self.poll((3990, False))
+        self.assertEqual((self.m.refused, len(self.sent()), self.m.busy), ({"sidetone"}, 2, False))
+        self.assertEqual(self.log.count("ack"), acks + 1)  # the page hears of it
+        self.m.set("sidetone", 20)
+        self.finish(True)
+        self.assertEqual(self.m.refused, {"sidetone"})  # until Booth restarts
+
+    def test_a_new_value_from_the_user_starts_its_tries_afresh(self):
+        self.on()
+        self.m.set("sidetone", 10)
+        self.finish(None)
+        self.poll((3990, False))  # 10's first strike; its second try goes out
+        self.m.set("sidetone", 20)
+        self.finish(True)
+        self.finish(None)
+        self.poll((3990, False))
+        self.assertEqual(self.m.refused, set())
+        self.assertEqual(self.sent()[-1], hidpp.sidetone_request(20))
 
     def test_a_resend_on_on_without_an_ack_refuses_nothing(self):
         self.saved.update(sidetone=64, auto_off=10)
         self.on()
         self.finish(False)
         self.finish(None)
-        self.assertEqual((self.m.refused, len(self.sent())), (set(), 2))
+        self.poll((3990, False))
+        self.assertEqual((self.m.refused, len(self.sent())), (set(), 2))  # not the user's ask now: no retry
 
     def test_off_keeps_the_refusals(self):
+        self.on()
         self.m.set("sidetone", 10)
         self.finish(False)
-        self.m.poll()
-        self.finish(hidpp.OFF)
+        self.poll((3990, False))
+        self.finish(False)
+        self.poll((3990, False))
+        self.poll(hidpp.OFF)
         self.on()
         self.assertEqual((self.m.refused, self.log[-2:]), ({"sidetone"}, ["on", "battery"]))
 
@@ -459,6 +555,9 @@ class Settings(unittest.TestCase):
         self.on()
         self.assertEqual(self.sent(), [hidpp.sidetone_request(10)])
         self.finish(False)  # still the user's value: its refusal counts
+        self.poll((3990, False))
+        self.finish(False)
+        self.poll((3990, False))
         self.assertEqual(self.m.refused, {"sidetone"})
 
     def test_without_the_settings_nothing_is_sent(self):  # the monitor before the app loaded them

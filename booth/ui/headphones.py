@@ -7,7 +7,7 @@ every tick. A `pw-dump --monitor` stream would need a long-lived process and a m
 learn the same two values."""
 import threading
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gdk, GLib, Gtk
 
 from booth import headset, store
 
@@ -16,6 +16,18 @@ SWITCH_SUBTITLE = "Play all sound through the headset"
 SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
 NOT_SET = "Not set in Booth"  # the headset can't report its own value: the widget's position means nothing yet
 NAMES = {"sidetone": "sidetone", "auto_off": "auto power-off"}
+
+
+def pass_scroll(controller, _dx, dy):
+    """A wheel or touchpad scroll over Sidetone or Auto power-off, caught before the widget (GTK4 would change its
+    value, which sends and saves one the user didn't pick): the page scrolls instead, by the step its own
+    GtkScrolledWindow uses. shortcut: no kinetic glide after a touchpad flick; add one if it feels abrupt."""
+    window = controller.get_widget().get_ancestor(Gtk.ScrolledWindow)
+    if window is not None:
+        adj = window.get_vadjustment()
+        step = adj.get_page_size() ** (2 / 3) if controller.get_unit() == Gdk.ScrollUnit.WHEEL else 1
+        adj.set_value(adj.get_value() + dy * step)
+    return True
 
 
 class HeadphonesPage(Adw.PreferencesPage):
@@ -57,6 +69,11 @@ class HeadphonesPage(Adw.PreferencesPage):
             auto_off.set_value(saved["auto_off"])
         auto_off.connect("notify::value", lambda r, _p: self.on_setting("auto_off", round(r.get_value())))
         self.hidpp_rows = {"sidetone": sidetone, "auto_off": auto_off}
+        for widget in (self.sidetone, auto_off):
+            scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.BOTH_AXES)
+            scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            scroll.connect("scroll", pass_scroll)
+            widget.add_controller(scroll)
         for kind, row in self.hidpp_rows.items():
             row.set_subtitle(SUBTITLES[kind] if kind in saved else NOT_SET)
             self.group.add(row)
