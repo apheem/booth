@@ -7,22 +7,23 @@ from booth import meter
 
 
 class LevelMeter(Gtk.DrawingArea):
-    def __init__(self, height=20, **kwargs):
+    def __init__(self, name, height=20, **kwargs):
+        """name: what a screen reader calls this bar, e.g. "Before processing" (the page shows two at once)."""
         super().__init__(content_height=height, hexpand=True, accessible_role=Gtk.AccessibleRole.METER, **kwargs)
-        self.peak = self.decay = self.said = None
+        self.name, self.peak, self.decay, self.said = name, None, None, None
         self.set_draw_func(self.draw)
-        self.say(meter.label(None))
+        self.say(meter.label(name, None))
 
     def set_level(self, peak, decay):
         self.peak, self.decay = peak, decay
-        self.say(meter.label(decay))
+        self.say(meter.label(self.name, decay))
         self.set_tooltip_text(None)
         self.queue_draw()
 
     def idle(self, text):
         """Nothing to meter: an empty bar that says why."""
         self.peak = self.decay = None
-        self.say(text)
+        self.say(f"{self.name}: {text}")
         self.set_tooltip_text(text)
         self.queue_draw()
 

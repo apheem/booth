@@ -2,6 +2,7 @@
 switch's systemctl commands, and the debounce that turns a burst of replug events into one camera restore."""
 import subprocess
 
+APP_ID = "io.github.apheem.Booth"  # the app's D-Bus name: owned while a Booth primary instance runs
 UNIT = "booth.service"
 IS_ENABLED = ["systemctl", "--user", "is-enabled", "--quiet", UNIT]
 

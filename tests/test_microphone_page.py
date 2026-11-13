@@ -7,11 +7,12 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import meter, scarlett, voice
+from booth import meter, monitor, plugins, scarlett, voice
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_app import Inline
+from tests.test_fallback import locked
 from tests.test_headset import DUMP
 
 CONTENTS = read("scarlett/amixer-contents.txt")
@@ -38,7 +39,9 @@ class _W:
 
     def __init__(self, *_args, **kwargs):
         self.handlers, self.active, self.selected, self.sensitive = {}, False, 0, True
-        self.description = self.subtitle = self.model = None
+        self.description, self.subtitle, self.model = None, kwargs.get("subtitle"), None
+        self.title, self.adjustment = kwargs.get("title"), kwargs.get("adjustment")
+        self.value, self.rows = (self.adjustment or {}).get("value"), []
         self.responses = []
 
     def connect(self, signal, handler, *args):
@@ -64,6 +67,17 @@ class _W:
             self.selected = i
             if "notify::selected" in self.handlers:
                 self.emit("notify::selected", None)
+
+    def get_value(self):
+        return self.value
+
+    def set_value(self, value):
+        if value != self.value:
+            self.value = value
+            self.emit("notify::value", None)
+
+    def add_row(self, row):
+        self.rows.append(row)
 
     def set_model(self, model):
         self.model = model
@@ -91,7 +105,11 @@ class _W:
 
 
 class _Meter(_W):
-    """A LevelMeter stand-in: what it was last told to show."""
+    """A LevelMeter stand-in: its name, and what it was last told to show."""
+
+    def __init__(self, name, *_args, **_kwargs):
+        super().__init__()
+        self.name = name
 
     def set_level(self, peak, decay):
         self.level, self.said = (peak, decay), None
@@ -131,7 +149,13 @@ class PageCase(unittest.TestCase):
     def setUp(self):
         self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
         self.said, self.selecting = "live", True  # what voice.apply returns; whether Booth Mic's selector runs
+        self.running = True  # voice.running: Booth Mic's own process is in PipeWire
+        self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
+        self.monitored, self.monitor_said = [], "on"  # every monitor.sync's switch; what it returns
+        self.monitor_on = []  # every monitor.sync's `on`: the PRO X headset's HeadsetMonitor.on
+        self.headset = types.SimpleNamespace(on=True)
+        self.labels = []  # every Gtk.Label the page made, as {its keyword arguments}
 
         real_send = scarlett.send
 
@@ -146,8 +170,12 @@ class PageCase(unittest.TestCase):
         for patch in (
                 mock.patch.object(microphone, "super", lambda *a: ns(__init__=lambda: None), create=True),
                 mock.patch.object(microphone, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W, ComboRow=_W,
-                                                        AlertDialog=dialog, ResponseAppearance=ns(DESTRUCTIVE=2))),
-                mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295)),
+                                                        SpinRow=_W, ExpanderRow=_W, AlertDialog=dialog,
+                                                        ResponseAppearance=ns(DESTRUCTIVE=2))),
+                mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295,
+                                                        Box=_W, Label=lambda **kw: self.labels.append(kw),
+                                                        Adjustment=ns(new=lambda value, lower, upper, *_: dict(
+                                                            value=value, lower=lower, upper=upper)))),
                 mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
                 mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: f(*a)),
                 mock.patch.object(microphone.threading, "Thread", Inline),
@@ -156,13 +184,22 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "apply",
                                   lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
+                mock.patch.object(microphone.voice, "running", lambda: self.running, create=True),
+                mock.patch.object(microphone.voice, "current", lambda: None),  # the selector config on disk: none
+                # every plugin verifies; self.found: those also in the running chain (voice.loaded), the page's rows
+                mock.patch.object(microphone.voice, "verified", lambda: dict.fromkeys(plugins.MANIFEST, "/verified")),
+                mock.patch.object(microphone.voice, "loaded", lambda found=None: self.found, create=True),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
-                mock.patch.object(microphone.meter, "Meter", _Gst)):
+                mock.patch.object(microphone.meter, "Meter", _Gst),
+                mock.patch.object(microphone.monitor, "LAST", None, create=True),  # no sync yet this run
+                mock.patch.object(microphone.monitor, "sync",
+                                  lambda settings, on: self.monitor_on.append(on)
+                                  or self.monitored.append(dict(settings["voice"])) or self.monitor_said)):
             patch.start()
             self.addCleanup(patch.stop)
         self.page = Page()
         self.page.root_ = _Root()
-        microphone.MicrophonePage.__init__(self.page, self.settings)
+        microphone.MicrophonePage.__init__(self.page, self.settings, self.headset)
         self.assertEqual([n for n in vars(self.page) if hasattr(microphone.MicrophonePage, n)], [])  # none shadowed
 
     def show(self, s):
@@ -294,6 +331,12 @@ class ScarlettGroup(PageCase):
         self.page.poll = types.MethodType(microphone.MicrophonePage.poll, self.page)
         return idle
 
+    def test_page_poll_reads_and_applies_under_the_voice_lock_so_a_heal_never_lands_in_between(self):
+        held = []  # a stale read applied after heal moved to a backup would put the Scarlett's config back on a gone node
+        self.real_poll(lambda choice: held.append(locked()) or state())
+        self.page.poll()
+        self.assertEqual((held, len(self.applied)), ([True], 1))
+
     def test_an_overlapping_poll_is_refused_and_the_next_one_after_show_runs(self):
         reads = []
         idle = self.real_poll(lambda choice: reads.append(choice) or state(**{scarlett.DIRECT: True}))
@@ -328,6 +371,33 @@ class ScarlettGroup(PageCase):
         with mock.patch.object(microphone.GLib, "source_remove", removed.append):
             self.page.stop()
         self.assertEqual(removed, [self.page.timer])
+
+
+class DirectMonitorSetting(PageCase):
+    """"Turn on Direct Monitor when the PRO X turns off": the routing policy's switch, saved, never a Scarlett write."""
+
+    def test_it_starts_on_and_shows_the_saved_value(self):
+        self.assertTrue(self.page.auto.active)
+        self.assertEqual(self.page.auto.title, "Turn on Direct Monitor when the PRO X turns off")
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "routing": {"direct_monitor": False}})
+        self.assertFalse(page.auto.active)
+
+    def test_a_click_is_saved_and_never_writes_the_scarlett(self):
+        self.show(state())
+        self.click(self.page.auto, False)
+        self.assertEqual((self.settings["routing"], self.saved), ({"direct_monitor": False}, [self.settings]))
+        self.assertEqual(self.ran, [])
+        self.settings["routing"] = {"moved": True}  # the routing saved its record since: a new dict
+        self.click(self.page.auto, True)
+        self.assertEqual(self.settings["routing"], {"moved": True, "direct_monitor": True})
+
+    def test_a_failed_save_says_so_on_the_row(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.click(self.page.auto, False)
+        self.assertEqual(self.page.auto.subtitle, "Set, but not saved: No space left on device")
+        self.click(self.page.auto, True)
+        self.assertEqual(self.page.auto.subtitle, microphone.AUTO)
 
 
 class VoiceGroup(PageCase):
@@ -376,6 +446,14 @@ class VoiceGroup(PageCase):
         f(*a)
         self.assertEqual(self.page.voice.description, voice.WAITING)
 
+    def test_a_poll_with_booth_mic_stopped_says_so_never_blames_the_scarlett(self):
+        s, self.selecting, self.running = state(), False, False  # its pre-start failed, or the user stopped it
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.page.voice.description, voice.STOPPED)
+
     def test_each_poll_says_where_booth_mic_takes_its_input(self):
         self.show(state())
         self.assertEqual(self.page.voice.description, voice.describe(state()))
@@ -412,7 +490,131 @@ class VoiceGroup(PageCase):
         self.page.poll()
         self.assertEqual(self.applied, [])
 
+    def unplugged_poll(self, source):
+        idle = self.real_poll(lambda choice: None)
+        with mock.patch.object(microphone.voice, "current", lambda: source):
+            self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        return self.page.voice.description
+
+    def test_unplugged_on_a_backup_says_booth_mic_runs_from_it_never_waiting(self):
+        for source in (voice.PRO_X_MIC, voice.BRIO_MIC):
+            said = self.unplugged_poll(source)
+            self.assertEqual(said, voice.describe(None, source=source))
+            self.assertIn(f"from the {source}", said)
+            self.assertNotEqual(said, voice.WAITING)
+        self.assertEqual(self.unplugged_poll(voice.SCARLETT), voice.WAITING)  # its own selector: back when it is
+
+    def test_unplugged_with_the_backup_selector_down_says_waiting_never_runs_from_it(self):  # heal's backoff
+        self.selecting = False
+        self.assertEqual(self.unplugged_poll(voice.BRIO_MIC), voice.WAITING)
+
+    def test_unplugged_with_booth_mic_stopped_says_stopped_and_never_meters_it(self):
+        self.running = False
+        self.assertEqual(self.unplugged_poll(voice.BRIO_MIC), voice.STOPPED)
+        self.assertEqual(self.page.after_record, None)
+        self.assertEqual(self.page.after.said, voice.STOPPED)
+
     real_poll = ScarlettGroup.real_poll
+
+
+class StageRows(PageCase):
+    """Noise suppression, leveling and the limiter: a switch, one knob and the raw controls each, saved and applied live;
+    a plugin missing or changed shows so and is bypassed."""
+
+    def stage(self, key):
+        return self.page.stages[key]
+
+    def test_each_stage_has_a_switch_a_knob_and_its_raw_controls_in_chain_order(self):
+        self.assertEqual(list(self.page.stages), ["noise", "leveling", "limiter"])
+        self.assertEqual([(s.switch.title, s.knob.title) for s in self.page.stages.values()],
+                         [("Noise Suppression", "Strength"), ("Leveling", "Amount"), ("Limiter", "Ceiling (dB)")])
+        self.assertEqual([s.details.title for s in self.page.stages.values()], ["Show details"] * 3)
+        self.assertEqual([r.title for r in self.stage("leveling").details.rows], list(voice.amount(50)))
+
+    def test_stages_start_on_with_the_default_knobs(self):
+        self.assertEqual([s.switch.active for s in self.page.stages.values()], [True] * 3)
+        self.assertEqual([s.knob.value for s in self.page.stages.values()], [50, 50, -1.0])
+        self.assertEqual([r.subtitle for r in self.stage("limiter").details.rows], ["0", "-1", "0.05"])
+        self.assertEqual(self.settings["voice"], {})  # nothing saved by showing them
+
+    def test_saved_values_are_shown_at_start(self):
+        page = Page()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {
+            "noise": False, "noise_strength": 80, "limiter_ceiling": -3.5}})
+        self.assertEqual((page.stages["noise"].switch.active, page.stages["noise"].knob.value,
+                          page.stages["limiter"].knob.value), (False, 80, -3.5))
+        self.assertEqual(page.stages["noise"].details.rows[0].subtitle, "76")
+
+    def test_the_knob_ranges_stay_inside_what_the_settings_accept(self):
+        for s, (lo, hi) in zip(self.page.stages.values(), ((0, 100), (0, 100), (-12, 0))):
+            self.assertEqual((s.knob.adjustment["lower"], s.knob.adjustment["upper"]), (lo, hi))
+
+    def test_a_stage_switch_is_saved_and_applied_live_never_moving_the_selector(self):
+        self.click(self.stage("noise").switch, False)
+        self.assertEqual((self.settings["voice"], self.saved), ({"noise": False}, [self.settings]))
+        self.assertEqual(self.applied, [({"noise": False}, None)])
+
+    def test_a_knob_is_saved_applied_and_its_raw_controls_follow(self):
+        self.stage("noise").knob.set_value(80.0)
+        self.assertEqual(self.settings["voice"], {"noise_strength": 80})
+        self.assertIs(type(self.settings["voice"]["noise_strength"]), int)  # the settings accept whole numbers only
+        self.assertEqual(self.applied, [({"noise_strength": 80}, None)])
+        self.assertEqual(self.stage("noise").details.rows[0].subtitle, "76")
+        self.stage("limiter").knob.set_value(-2.5)
+        self.assertEqual(self.settings["voice"]["limiter_ceiling"], -2.5)
+        self.assertEqual(self.stage("limiter").details.rows[1].subtitle, "-2.5")
+
+    def test_a_knob_that_cant_be_saved_says_so_and_still_applies(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.stage("leveling").knob.set_value(70.0)
+        self.assertEqual(self.stage("leveling").knob.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(len(self.applied), 1)
+
+    def test_a_plugin_missing_or_changed_says_so_and_the_stage_is_bypassed(self):
+        self.page.show(state(), self.page.writer.writes, True, "", {"leveling": microphone.MISSING})
+        row = self.stage("leveling")
+        self.assertEqual(row.switch.subtitle, microphone.MISSING)
+        self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (False, False, False))
+        self.assertEqual((self.settings["voice"], self.saved, self.applied), ({}, [], []))  # shown, never saved
+        self.assertTrue(self.stage("noise").switch.sensitive)
+        self.page.show(state(), self.page.writer.writes, True, "", {})  # ./install.sh fetched it again
+        self.assertEqual((row.switch.active, row.switch.sensitive, row.knob.sensitive), (True, True, True))
+        self.assertNotEqual(row.switch.subtitle, microphone.MISSING)
+
+    def poll_plugins(self):
+        idle = ScarlettGroup.real_poll(self, lambda choice: state())
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        return {key: stage.switch.subtitle for key, stage in self.page.stages.items()}
+
+    def test_each_poll_checks_the_plugins(self):
+        # RNNoise doesn't verify (missing, or changed since): bypassed, ./install.sh fetches it again
+        self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
+        with mock.patch.object(microphone.voice, "verified", lambda: self.found):
+            subtitles = self.poll_plugins()
+        self.assertEqual(subtitles["noise"], microphone.MISSING)
+        self.assertEqual(subtitles["limiter"], microphone.STAGES["limiter"][1])
+
+    def test_a_plugin_that_verifies_but_booth_mic_hasnt_loaded_yet_says_it_loads_at_its_restart(self):
+        # an install while an old Booth ran: the plugins are in place, Booth Mic still runs the old chain
+        self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
+        subtitles = self.poll_plugins()
+        self.assertEqual(subtitles["noise"], microphone.PENDING)
+        self.assertIn("loads when Booth Mic restarts", microphone.PENDING)
+        self.assertNotIn("missing", microphone.PENDING.lower())
+        row = self.stage("noise")
+        self.assertEqual((row.switch.active, row.switch.sensitive), (False, False))  # not in the chain yet: dry
+
+    def test_the_master_switch_off_greys_every_stage(self):
+        self.click(self.page.master, False)
+        self.assertEqual([(s.switch.sensitive, s.knob.sensitive) for s in self.page.stages.values()],
+                         [(False, False)] * 3)
+        self.click(self.page.master, True)
+        self.assertEqual([(s.switch.sensitive, s.knob.sensitive) for s in self.page.stages.values()],
+                         [(True, True)] * 3)
 
 
 class Meters(PageCase):
@@ -471,6 +673,14 @@ class Meters(PageCase):
         self.page.root_.emit("notify::suspended", None)
         self.assertFalse(self.gst.wants[-1][1])
 
+    def test_each_bar_names_itself_and_is_labelled_by_its_visible_label(self):
+        p = self.page
+        self.assertEqual((p.bar.name, p.after.name, p.mini.name),
+                         ("Before processing", "After processing (Booth Mic)", "Input level"))
+        # mnemonic_widget: GTK sets the bar's LABELLED_BY relation to the label
+        self.assertEqual([(kw["label"], kw["mnemonic_widget"]) for kw in self.labels],
+                         [("Before", p.bar), ("After", p.after)])
+
     def test_a_failure_says_so_on_both_meters(self):
         self.page.meter.failed(meter.UNAVAILABLE)
         self.assertEqual([m.said for m in self.meters], [meter.UNAVAILABLE] * 2)
@@ -479,6 +689,154 @@ class Meters(PageCase):
         with mock.patch.object(microphone.GLib, "source_remove", lambda _t: None):
             self.page.stop()
         self.assertEqual(self.gst.stopped, 1)
+
+
+class AfterMeter(PageCase):
+    """Booth Mic's after-meter: the same Meter on booth_mic, mono, on the page only, never while it isn't on screen."""
+
+    def setUp(self):
+        super().setUp()
+        self.gst = self.page.after_meter
+
+    map = Meters.map
+
+    def test_it_reads_booth_mic_mono_by_name(self):
+        self.assertEqual(microphone.AFTER, {"node": "booth_mic", "channel": 1, "channels": 1})
+        self.assertIn('target-object="booth_mic"', meter.launch(microphone.AFTER["node"], microphone.AFTER["channels"]))
+
+    def test_runs_only_while_the_page_is_on_screen(self):
+        self.show(state())
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, False))
+        self.map(self.page)
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, True))
+        self.map(self.page, False)
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, False))
+
+    def test_mapping_the_page_before_the_first_poll_never_opens_booth_mic(self):
+        self.map(self.page)  # Booth Mic not yet known to be running
+        self.assertEqual(self.gst.wants[-1], (None, True))
+        self.show(state())
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, True))
+
+    def test_the_sidebar_meter_alone_never_opens_booth_mic(self):
+        self.show(state())
+        self.page.mini.get_mapped = lambda: self.page.mini.mapped
+        self.page.mini.get_root = lambda: self.page.root_
+        self.map(self.page.mini)
+        self.assertTrue(self.page.meter.wants[-1][1])  # the before-meter runs for the sidebar
+        self.assertFalse(self.gst.wants[-1][1])
+
+    def test_a_minimised_window_stops_it(self):
+        self.show(state())
+        self.map(self.page)
+        self.page.root_.suspended = True
+        self.page.root_.emit("notify::suspended", None)
+        self.assertFalse(self.gst.wants[-1][1])
+
+    def test_its_levels_go_to_the_after_bar_only(self):
+        self.gst.post(-20.0, -18.0)
+        self.assertEqual(self.page.after.level, (-20.0, -18.0))
+        self.assertIsNone(vars(self.page.bar).get("level"))
+        self.gst.failed(meter.UNAVAILABLE)
+        self.assertEqual((self.page.after.said, vars(self.page.bar).get("level")), (meter.UNAVAILABLE, None))
+
+    def test_booth_mic_stopped_says_so_and_runs_nothing(self):
+        self.page.show(state(), self.page.writer.writes, True, "", None, False)
+        self.assertEqual(self.gst.wants[-1][0], None)
+        self.assertEqual(self.page.after.said, voice.STOPPED)
+
+    def test_an_unplugged_scarlett_still_meters_booth_mic(self):
+        self.show(None)  # Booth Mic carries silence (or, with #20, a backup mic): it is what the call hears
+        self.assertEqual(self.gst.wants[-1][0], microphone.AFTER)
+
+    def test_closing_the_window_stops_both_meters(self):
+        with mock.patch.object(microphone.GLib, "source_remove", lambda _t: None):
+            self.page.stop()
+        self.assertEqual((self.page.meter.stopped, self.gst.stopped), (1, 1))
+
+
+class Monitoring(PageCase):
+    """The "Hear processed voice in headphones" switch: off by default, saved, and handed to monitor.sync off the main
+    loop; never voice.apply, never the Scarlett."""
+
+    def test_it_starts_off_and_says_the_delay_where_it_plays_and_what_it_keeps_open(self):
+        self.assertFalse(self.page.monitoring.active)
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)
+        self.assertEqual(self.monitored, [])  # showing the saved state starts nothing
+
+    def test_the_saved_switch_is_shown_at_start(self):
+        page = Page()
+        page.root_ = _Root()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {"monitor": True}})
+        self.assertTrue(page.monitoring.active)
+        self.assertEqual(self.monitored, [])
+
+    def test_a_click_is_saved_and_synced_never_touching_booth_mic(self):
+        self.click(self.page.monitoring, True)
+        self.assertEqual((self.settings["voice"], self.saved), ({"monitor": True}, [self.settings]))
+        self.assertEqual(self.monitored, [{"monitor": True}])
+        self.click(self.page.monitoring, False)
+        self.assertEqual(self.monitored[-1], {"monitor": False})
+        self.assertEqual((self.applied, self.ran), ([], []))  # never Booth Mic's chain, never the Scarlett
+
+    def test_a_click_with_the_pro_x_off_hands_that_to_sync_which_pauses_it(self):
+        for on in (False, None, True):
+            self.headset.on = on
+            self.click(self.page.monitoring, not self.page.monitoring.active)
+        self.assertEqual(self.monitor_on, [False, None, True])
+        self.monitor_said = monitor.PAUSED
+        self.click(self.page.monitoring, True)
+        self.assertEqual(self.page.monitoring.subtitle, "Paused: the PRO X is off")
+
+    def test_what_didnt_happen_is_said_on_the_row(self):
+        self.monitor_said = "not started: see systemctl --user status booth-monitor.service"
+        self.click(self.page.monitoring, True)
+        self.assertEqual(self.page.monitoring.subtitle, f"Set, but {self.monitor_said}")
+        self.monitor_said = "off"
+        self.click(self.page.monitoring, False)
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)
+
+    def test_a_failed_save_says_so_and_still_syncs(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.click(self.page.monitoring, True)
+        self.assertEqual(self.page.monitoring.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(self.monitored, [{"monitor": True}])
+        self.show(state())  # a poll keeps the note
+        self.assertEqual(self.page.monitoring.subtitle, "Set, but not saved: No space left on device")
+        self.click(self.page.monitoring, False)  # saved this time
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)
+
+    def test_waiting_for_the_pro_x_or_booth_mic_is_said_on_the_row(self):
+        for said in (monitor.NO_PROX, monitor.NO_MIC):
+            self.monitor_said = said
+            self.click(self.page.monitoring, not self.page.monitoring.active)
+            self.assertEqual(self.page.monitoring.subtitle, said)
+
+    def test_each_poll_shows_monitorings_latest_state(self):
+        self.monitor_said = "not started: see systemctl --user status booth-monitor.service"
+        self.click(self.page.monitoring, True)
+        for last, subtitle in ((monitor.NO_PROX, monitor.NO_PROX), (monitor.NOT_RUNNING, f"Set, but {monitor.NOT_RUNNING}"),
+                               ("on", monitor.LABEL), (monitor.NO_MIC, monitor.NO_MIC), ("off", monitor.LABEL)):
+            with mock.patch.object(monitor, "LAST", last):  # what a heal tick's sync found since
+                self.show(state())
+            self.assertEqual(self.page.monitoring.subtitle, subtitle)
+
+    def test_sync_runs_on_a_worker_thread_and_the_row_changes_only_on_the_main_loop(self):
+        threads, idle = [], []
+        self.monitor_said = monitor.NO_PROX
+        self.page.monitoring.subtitle = "Set, but not started: see systemctl --user status booth-monitor.service"
+        with mock.patch.object(microphone.threading, "Thread",
+                               lambda target, daemon: types.SimpleNamespace(start=lambda: threads.append(target))), \
+                mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            self.click(self.page.monitoring, True)
+            self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)  # the click clears an old note at once
+            self.assertEqual((len(threads), self.monitored), (1, []))  # handed to a thread, never run inline
+            threads.pop()()
+        self.assertEqual(self.monitored, [{"monitor": True}])
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)  # the worker never touched the row
+        for f, a in idle:  # the main loop
+            f(*a)
+        self.assertEqual(self.page.monitoring.subtitle, monitor.NO_PROX)
 
 
 class WindowClose(unittest.TestCase):
@@ -493,6 +851,7 @@ class WindowClose(unittest.TestCase):
             if c.args[0] == "close-request":
                 c.args[1](win)
         mic.return_value.stop.assert_called_once_with()
+        mic.assert_called_once_with({}, booth.headset_monitor)  # monitoring paused while the PRO X is off
         self.assertIs(win.pages[1][3], mic.return_value.mini)  # the sidebar's Microphone row shows its meter
 
     def test_closing_the_window_stops_the_headphones_pages_poll(self):
@@ -530,7 +889,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4, True, ""))])
+        self.assertEqual(self.idle, [(page.show, (None, 4, True, "", None, True, None))])  # None: the stage rows stay as they are
 
 
 if __name__ == "__main__":

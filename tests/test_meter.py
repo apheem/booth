@@ -60,12 +60,13 @@ class Scale(unittest.TestCase):
         low, high = meter.zone()
         self.assertTrue(low < meter.position(-12.0) < high)
 
-    def test_the_label_says_the_db_value(self):
-        self.assertEqual(meter.label(-12.4), "Input level −12 dB")
-        self.assertEqual(meter.label(-0.2), "Input level 0 dB")
-        self.assertEqual(meter.label(-75.0), "Input level silent")  # below the bottom of the bar
-        self.assertEqual(meter.label(-349.99), "Input level silent")
-        self.assertEqual(meter.label(None), "Input level silent")
+    def test_the_label_names_its_meter_and_says_the_db_value(self):
+        # the page shows two bars at once: a screen reader must hear which one
+        self.assertEqual(meter.label("Before processing", -12.4), "Before processing: −12 dB")
+        self.assertEqual(meter.label("After processing (Booth Mic)", -0.2), "After processing (Booth Mic): 0 dB")
+        self.assertEqual(meter.label("Input level", -75.0), "Input level: silent")  # below the bottom of the bar
+        self.assertEqual(meter.label("Input level", -349.99), "Input level: silent")
+        self.assertEqual(meter.label("After processing (Booth Mic)", None), "After processing (Booth Mic): silent")
 
 
 class Pick(unittest.TestCase):

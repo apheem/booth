@@ -3,12 +3,14 @@
 # Copies the repo's booth/ to ~/.local/share/booth/booth (a real copy, never a symlink into the repo or a worktree),
 # writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop.
 set -eu
+umask 022  # never group-writable, whatever the user's umask: verify() refuses that for a plugin, so for its pins too
 repo=$(cd "$(dirname "$0")" && pwd)
 share=${XDG_DATA_HOME:-}
 case $share in /*) ;; *) share=$HOME/.local/share ;; esac  # the XDG spec: a relative path is invalid and ignored
 dest=$share/booth
 bin=$HOME/.local/bin
 mkdir -p "$dest" "$bin" "$share/applications"
+chmod go-w "$dest"  # an install made under umask 0002
 
 # Stage then swap, so a failed copy never leaves a half-installed app and files removed from the repo don't linger.
 rm -rf "$dest/booth.new"
@@ -54,6 +56,7 @@ config=${XDG_CONFIG_HOME:-}
 case $config in /*) ;; *) config=$HOME/.config ;; esac
 units=$config/systemd/user
 mkdir -p "$units"
+[ ! -d "$config/booth" ] || chmod go-w "$config/booth"  # it holds the config Booth Mic's pipewire loads
 first=  # the first install enables the unit; a re-install keeps what the "Run in background" switch chose
 [ -e "$units/booth.service" ] || first=1
 # Unit-file quoting: in a quoted word \ and " take a backslash, % is doubled and $ too. The executable is /bin/sh
@@ -77,11 +80,18 @@ mv "$units/booth.service.new" "$units/booth.service"
 
 # booth-voice.service runs Booth Mic, the voice chain, as its own PipeWire client from the config Booth writes beside
 # its settings, so Booth Mic stays in a call with Booth closed or crashed. It lives with the user's PipeWire. No config
-# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above.
+# yet: ExecCondition skips it cleanly. Quoting as for ExecStart above. ExecStartPre writes voice-run.conf, the only file
+# ExecStart loads and one Booth never writes, with the installed booth.voice from the saved settings and the plugins
+# verified right then (booth.plugins), so a plugin file changed since is left out, never loaded; if it can't write it
+# and the one there names a plugin that doesn't verify now, the unit doesn't start. It is given the paths baked here, so
+# it writes the very file ExecStart loads, whatever the user manager's XDG_*.
 voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
 [ -e "$units/booth-voice.service" ] || voice_first=1
 voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+run_arg=$(printf '%s' "$config/booth/voice-run.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 select_arg=$(printf '%s' "$config/booth/voice-select.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+dest_arg=$(printf '%s' "$dest" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+plugins_arg=$(printf '%s' "$dest/plugins" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 cat > "$units/booth-voice.service.new" <<EOF
 [Unit]
 Description=Booth Mic: the voice chain (a PipeWire filter-chain)
@@ -90,7 +100,8 @@ BindsTo=pipewire.service
 
 [Service]
 ExecCondition=/usr/bin/test -f "$voice_arg"
-ExecStart=/usr/bin/pipewire -c "$voice_arg"
+ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write "$run_arg" "$plugins_arg"
+ExecStart=/usr/bin/pipewire -c "$run_arg"
 Restart=on-failure
 RestartSec=5
 Slice=session.slice
@@ -101,7 +112,8 @@ EOF
 mv "$units/booth-voice.service.new" "$units/booth-voice.service"
 # booth-mic-select.service runs Booth Mic's source selector (the Scarlett's mic channel into Booth Mic's input) as a
 # separate process, so a new mic channel or Scarlett node restarts only it, never Booth Mic. It never runs without
-# booth-voice.service (BindsTo) and starts with it (WantedBy).
+# booth-voice.service (BindsTo) and starts with it (WantedBy). Its ExecCondition, the installed booth.voice, skips it
+# with no config, and refuses (and removes) a backup mic's config unless Booth runs to say it (#20).
 cat > "$units/booth-mic-select.service.new" <<EOF
 [Unit]
 Description=Booth Mic's source: the Scarlett's mic channel (a PipeWire loopback)
@@ -109,7 +121,7 @@ After=booth-voice.service
 BindsTo=booth-voice.service
 
 [Service]
-ExecCondition=/usr/bin/test -f "$select_arg"
+ExecCondition=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --select "$select_arg"
 ExecStart=/usr/bin/pipewire -c "$select_arg"
 Restart=on-failure
 RestartSec=5
@@ -119,6 +131,24 @@ Slice=session.slice
 WantedBy=booth-voice.service
 EOF
 mv "$units/booth-mic-select.service.new" "$units/booth-mic-select.service"
+# booth-monitor.service plays Booth Mic in the PRO X headset (booth.monitor's loopback) while the "Hear processed voice"
+# switch is on. Never enabled and nothing in it starts or stops Booth Mic: Booth starts it and stops it, and removes its
+# config when switched off, so ExecCondition keeps it from starting at all.
+monitor_arg=$(printf '%s' "$config/booth/monitor.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+cat > "$units/booth-monitor.service.new" <<EOF
+[Unit]
+Description=Booth: hear Booth Mic in the PRO X headset (a PipeWire loopback)
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+ExecCondition=/usr/bin/test -f "$monitor_arg"
+ExecStart=/usr/bin/pipewire -c "$monitor_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+EOF
+mv "$units/booth-monitor.service.new" "$units/booth-monitor.service"
 # Enabled whatever the Run in Background switch says. booth.voice writes the configs from the Scarlett now and starts
 # them (restarts what changed). The first install then makes Booth Mic the default mic by name: WirePlumber picks it
 # as soon as it appears. None of this stops the install: Booth writes the configs and starts the services each run.
@@ -144,6 +174,15 @@ while owned; do
   sleep 0.5
   n=$((n + 1))
 done
+# Booth Mic restarted (only if it runs) when its plugins aren't the ones verified now, so a new stage loads at once. Not
+# with an old Booth still running: its poll would write its own chain back and restart Booth Mic, whose pre-start writes
+# the new one, every few seconds until Booth is closed (the hint below). Left as is, its next start loads them.
+if [ -n "$stale" ]; then
+  echo "install.sh: Booth didn't quit, so Booth Mic wasn't restarted for its new plugins; once Booth is closed, run: systemctl --user restart booth-voice.service" >&2
+else
+  PYTHONPATH=$dest python3 -P -m booth.voice --reload ||
+    echo "install.sh: couldn't restart Booth Mic for its new plugins; they load at its next start" >&2
+fi
 state=new
 [ -n "$first" ] || state=$(systemctl --user is-enabled booth.service 2>/dev/null) || true
 # restart, not start: a re-install must run the new copy. Only an explicit "disabled" is the switch turned off; no
