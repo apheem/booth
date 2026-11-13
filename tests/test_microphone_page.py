@@ -847,6 +847,7 @@ class WindowClose(unittest.TestCase):
             if c.args[0] == "close-request":
                 c.args[1](win)
         mic.return_value.stop.assert_called_once_with()
+        mic.assert_called_once_with({}, booth.headset_monitor)  # monitoring paused while the PRO X is off
         self.assertIs(win.pages[1][3], mic.return_value.mini)  # the sidebar's Microphone row shows its meter
 
     def test_closing_the_window_stops_the_headphones_pages_poll(self):
