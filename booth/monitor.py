@@ -34,6 +34,7 @@ NOT_RUNNING = "not running: Booth tries again within a minute"
 BACKOFF_S = 60
 _LOCK = threading.Lock()  # the page's switch and the 10 s tick may sync at once
 _STARTED = {}  # (Booth Mic's object.serial, the PRO X sink's) → when sync last started the unit for them
+LAST = None  # sync()'s latest result, None before the first
 
 
 def path():
@@ -55,38 +56,52 @@ def _serial(node):
     return node["info"]["props"].get("object.serial", node["id"])
 
 
-def sync(settings, run=service.run, dump=voice._dump, file=None, clock=time.monotonic):
+def sync(*args, **kwargs):
+    """_sync(), its result kept in LAST for the page's poll: a heal tick's result shows on the switch's row too."""
+    global LAST
+    with _LOCK:
+        LAST = _sync(*args, **kwargs)
+        return LAST
+
+
+def problem(said):
+    """A sync() result → what the switch's row must say, or None when it is on or off as switched."""
+    if said in (None, "on", "off"):
+        return None
+    return f"Set, but {said}" if said.startswith("not ") else said
+
+
+def _sync(settings, run=service.run, dump=voice._dump, file=None, clock=time.monotonic):
     """The switch (settings["voice"]["monitor"]) → the unit. Off: stopped, then its config removed (ExecCondition: then
     nothing can start it); a failed stop keeps the config, so the next call stops it again. On: the config for the PRO X
     sink found now, started (restart) when it is new, or when the loopback isn't in PipeWire, Booth Mic is, and it wasn't
     started for these same nodes in the last BACKOFF_S. Nothing without the PRO X sink in pw-dump. Returns what it did:
     "on", "off", NO_PROX, NO_MIC, or "not …"."""
     file = file or path()
-    with _LOCK:
-        if (settings.get("voice") or {}).get("monitor") is not True:
-            if not file.exists():
-                return "off"
-            if not run(STOP):
-                return f"not stopped: see systemctl --user status {UNIT}"
-            voice._put_back(file, None)
+    if (settings.get("voice") or {}).get("monitor") is not True:
+        if not file.exists():
             return "off"
-        now = dump()
-        sink = devices.find_sink(devices.parse_sinks(now)[0])
-        if sink is None:  # unplugged, or pw-dump failed: the running loopback (if any) is left to its own end
-            return NO_PROX
-        cfg = json.loads(build(sink))
-        changed = cfg != voice._load(file)
-        if changed and (said := voice._save(cfg, file)):
-            return said
-        mic = voice._node(now, voice.NODE)
-        if mic is None:
-            return NO_MIC
-        up = voice._node_id(now, CAPTURE) is not None and voice._node_id(now, PLAYBACK) is not None
-        if up and not changed:
-            return "on"
-        key = (_serial(mic), _serial(voice._node(now, sink)))
-        if not changed and key in _STARTED and clock() - _STARTED[key] < BACKOFF_S:
-            return NOT_RUNNING
-        _STARTED.clear()
-        _STARTED[key] = clock()
-        return "on" if run(RESTART) else f"not started: see systemctl --user status {UNIT}"
+        if not run(STOP):
+            return f"not stopped: see systemctl --user status {UNIT}"
+        voice._put_back(file, None)
+        return "off"
+    now = dump()
+    sink = devices.find_sink(devices.parse_sinks(now)[0])
+    if sink is None:  # unplugged, or pw-dump failed: the running loopback (if any) is left to its own end
+        return NO_PROX
+    cfg = json.loads(build(sink))
+    changed = cfg != voice._load(file)
+    if changed and (said := voice._save(cfg, file)):
+        return said
+    mic = voice._node(now, voice.NODE)
+    if mic is None:
+        return NO_MIC
+    up = voice._node_id(now, CAPTURE) is not None and voice._node_id(now, PLAYBACK) is not None
+    if up and not changed:
+        return "on"
+    key = (_serial(mic), _serial(voice._node(now, sink)))
+    if not changed and key in _STARTED and clock() - _STARTED[key] < BACKOFF_S:
+        return NOT_RUNNING
+    _STARTED.clear()
+    _STARTED[key] = clock()
+    return "on" if run(RESTART) else f"not started: see systemctl --user status {UNIT}"

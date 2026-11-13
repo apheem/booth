@@ -137,7 +137,7 @@ monitor_arg=$(printf '%s' "$config/booth/monitor.conf" | sed -e 's/[\\"]/\\&/g' 
 cat > "$units/booth-monitor.service.new" <<EOF
 [Unit]
 Description=Booth: hear Booth Mic in the PRO X headset (a PipeWire loopback)
-After=pipewire.service booth-voice.service
+After=pipewire.service
 BindsTo=pipewire.service
 
 [Service]

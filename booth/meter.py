@@ -34,11 +34,11 @@ def zone():
     return position(ZONE[0]), position(ZONE[1])
 
 
-def label(db):
-    """The accessible label, e.g. "Input level −12 dB"."""
+def label(name, db):
+    """A meter's accessible label: its name and the dB value, e.g. "Before processing: −12 dB"."""
     if db is None or math.isnan(db) or db <= FLOOR:
-        return "Input level silent"
-    return f"Input level {round(db)} dB".replace("-", "−")
+        return f"{name}: silent"
+    return f"{name}: {round(db)} dB".replace("-", "−")
 
 
 def pick(structure, channel):

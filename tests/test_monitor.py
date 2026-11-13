@@ -129,6 +129,28 @@ class Sync(unittest.TestCase):
         self.assertEqual(self.sync(), "on")
         self.assertEqual(self.ran, [RESTART, RESTART])
 
+    def test_a_replugged_dongle_same_sink_name_new_serial_is_started_again_at_once(self):
+        self.sync()
+        objects = json.loads(dump(MIC))
+        for o in objects:
+            if o["id"] == 33:  # the PRO X sink, back under its old name: the loopback went with the old one
+                o["info"]["props"]["object.serial"] = 7333
+        self.now, self.t = json.dumps(objects), 1.0
+        self.assertEqual(self.sync(), "on")
+        self.assertEqual(self.ran, [RESTART, RESTART])
+
+    def test_half_a_loopback_is_not_up_and_is_restarted(self):
+        self.sync()
+        for i, half in enumerate(MONITOR):
+            self.now, self.t = dump(MIC, half), (i + 1) * monitor.BACKOFF_S
+            self.assertEqual(self.sync(), "on")
+            self.assertEqual(self.ran, [RESTART] * (i + 2))
+
+    def test_each_result_is_kept_for_the_pages_poll(self):
+        self.now = dump()
+        self.assertEqual((self.sync(), monitor.LAST), (monitor.NO_MIC, monitor.NO_MIC))
+        self.assertEqual((self.sync(OFF), monitor.LAST), ("off", "off"))
+
     def test_a_loopback_that_wont_stay_up_is_restarted_at_most_once_a_minute(self):
         self.sync()
         self.t = monitor.BACKOFF_S - 1

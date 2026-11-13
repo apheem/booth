@@ -292,10 +292,12 @@ class Install(unittest.TestCase):
         self.assertIn(f'ExecStart=/usr/bin/pipewire -c "{conf}"', unit)
         self.assertIn(f'ExecCondition=/usr/bin/test -f "{conf}"', unit)  # switched off: its config is gone, never starts
         self.assertIn("BindsTo=pipewire.service", unit)
-        self.assertIn("After=pipewire.service booth-voice.service", unit)
+        self.assertIn("After=pipewire.service", unit)
         self.assertIn("Restart=on-failure", unit)
-        for word in ("BindsTo=booth", "Requires=", "Wants=", "PartOf=", "[Install]"):  # never starts or stops Booth Mic
-            self.assertNotIn(word, text)
+        # never starts, stops or waits on another Booth unit: none is named on any line, whatever the directive
+        self.assertEqual([ln for ln in unit if any(u in ln for u in ("booth-voice", "booth-mic-select", "booth.service"))],
+                         [])
+        self.assertNotIn("[Install]", text)
         self.assertNotIn("booth-monitor", self.calls.read_text())  # never enabled or started by the install
 
     def test_booth_mic_is_set_up_by_the_installed_copy_never_the_repo(self):

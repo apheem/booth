@@ -104,7 +104,11 @@ class _W:
 
 
 class _Meter(_W):
-    """A LevelMeter stand-in: what it was last told to show."""
+    """A LevelMeter stand-in: its name, and what it was last told to show."""
+
+    def __init__(self, name, *_args, **_kwargs):
+        super().__init__()
+        self.name = name
 
     def set_level(self, peak, decay):
         self.level, self.said = (peak, decay), None
@@ -148,6 +152,7 @@ class PageCase(unittest.TestCase):
         self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
         self.monitored, self.monitor_said = [], "on"  # every monitor.sync's switch; what it returns
+        self.labels = []  # every Gtk.Label the page made, as {its keyword arguments}
 
         real_send = scarlett.send
 
@@ -165,7 +170,7 @@ class PageCase(unittest.TestCase):
                                                         SpinRow=_W, ExpanderRow=_W, AlertDialog=dialog,
                                                         ResponseAppearance=ns(DESTRUCTIVE=2))),
                 mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295,
-                                                        Box=_W, Label=_W,
+                                                        Box=_W, Label=lambda **kw: self.labels.append(kw),
                                                         Adjustment=ns(new=lambda value, lower, upper, *_: dict(
                                                             value=value, lower=lower, upper=upper)))),
                 mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
@@ -182,6 +187,7 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "loaded", lambda: self.found, create=True),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst),
+                mock.patch.object(microphone.monitor, "LAST", None, create=True),  # no sync yet this run
                 mock.patch.object(microphone.monitor, "sync",
                                   lambda settings: self.monitored.append(dict(settings["voice"])) or self.monitor_said)):
             patch.start()
@@ -615,6 +621,14 @@ class Meters(PageCase):
         self.page.root_.emit("notify::suspended", None)
         self.assertFalse(self.gst.wants[-1][1])
 
+    def test_each_bar_names_itself_and_is_labelled_by_its_visible_label(self):
+        p = self.page
+        self.assertEqual((p.bar.name, p.after.name, p.mini.name),
+                         ("Before processing", "After processing (Booth Mic)", "Input level"))
+        # mnemonic_widget: GTK sets the bar's LABELLED_BY relation to the label
+        self.assertEqual([(kw["label"], kw["mnemonic_widget"]) for kw in self.labels],
+                         [("Before", p.bar), ("After", p.after)])
+
     def test_a_failure_says_so_on_both_meters(self):
         self.page.meter.failed(meter.UNAVAILABLE)
         self.assertEqual([m.said for m in self.meters], [meter.UNAVAILABLE] * 2)
@@ -645,6 +659,12 @@ class AfterMeter(PageCase):
         self.assertEqual(self.gst.wants[-1], (microphone.AFTER, True))
         self.map(self.page, False)
         self.assertEqual(self.gst.wants[-1], (microphone.AFTER, False))
+
+    def test_mapping_the_page_before_the_first_poll_never_opens_booth_mic(self):
+        self.map(self.page)  # Booth Mic not yet known to be running
+        self.assertEqual(self.gst.wants[-1], (None, True))
+        self.show(state())
+        self.assertEqual(self.gst.wants[-1], (microphone.AFTER, True))
 
     def test_the_sidebar_meter_alone_never_opens_booth_mic(self):
         self.show(state())
@@ -720,6 +740,42 @@ class Monitoring(PageCase):
             self.click(self.page.monitoring, True)
         self.assertEqual(self.page.monitoring.subtitle, "Set, but not saved: No space left on device")
         self.assertEqual(self.monitored, [{"monitor": True}])
+        self.show(state())  # a poll keeps the note
+        self.assertEqual(self.page.monitoring.subtitle, "Set, but not saved: No space left on device")
+        self.click(self.page.monitoring, False)  # saved this time
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)
+
+    def test_waiting_for_the_pro_x_or_booth_mic_is_said_on_the_row(self):
+        for said in (monitor.NO_PROX, monitor.NO_MIC):
+            self.monitor_said = said
+            self.click(self.page.monitoring, not self.page.monitoring.active)
+            self.assertEqual(self.page.monitoring.subtitle, said)
+
+    def test_each_poll_shows_monitorings_latest_state(self):
+        self.monitor_said = "not started: see systemctl --user status booth-monitor.service"
+        self.click(self.page.monitoring, True)
+        for last, subtitle in ((monitor.NO_PROX, monitor.NO_PROX), (monitor.NOT_RUNNING, f"Set, but {monitor.NOT_RUNNING}"),
+                               ("on", monitor.LABEL), (monitor.NO_MIC, monitor.NO_MIC), ("off", monitor.LABEL)):
+            with mock.patch.object(monitor, "LAST", last):  # what a heal tick's sync found since
+                self.show(state())
+            self.assertEqual(self.page.monitoring.subtitle, subtitle)
+
+    def test_sync_runs_on_a_worker_thread_and_the_row_changes_only_on_the_main_loop(self):
+        threads, idle = [], []
+        self.monitor_said = monitor.NO_PROX
+        self.page.monitoring.subtitle = "Set, but not started: see systemctl --user status booth-monitor.service"
+        with mock.patch.object(microphone.threading, "Thread",
+                               lambda target, daemon: types.SimpleNamespace(start=lambda: threads.append(target))), \
+                mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            self.click(self.page.monitoring, True)
+            self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)  # the click clears an old note at once
+            self.assertEqual((len(threads), self.monitored), (1, []))  # handed to a thread, never run inline
+            threads.pop()()
+        self.assertEqual(self.monitored, [{"monitor": True}])
+        self.assertEqual(self.page.monitoring.subtitle, monitor.LABEL)  # the worker never touched the row
+        for f, a in idle:  # the main loop
+            f(*a)
+        self.assertEqual(self.page.monitoring.subtitle, monitor.NO_PROX)
 
 
 class WindowClose(unittest.TestCase):

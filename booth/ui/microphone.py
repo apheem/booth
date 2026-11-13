@@ -66,16 +66,18 @@ class MicrophonePage(Adw.PreferencesPage):
         for row in self.rows.values():
             row.set_sensitive(False)  # until the first poll finds the Scarlett
         self.levels = Adw.PreferencesGroup(title="Input Level", description=meter.COACHING)
-        self.bar, self.mini, self.after = LevelMeter(24), LevelMeter(6, margin_top=4), LevelMeter(24)
+        self.bar, self.after = LevelMeter("Before processing", 24), LevelMeter("After processing (Booth Mic)", 24)
+        self.mini = LevelMeter("Input level", 6, margin_top=4)
         for title, bar in (("Before", self.bar), ("After", self.after)):
             line = Gtk.Box(spacing=12, margin_top=6)
-            line.append(Gtk.Label(label=title, xalign=0, width_chars=6))
+            # mnemonic_widget: GTK makes the label the bar's LABELLED_BY (PyGObject 3.48 can't pass update_relation a list)
+            line.append(Gtk.Label(label=title, xalign=0, width_chars=6, mnemonic_widget=bar))
             line.append(bar)
             self.levels.add(line)
         self.meter = meter.Meter(self.on_level, self.on_meter_failed)
         self.after_meter = meter.Meter(self.after.set_level, self.after.idle)
-        self.after_record = AFTER
-        self.record, self.root = None, None
+        self.after_record = None  # until a poll finds Booth Mic running: mapping the page never opens it before
+        self.record, self.root, self.monitor_unsaved = None, None, ""
         for widget in (self, self.mini):
             widget.connect("map", self.on_map)
             widget.connect("unmap", self.meter_update)
@@ -171,6 +173,7 @@ class MicrophonePage(Adw.PreferencesPage):
             self.after.idle(voice.STOPPED)
         self.meter_update()
         self.voice.set_description(voice.describe(state, selecting, said, running))
+        self.show_monitoring(monitor.LAST)  # the latest sync, the switch's or a heal tick's
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
             ctrls = state["ctrls"] if state else {}
@@ -269,15 +272,19 @@ class MicrophonePage(Adw.PreferencesPage):
         self.settings["voice"]["monitor"] = row.get_active()
         try:
             store.save(self.settings)
-            row.set_subtitle(monitor.LABEL)
+            self.monitor_unsaved = ""
         except OSError as e:  # applied anyway: the user must know it won't last
-            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
+            self.monitor_unsaved = f"Set, but not saved: {e.strerror or e}"
+        self.show_monitoring(None)
 
         def sync():
             said = monitor.sync(self.settings)
-            if said.startswith("not "):
-                GLib.idle_add(row.set_subtitle, f"Set, but {said}")
+            GLib.idle_add(self.show_monitoring, said)
         threading.Thread(target=sync, daemon=True).start()
+
+    def show_monitoring(self, said):
+        """What isn't as switched (waiting, not started…) first, then a save that failed, else the label."""
+        self.monitoring.set_subtitle(monitor.problem(said) or self.monitor_unsaved or monitor.LABEL)
 
     def on_input(self, row, _param):
         self.settings["microphone"]["input"] = list(scarlett.INPUTS)[row.get_selected()]
