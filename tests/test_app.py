@@ -375,7 +375,7 @@ class BackgroundLaunch(unittest.TestCase):
             threads[0]()
             with self.assertRaises(OSError):  # Booth Mic's heal failed: Booth Stereo is still looked after
                 threads[1]()
-        self.assertEqual(sync.call_args_list, [mock.call(stub.settings)] * 2)
+        self.assertEqual(sync.call_args_list, [mock.call(stub.settings, notify=stub.stereo_switched)] * 2)
         self.assertFalse(stub.healing)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
@@ -697,6 +697,16 @@ class HeadsetBattery(unittest.TestCase):
         self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
         notification.new.assert_called_once_with("Sound routing set, but not saved: No space left on device")
         stub.send_notification.assert_called_once_with("routing-unsaved", notification.new.return_value)
+
+    def test_booth_stereos_notice_is_sent_on_the_main_loop_under_its_own_id(self):  # #19: from sync's worker
+        with mock.patch.object(app.Gio, "Notification") as notification, \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: f(*a)):
+            stub = mock.Mock()
+            app.Application.stereo_switched(stub, "Booth Stereo switched computer sound to X — a recording on it "
+                                                  "restarted")
+        notification.new.assert_called_once_with("Booth Stereo switched computer sound to X — a recording on it "
+                                                  "restarted")
+        stub.send_notification.assert_called_once_with("booth-stereo", notification.new.return_value)
 
     def test_the_low_battery_notification_says_the_estimate(self):
         with mock.patch.object(app.Gio, "Notification") as notification:

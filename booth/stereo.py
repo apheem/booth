@@ -22,7 +22,10 @@ while Booth Mic is muted (NOTE says so); its own master follows only the Voice p
 mic: Booth never makes it one, and its priority is below any mic's.
 Its pre-start (`--write`) writes stereo.conf from the saved settings, the source found then and the plugins verified
 then, as booth-voice's does, so a plugin changed since is never loaded. sync() runs on every heal tick and every voice
-change: a knob or preset is set live on its chain too (voice.set_live on booth.stereo.voice, read back), never a restart.
+change; a knob tick (the voice throttle) runs live() only: its values set on booth.stereo.voice (voice.set_live, read
+back), never a shape or restart decision. A side or source is taken as saved, as the pre-start does, so one that didn't
+save never restarts it. Computer sound following a new default output (#12) restarts it, and a recording on it: said
+once (notify); WirePlumber 0.4.17 won't move a dont-reconnect stream live.
     python3 -m booth.stereo --write [stereo.conf [plugins folder]]   booth-stereo.service's ExecStartPre"""
 import json
 import sys
@@ -38,8 +41,10 @@ NODE, SINK, VOICE, OTHER = "booth_stereo", "booth.stereo.input", "booth.stereo.v
 DESCRIPTION = "Booth Stereo (for recording)"
 SCARLETT, COMPUTER = "scarlett", "computer"  # the other side's choices besides a source's node name
 SIDES = {"L": ("FL", "Left"), "R": ("FR", "Right")}  # settings voice "stereo_side", the voice's: position, name
+STEREO = ("stereo_side", "stereo_source")
 NOTE = ("For recording apps, not calls: Booth Stereo carries your voice even while Booth Mic is muted, and its other "
-        "side may carry the computer's sound")
+        "side may carry the computer's sound. With Computer sound, a new default output is followed and a recording on "
+        "it restarts")
 NO_MIC = "Waiting for Booth Mic"
 NOT_RUNNING = "not running: Booth tries again within a minute"
 BACKOFF_S = 60
@@ -109,15 +114,19 @@ def _find(choice, settings, dump, read):
             return None, "the Scarlett isn't connected"
         name = next(k for k in scarlett.INPUTS if k != mic)
         channel = scarlett.routing(state["ctrls"]).get(name)
-        if channel is None or channel == (state["mic"] or {}).get("channel") or channel > len(positions):
+        if channel is None:
             return None, f"the Scarlett's {name} input isn't routed to a capture channel"
-        position = positions[channel - 1]
+        if channel == (state["mic"] or {}).get("channel"):  # never the mic's raw channel: the voice in both ears
+            return None, f"the Scarlett's {name} input is on the mic's capture channel"
+        position = positions[channel - 1] if channel <= len(positions) else ""
+        if not position:
+            return None, f"the Scarlett's {name} input is on capture channel {channel}, which its PipeWire source lacks"
         return {"node": node, "position": position}, f"the Scarlett's {name} input, capture channel {channel} ({position})"
     if choice == COMPUTER:  # the default output's monitor, by name now: it follows the output the user picks
         sink = _configured_sink(dump)
         if sink is None:
             return None, "no default output is set"
-        if sink not in devices.parse_sinks(dump)[0] or _own(sink):
+        if sink not in devices.parse_sinks(dump)[0]:  # Audio/Sink only: never one of Booth's (…/Internal)
             return None, "the default output isn't connected"
         props = voice._node(dump, sink)["info"]["props"]
         return {"node": sink, "sink": True}, f"the computer's sound ({props.get('node.description') or sink})"
@@ -195,6 +204,16 @@ def _without_other(cfg):
         return None
 
 
+def _computer(cfg):
+    """The output whose sound a config's other side takes (computer sound), or None; any JSON on disk."""
+    try:
+        return next((c["target.object"] for m in cfg["context.modules"]
+                     if (c := (m.get("args") or {}).get("capture.props") or {}).get("node.name") == OTHER
+                     and c.get("stream.capture.sink")), None)
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
 def _live(cfg, now, run, dump):
     """The chain's controls set live on booth.stereo.voice when it doesn't run them already → None, or what failed."""
     have = voice._live_params(now, VOICE)
@@ -213,18 +232,32 @@ def sync(*args, **kwargs):
         return LAST
 
 
-def _sync(settings, read=scarlett.read, run=service.run, dump=voice._dump, file=None, clock=time.monotonic):
+def live(settings, run=service.run, dump=voice._dump):
+    """A knob, switch or preset (the voice throttle's): only the chain's values, set live on booth.stereo.voice and read
+    back; never a shape or restart decision (sync's: the heal tick, a side or source change). → LAST, or "not …"."""
+    with _LOCK:
+        cfg = json.loads(build(settings, voice.verified(), None))  # a plugin that doesn't verify now: its stage dry
+        missed = voice.set_live(cfg, run, dump, VOICE)  # None: not running, the heal tick starts it
+        return f"not applied: Booth Stereo didn't take {', '.join(missed)}" if missed else LAST
+
+
+def _sync(settings, read=scarlett.read, run=service.run, dump=voice._dump, file=None, clock=time.monotonic,
+          saved=store.load, notify=lambda _text: None):
     """The settings and the desk now → Booth Stereo. Running as wanted: new knob values set live, else nothing. A new
     side, source or chain shape, or not running while Booth Mic's input is there: its unit restarted (its pre-start
     writes the config), at once for a new config or a new booth.mic.input, else at most once in BACKOFF_S. Its other
     side gone (WirePlumber removed that loopback with its source) is what is wanted: silent, no restart. Returns the
-    other side's text (target()), NO_MIC, NOT_RUNNING or "not …"."""
+    other side's text (target()), NO_MIC, NOT_RUNNING or "not …". The side and source are `saved`'s (the pre-start's):
+    one that didn't save is never chased by a restart a minute; computer sound moved to a new output is `notify`d."""
     global SOURCES
     file = file or path()
     now = dump()
     mic = voice._node(now, voice.INPUT)
     if mic is None:  # Booth Mic not running, or pw-dump failed: no voice to take
         return NO_MIC
+    disk = _v(saved())
+    settings = dict(settings, voice=dict({k: v for k, v in _v(settings).items() if k not in STEREO},
+                                         **{k: disk[k] for k in STEREO if k in disk}))
     SOURCES = sources(now)
     other, said = target(settings, now, read)
     found = voice.verified()
@@ -244,9 +277,16 @@ def _sync(settings, read=scarlett.read, run=service.run, dump=voice._dump, file=
     key = (json.dumps(voice.shape(cfg), sort_keys=True), mic["info"]["props"].get("object.serial", mic["id"]))
     if key in _STARTED and clock() - _STARTED[key] < BACKOFF_S:
         return NOT_RUNNING
+    was = _computer(voice._load(file)) if voice._node_id(now, NODE) is not None else None  # the output it took
     _STARTED.clear()
     _STARTED[key] = clock()
-    return said if run(RESTART) else f"not started: see systemctl --user status {UNIT}"
+    if not run(RESTART):
+        return f"not started: see systemctl --user status {UNIT}"
+    if other and other.get("sink") and was not in (None, other["node"]):  # a new default output: a recording restarted
+        sink = voice._node(now, other["node"])["info"]["props"]
+        notify(f"Booth Stereo switched computer sound to {sink.get('node.description') or other['node']} — a recording "
+               "on it restarted")
+    return said
 
 
 def write(file=None, where=None):

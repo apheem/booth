@@ -21,8 +21,8 @@ saved and handed to monitor.sync off the main loop.
 
 Then Booth Stereo (booth.stereo, #19): the voice's side, the other side's source (the dropdown lists what the last
 stereo.sync found, and a saved source that is away stays chosen) and the privacy note. A change is saved and handed to
-stereo.sync off the main loop, which restarts only Booth Stereo; every voice change is synced to it too (its own chain,
-live)."""
+stereo.sync off the main loop, which restarts only Booth Stereo; every voice change reaches it too (stereo.live: its own
+chain's values, live; its shape is the heal tick's)."""
 import functools
 import threading
 import types
@@ -444,7 +444,7 @@ class MicrophonePage(Adw.PreferencesPage):
         row, said = self.voice_row, voice.apply(self.settings, None)
         if said.startswith("not "):  # not recorded: the next poll's apply tries again
             GLib.idle_add(row.set_subtitle, f"Set, but {said}")
-        GLib.idle_add(self.show_stereo, stereo.sync(self.settings))  # Booth Stereo's own chain, live too
+        GLib.idle_add(self.show_stereo, stereo.live(self.settings))  # Booth Stereo's own chain, its values only
 
     def spawn(self, make, done):
         threading.Thread(target=lambda: self.write(make, done), daemon=True).start()

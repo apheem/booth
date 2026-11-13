@@ -37,10 +37,10 @@ UP = (node(140, "booth.stereo.input", 940, "Audio/Sink/Internal"),
 OTHER_UP = (node(144, "booth.stereo.other", 944), node(145, "booth.stereo.other.out", 945, "Stream/Output/Audio/Internal"))
 
 
-def dump(*extra, props=None):
-    """The captured pw-dump (Scarlett, BRIO, PRO X, a USB card) plus `extra` nodes; `props`: booth.stereo.voice's
-    Props {node:control: value}, as a filter-chain reports them."""
-    objects = json.loads(DUMP) + [json.loads(json.dumps(o)) for o in extra]
+def dump(*extra, props=None, base=DUMP):
+    """The captured pw-dump (Scarlett, BRIO, PRO X, a USB card; or `base`) plus `extra` nodes; `props`:
+    booth.stereo.voice's Props {node:control: value}, as a filter-chain reports them."""
+    objects = json.loads(base) + [json.loads(json.dumps(o)) for o in extra]
     for o in objects:
         if props is not None and ((o.get("info") or {}).get("props") or {}).get("node.name") == stereo.VOICE:
             o["info"]["params"] = {"Props": [{"volume": 1.0}, {"params": [x for p in props.items() for x in p]}]}
@@ -199,8 +199,6 @@ class Target(unittest.TestCase):
                               (settings("R", BRIO), gone, f"Left: silent, {BRIO} isn't connected"),
                               (settings(source="booth_mic"), dump(BOOTH_MIC), "Right: silent, booth_mic isn't connected"),
                               (settings(source="booth_stereo"), dump(*UP), "Right: silent, booth_stereo isn't connected"),
-                              (settings(source="computer"), configured("booth.stereo.input"),  # Booth's own: never
-                               "Right: silent, the default output isn't connected"),
                               (settings(source="computer"), configured("alsa_output.gone"),
                                "Right: silent, the default output isn't connected")):
             with self.subTest(said=said):
@@ -214,6 +212,28 @@ class Target(unittest.TestCase):
         self.state = {"ctrls": ctrls, "mic": scarlett.mic(ctrls, DUMP, "XLR")}
         self.assertEqual(self.target(settings()),
                          (None, "Right: silent, the Scarlett's Instrument input isn't routed to a capture channel"))
+
+    def test_the_scarletts_other_input_on_the_mics_channel_leaves_its_side_silent_never_the_voice_twice(self):  # #4
+        self.state = {"ctrls": CTRLS, "mic": dict(self.state["mic"], channel=1)}  # the Instrument's channel
+        self.assertEqual(self.target(settings()),
+                         (None, "Right: silent, the Scarlett's Instrument input is on the mic's capture channel"))
+
+    def test_a_channel_its_pipewire_source_lacks_leaves_its_side_silent_never_raises(self):  # #5: heal tick, throttle
+        ctrls = json.loads(json.dumps(CTRLS))
+        ctrls["PCM 01 Capture Enum"]["values"], ctrls["PCM 03 Capture Enum"]["values"] = [0], [1]  # Instrument on 3
+        objects = json.loads(DUMP)
+        scarlett_in = next(o["info"]["props"] for o in objects
+                           if ((o.get("info") or {}).get("props") or {}).get("node.name") == SCARLETT_IN)
+        scarlett_in["audio.position"] = "FL,FR"  # a 2-channel profile
+        self.state = {"ctrls": ctrls, "mic": scarlett.mic(ctrls, json.dumps(objects), "XLR")}
+        self.assertEqual(self.target(settings(), json.dumps(objects)),
+                         (None, "Right: silent, the Scarlett's Instrument input is on capture channel 3, which its "
+                                "PipeWire source lacks"))
+        del scarlett_in["audio.position"]  # no positions at all
+        self.state = {"ctrls": CTRLS, "mic": scarlett.mic(CTRLS, json.dumps(objects), "XLR")}
+        self.assertEqual(self.target(settings(), json.dumps(objects)),
+                         (None, "Right: silent, the Scarlett's Instrument input is on capture channel 1, which its "
+                                "PipeWire source lacks"))
 
     def test_a_discovered_device_is_taken_by_name(self):
         self.assertEqual(self.target(settings("R", BRIO)),
@@ -235,6 +255,7 @@ class Sync(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.file = Path(tmp.name) / "stereo.conf"
         self.ran, self.ok, self.t, self.props, self.other = [], True, 0.0, None, ()
+        self.gone, self.disk, self.notes, self.base = (), None, [], DUMP  # nodes gone; the saved settings; notices
         self.mic = MIC_INPUT
         self.state = {"ctrls": CTRLS, "mic": scarlett.mic(CTRLS, DUMP, "XLR")}
         self.found = dict(FOUND)
@@ -251,16 +272,21 @@ class Sync(unittest.TestCase):
 
     def dump_(self):
         if self.mic is None:
-            return dump()
-        return dump(self.mic) if self.props is None else dump(self.mic, *UP, *self.other, props=self.props)
+            return dump(base=self.base)
+        if self.props is None:
+            return dump(self.mic, base=self.base)
+        up = [n for n in UP if n["info"]["props"]["node.name"] not in self.gone]
+        return dump(self.mic, *up, *self.other, props=self.props, base=self.base)
 
     def sync(self, s=None):
-        return stereo.sync(s or settings(), lambda _c: self.state, self.run_, self.dump_, self.file, lambda: self.t)
+        s = s or settings()
+        return stereo.sync(s, lambda _c: self.state, self.run_, self.dump_, self.file, lambda: self.t,
+                           saved=lambda: self.disk or s, notify=self.notes.append)
 
     def up(self, s=None):
         """Booth Stereo started as its pre-start writes it: its nodes up, its chain's Props what it loaded."""
         s = s or settings()
-        other = stereo.target(s, DUMP, lambda _c: self.state)[0]
+        other = stereo.target(s, self.base, lambda _c: self.state)[0]
         self.file.write_text(stereo.build(s, self.found, other))
         self.other = OTHER_UP if other else ()
         self.props = {f"{n['name']}:{k}": v for n in graph(self.file.read_text())["nodes"]
@@ -286,6 +312,75 @@ class Sync(unittest.TestCase):
             self.assertEqual(self.ran[-1], RESTART)
             self.up(s)
         self.assertEqual(self.ran, [RESTART] * 3)
+        self.assertEqual(self.notes, [])  # the user's own change: no notice
+
+    def test_left_right_left_within_the_backoff_restarts_at_each_change(self):  # #2
+        self.sync()
+        self.up()
+        for s in (settings("R"), settings("L")):
+            self.t += 1
+            self.sync(s)
+            self.up(s)
+        self.assertEqual(self.ran, [RESTART] * 3)
+
+    def test_booth_stereo_up_without_its_voice_is_restarted_never_left_one_sided(self):  # #1
+        self.up()
+        self.gone = (stereo.VOICE,)  # booth-voice restarted: booth.stereo.voice went with the old booth.mic.input
+        self.assertEqual(self.sync(), "Right: the Scarlett's Instrument input, capture channel 1 (FL)")
+        self.assertEqual(self.ran, [RESTART])
+
+    def test_its_voice_gone_between_the_dump_and_the_live_set_says_not_applied(self):  # #3
+        self.up()
+        real = self.dump_
+
+        def dump_():
+            text, self.gone = real(), (stereo.VOICE,)
+            return text
+        self.dump_ = dump_
+        self.assertEqual(self.sync(settings(tone_air=-6.0)), "not applied: Booth Stereo didn't take the change")
+        self.assertEqual(self.ran, [])
+
+    def test_a_side_or_source_that_wasnt_saved_never_restarts_it_the_next_save_does(self):  # #7
+        self.up()
+        self.disk = settings()  # the save of R failed: its pre-start would still build L, so a restart is a loop
+        self.assertEqual(self.sync(settings("R")), "Right: the Scarlett's Instrument input, capture channel 1 (FL)")
+        self.t += stereo.BACKOFF_S
+        self.sync(settings("R"))
+        self.assertEqual(self.ran, [])  # the running config is kept
+        self.disk = None  # saved now
+        self.sync(settings("R"))
+        self.assertEqual(self.ran, [RESTART])
+
+    def test_computer_sound_on_a_new_default_output_restarts_it_and_says_so_once(self):  # #8
+        s = settings(source="computer")
+        self.up(s)
+        self.base = configured(USB_OUT)  # #12 or the user moved the default output
+        self.ok = False
+        self.sync(s)
+        self.assertEqual(self.notes, [])  # not restarted: nothing to say
+        self.ok, self.t = True, stereo.BACKOFF_S
+        self.sync(s)
+        self.assertEqual(self.notes, ["Booth Stereo switched computer sound to USB Audio Digital Stereo (IEC958) — a "
+                                      "recording on it restarted"])
+        self.up(s)
+        self.sync(s)
+        self.assertEqual((self.ran, len(self.notes)), ([RESTART] * 2, 1))  # once
+        self.props, self.base, self.t = None, DUMP, self.t + stereo.BACKOFF_S  # not running: no recording on it
+        self.sync(s)
+        self.assertEqual((self.ran[-1], len(self.notes)), (RESTART, 1))
+
+    def test_a_knob_tick_only_sets_its_chains_values_live_never_a_shape_or_restart_decision(self):  # #10
+        self.up()
+        s = settings("R", tone_air=-6.0)  # a side change waiting too: sync's, never the throttle's
+        with mock.patch.object(stereo, "LAST", "Right: x"):
+            self.assertEqual(stereo.live(s, self.run_, self.dump_), "Right: x")
+            self.assertEqual({tuple(c[:3]) for c in self.ran}, {("pw-cli", "set-param", "142")})
+            self.assertEqual(self.props["tone_air:Gain"], -6.0)
+            self.ok = False
+            self.assertEqual(stereo.live(settings(tone_air=3.0), self.run_, self.dump_),
+                             "not applied: Booth Stereo didn't take tone_air:Gain")
+            self.assertEqual(stereo.LAST, "Right: x")
+        self.assertNotIn(RESTART, self.ran)
 
     def test_a_preset_or_knob_change_goes_live_on_booth_stereos_own_chain_readback_verified(self):
         self.up()
@@ -385,6 +480,7 @@ class Note(unittest.TestCase):
         self.assertIn("even while Booth Mic is muted", stereo.NOTE)
         self.assertIn("computer's sound", stereo.NOTE)
         self.assertIn("recording apps, not calls", stereo.NOTE)
+        self.assertIn("a recording on it restarts", stereo.NOTE)  # #8: computer sound following a new output
 
 
 if __name__ == "__main__":

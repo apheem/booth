@@ -156,7 +156,7 @@ class PageCase(unittest.TestCase):
         self.monitor_on = []  # every monitor.sync's `on`: the PRO X headset's HeadsetMonitor.on
         self.headset = types.SimpleNamespace(on=True)
         self.labels = []  # every Gtk.Label the page made, as {its keyword arguments}
-        self.stereo_synced, self.stereo_said = [], "Right: the Scarlett's Instrument input, capture channel 1 (FL)"
+        self.stereo_synced, self.stereo_lived, self.stereo_said = [], [], "Right: the Scarlett's Instrument input, capture channel 1 (FL)"
 
         real_send = scarlett.send
 
@@ -199,6 +199,8 @@ class PageCase(unittest.TestCase):
                 # Booth Stereo (#19): every sync's voice settings; what it returns; what it found last
                 mock.patch.object(microphone.stereo, "sync",
                                   lambda settings: self.stereo_synced.append(dict(settings["voice"])) or self.stereo_said),
+                mock.patch.object(microphone.stereo, "live",  # a knob tick's: only its chain's values
+                                  lambda settings: self.stereo_lived.append(dict(settings["voice"])) or self.stereo_said),
                 mock.patch.object(microphone.stereo, "LAST", None),
                 mock.patch.object(microphone.stereo, "SOURCES", [])):
             patch.start()
@@ -997,7 +999,8 @@ class BoothStereo(PageCase):
 
     def test_a_voice_change_reaches_booth_stereos_chain_too(self):  # a knob, a switch or a preset, live on both
         self.page.knobs["tone_air"].row.set_value(1.5)
-        self.assertEqual((self.applied[-1][0], self.stereo_synced), ({"tone_air": 1.5}, [{"tone_air": 1.5}]))
+        self.assertEqual((self.applied[-1][0], self.stereo_lived), ({"tone_air": 1.5}, [{"tone_air": 1.5}]))
+        self.assertEqual(self.stereo_synced, [])  # #10: no shape work (pw-dumps, amixer) on a knob tick
         self.stereo_said = "not applied: Booth Stereo didn't take tone_air:Gain"
         self.page.knobs["tone_air"].row.set_value(2.0)
         self.assertEqual(self.page.other.subtitle, self.stereo_said)

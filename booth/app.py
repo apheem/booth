@@ -200,7 +200,7 @@ class Application(Adw.Application):
         def sync():
             voice.sync(self.settings)
             monitor.sync(self.settings, on=self.headset_monitor.on)
-            stereo.sync(self.settings)
+            stereo.sync(self.settings, notify=self.stereo_switched)
         threading.Thread(target=sync, daemon=True).start()
 
     def watch_mute(self):
@@ -279,9 +279,13 @@ class Application(Adw.Application):
                 monitor.sync(self.settings, on=self.headset_monitor.on)  # paused while the PRO X is off
             finally:
                 try:  # Booth Stereo (#19) back after Booth Mic or its source came back; it follows a new source
-                    stereo.sync(self.settings)
+                    stereo.sync(self.settings, notify=self.stereo_switched)
                 finally:
                     self.healing = False
+
+    def stereo_switched(self, text):
+        """Booth Stereo's notice (computer sound moved to a new output), from sync's worker: on the main loop."""
+        GLib.idle_add(lambda: self.send_notification("booth-stereo", Gio.Notification.new(text)))
 
     def low_battery(self, percent):
         note = Gio.Notification.new("Headset battery low")
