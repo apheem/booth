@@ -1685,7 +1685,15 @@ class Readback(unittest.TestCase):
         said = REAL_APPLY(MUTED, None, **self.chain(drop=lambda cmd, n: "tone_air:Gain" in cmd[4] and n == 1))
         self.assertEqual(said, "live")
         self.assertEqual([c for c in self.ran if "tone_air:Gain" in c[4]].__len__(), 2)
+        # only the missed call goes again: every other one, read back as landed, once
+        self.assertEqual(len(self.ran), len(voice.set_params_cmds(CHAIN_DUMP, config(MUTED))) + 1)
         self.assertEqual(json.loads(self.file.read_text()), config(MUTED))
+
+    def test_a_mute_whose_master_never_lands_is_not_applied_though_the_old_gains_are_close(self):  # #21 cnf59
+        self.props.update(sent(voice.set_params_cmds(CHAIN_DUMP, config(ON))))  # running ON: master Gain 1 is 1.0
+        said = REAL_APPLY(MUTED, None, **self.chain(drop=lambda cmd, n: "master:" in cmd[4]))
+        self.assertEqual(said, "not applied: Booth Mic didn't take master:Gain 1")  # 1.0 stale, never 0.0's
+        self.assertEqual(json.loads(self.file.read_text()), config(ON))  # not recorded
 
     def test_a_value_the_chain_stores_as_a_float32_has_landed(self):  # 0.707 reads back 0.7070000171661377
         f32 = lambda v: struct.unpack("f", struct.pack("f", v))[0]  # noqa: E731
@@ -1705,6 +1713,8 @@ class Throttle(unittest.TestCase):
     def sleep(self, s):
         self.assertGreaterEqual(s, 0)
         self.now += s
+        self.sleeps = getattr(self, "sleeps", 0) + 1  # a worker that never clears `dirty` fails here, never hangs
+        self.assertLess(self.sleeps, 1000, "the worker never stopped")
 
     def send(self):
         self.sent.append((round(self.now, 3), self.value))  # apply() reads the settings when it runs: the latest
@@ -1767,6 +1777,19 @@ class Throttle(unittest.TestCase):
         self.change(2)
         self.run_worker()
         self.assertEqual(self.sent[-1][1], 2)
+
+    def test_a_change_made_while_a_send_raised_still_lands_without_another_change(self):  # #17 aud58
+        def send():
+            self.change(2)  # the knob moved while pw-cli ran, then the send failed
+            raise OSError("pw-cli gone")
+        self.t.send = send
+        self.change(1)
+        with self.assertRaises(OSError):
+            self.run_worker()
+        self.t.send = self.send
+        self.assertEqual(len(self.workers), 1)  # a new worker for it, with no next kick
+        self.run_worker()
+        self.assertEqual(self.sent, [(100.05, 2)])
 
     def test_the_default_gap_is_about_20_a_second(self):
         self.assertEqual(voice.Throttle(self.send, self.workers.append).gap, 0.05)

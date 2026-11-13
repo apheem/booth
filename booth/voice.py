@@ -226,9 +226,11 @@ class Throttle:
                     self.dirty = False
                 self.last = self.clock()
                 self.send()
-        except BaseException:  # a send that raised: the next change starts a new worker
+        except BaseException:  # a send that raised: a change that came meanwhile gets a new worker, else the next one
             with self.lock:
-                self.busy = False
+                again = self.busy = self.dirty
+            if again:
+                self.spawn(self.work)
             raise
 
 
