@@ -19,7 +19,8 @@ def defaults():
     # microphone: {"input": "XLR" or "Instrument", the Scarlett input that is the mic; XLR when absent}. Never 48V.
     # voice: {"enabled": the Voice processing master switch, "rumble": the rumble filter, "noise", "leveling", "limiter":
     #   the plugin stages' switches}, booleans, True when absent; the stages' knobs "noise_strength" and
-    #   "leveling_amount" 0..100 (50 when absent) and "limiter_ceiling" −20..0 dB (−1 when absent), see booth.voice.
+    #   "leveling_amount" 0..100 (50 when absent) and "limiter_ceiling" −20..0 dB (−1 when absent), see booth.voice;
+    #   "monitor": the "Hear processed voice in headphones" switch, False when absent (booth.monitor).
     # routing: {"direct_monitor": the "Turn on Direct Monitor when the PRO X turns off" switch, True when absent}, and
     #   the routing policy's own record next to it, written only by booth.routing: none, or "moved": True with "direct":
     #   Direct Monitor's value before Booth moved output to the Scarlett, put back when the PRO X turns on, or "direct":
@@ -63,7 +64,7 @@ def load(file=None):
         voice = data.get("voice", {})
         if not isinstance(voice, dict) \
                 or not all(isinstance(voice.get(k, True), bool)
-                           for k in ("enabled", "rumble", "noise", "leveling", "limiter")) \
+                           for k in ("enabled", "rumble", "noise", "leveling", "limiter", "monitor")) \
                 or not all(_whole(voice.get(k, 0), 100) for k in ("noise_strength", "leveling_amount")) \
                 or not (type(c := voice.get("limiter_ceiling", -1.0)) in (int, float) and -20 <= c <= 0):  # not NaN
             raise ValueError("not a settings object")

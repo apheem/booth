@@ -329,6 +329,27 @@ class BackgroundLaunch(unittest.TestCase):
             threads[0]()
         sync.assert_called_once_with(stub.settings)
 
+    def test_monitoring_follows_its_switch_at_start_off_the_main_loop_window_or_not(self):
+        threads, stub = [], mock.Mock(settings={"voice": {"monitor": True}})
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync"), mock.patch.object(app.monitor, "sync") as sync:
+            app.Application.sync_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+        sync.assert_called_once_with(stub.settings)
+
+    def test_every_heal_tick_brings_monitoring_back_even_when_booth_mics_heal_fails(self):
+        threads, stub = [], mock.Mock(settings={"voice": {"monitor": True}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "heal", side_effect=OSError("boom")), \
+                mock.patch.object(app.monitor, "sync") as sync:
+            app.Application.heal_voice(stub)
+            with self.assertRaises(OSError):
+                threads[0]()
+        sync.assert_called_once_with(stub.settings)  # a closed window, the background service: every 10 s
+        self.assertFalse(stub.healing)
+
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
         threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
         stub.heal_once = lambda: app.Application.heal_once(stub)

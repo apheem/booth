@@ -130,6 +130,24 @@ Slice=session.slice
 WantedBy=booth-voice.service
 EOF
 mv "$units/booth-mic-select.service.new" "$units/booth-mic-select.service"
+# booth-monitor.service plays Booth Mic in the PRO X headset (booth.monitor's loopback) while the "Hear processed voice"
+# switch is on. Never enabled and nothing in it starts or stops Booth Mic: Booth starts it and stops it, and removes its
+# config when switched off, so ExecCondition keeps it from starting at all.
+monitor_arg=$(printf '%s' "$config/booth/monitor.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+cat > "$units/booth-monitor.service.new" <<EOF
+[Unit]
+Description=Booth: hear Booth Mic in the PRO X headset (a PipeWire loopback)
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+ExecCondition=/usr/bin/test -f "$monitor_arg"
+ExecStart=/usr/bin/pipewire -c "$monitor_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+EOF
+mv "$units/booth-monitor.service.new" "$units/booth-monitor.service"
 # Enabled whatever the Run in Background switch says. booth.voice writes the configs from the Scarlett now and starts
 # them (restarts what changed). The first install then makes Booth Mic the default mic by name: WirePlumber picks it
 # as soon as it appears. None of this stops the install: Booth writes the configs and starts the services each run.
