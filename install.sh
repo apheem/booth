@@ -155,6 +155,9 @@ mv "$units/booth-monitor.service.new" "$units/booth-monitor.service"
 systemctl --user daemon-reload && systemctl --user enable booth-voice.service booth-mic-select.service ||
   echo "install.sh: couldn't enable booth-voice.service (Booth Mic); from your desktop session run: systemctl --user enable --now booth-voice.service booth-mic-select.service" >&2
 PYTHONPATH=$dest python3 -P -m booth.voice || echo "install.sh: couldn't set up Booth Mic (above); Booth tries again when it starts" >&2
+# GNOME's own mic-mute action (it mutes the default source, Booth Mic) on Ctrl+Alt+M, only while it has no binding:
+# never the user's own (booth.mute.binding). gsettings writes the user's dconf; it never stops the install.
+PYTHONPATH=$dest python3 -P -m booth.mute --bind || true
 if [ -n "$voice_first" ]; then
   pw-metadata -n default 0 default.configured.audio.source '{ "name": "booth_mic" }' Spa:String:JSON >/dev/null 2>&1 ||
     echo "install.sh: couldn't make Booth Mic the default mic; choose Booth Mic in Settings → Sound → Input" >&2

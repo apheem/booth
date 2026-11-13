@@ -73,7 +73,14 @@ class Install(unittest.TestCase):
         for name in ("curl", "apt-get", "dpkg-deb"):
             (stubs / name).write_text('#!/bin/sh\necho "${0##*/} $*" >> "$FETCH_LOG"\nexit 1\n')
             (stubs / name).chmod(0o755)
-        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", STUB_LOG=str(self.calls), FETCH_LOG=str(self.fetches))
+        # gsettings (#21): mic-mute reads as MIC_MUTE (GNOME 46's default [''] when unset), its calls in their own log
+        self.gsettings = Path(tmp.name) / "gsettings.log"
+        (stubs / "gsettings").write_text('#!/bin/sh\necho "gsettings $*" >> "$GSETTINGS_LOG"\n'
+                                         '[ "$1" != get ] || printf "%s\\n" "${MIC_MUTE-[\'\']}"\n'
+                                         'exit "${GSETTINGS_RC:-0}"\n')
+        (stubs / "gsettings").chmod(0o755)
+        self.env.update(PATH=f"{stubs}:{self.env['PATH']}", STUB_LOG=str(self.calls), FETCH_LOG=str(self.fetches),
+                        GSETTINGS_LOG=str(self.gsettings))
         self.app = self.home / ".local/share/booth/booth"
         self.launcher = self.home / ".local/bin/booth"
         self.desktop = self.home / f".local/share/applications/{APP_ID}.desktop"
@@ -371,6 +378,33 @@ class Install(unittest.TestCase):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("couldn't make Booth Mic the default mic", r.stderr)
+
+    def gsettings_calls(self):
+        return self.gsettings.read_text().splitlines() if self.gsettings.exists() else []
+
+    def test_gnomes_mic_mute_gets_ctrl_alt_m_only_when_it_has_no_binding(self):  # #21
+        get = "gsettings get org.gnome.settings-daemon.plugins.media-keys mic-mute"
+        for current in ("['']", "@as []"):
+            self.env["MIC_MUTE"] = current
+            self.gsettings.unlink(missing_ok=True)
+            r = self.install()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.gsettings_calls(),
+                             [get, "gsettings set org.gnome.settings-daemon.plugins.media-keys mic-mute "
+                                   "['<Control><Alt>m']"], current)
+        for current in ("['<Super>m']", "['<Control><Alt>m']"):  # the user's own, or already ours: never rewritten
+            self.env["MIC_MUTE"] = current
+            self.gsettings.unlink(missing_ok=True)
+            self.assertEqual(self.install().returncode, 0)
+            self.assertEqual(self.gsettings_calls(), [get], current)
+
+    def test_an_unreadable_mic_mute_is_never_written_and_the_install_goes_on(self):
+        self.env["GSETTINGS_RC"] = "1"  # no GNOME schema, no session
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.gsettings_calls()), 1)
+        self.assertIn("Ctrl+Alt+M", r.stderr)
+        self.assertTrue(self.launcher.exists())
 
     def test_the_voice_plugins_are_in_place_before_booth_is_quit_and_restarted(self):
         lines = [ln for ln in (REPO / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]

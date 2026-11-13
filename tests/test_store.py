@@ -195,6 +195,16 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_the_mute_round_trips_and_a_bad_one_counts_as_corrupt(self):  # #21: booth-voice's pre-start reads it
+        settings = store.load(self.path)
+        for muted in (True, False):
+            settings["voice"]["muted"] = muted
+            store.save(settings, self.path)
+            self.assertIs(store.load(self.path)["voice"]["muted"], muted)
+        for text in ('{"voice": {"muted": 1}}', '{"voice": {"muted": "yes"}}', '{"voice": {"muted": null}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
     def test_fresh_settings_start_on_the_broadcast_preset(self):  # #2: the user's mic is dynamic
         self.assertEqual(store.load(self.path)["voice"], voice.PRESETS["Broadcast"])
 

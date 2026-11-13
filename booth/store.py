@@ -22,7 +22,8 @@ def defaults():
     #   "leveling_amount" 0..100 (50 when absent) and "limiter_ceiling" −20..0 dB (−1 when absent), see booth.voice;
     #   "monitor": the "Hear processed voice in headphones" switch, False when absent (booth.monitor); the Tone stage's
     #   switch "tone" (False when absent: an upgrade's sound unchanged) and its knobs "tone_warmth", "tone_presence" and
-    #   "tone_air", gains −12..12 dB (0 when absent). Fresh settings start on booth.voice's DEFAULT_PRESET.
+    #   "tone_air", gains −12..12 dB (0 when absent). Fresh settings start on booth.voice's DEFAULT_PRESET. "muted":
+    #   Booth's record of Booth Mic's node mute (booth.mute), False when absent: muted, its chain carries silence.
     # routing: {"direct_monitor": the "Turn on Direct Monitor when the PRO X turns off" switch, True when absent}, and
     #   the routing policy's own record next to it, written only by booth.routing: none, or "moved": True with "direct":
     #   Direct Monitor's value before Booth moved output to the Scarlett, put back when the PRO X turns on, or "direct":
@@ -72,7 +73,7 @@ def load(file=None):
         voice = data.get("voice", {})
         if not isinstance(voice, dict) \
                 or not all(isinstance(voice.get(k, True), bool)
-                           for k in ("enabled", "rumble", "noise", "leveling", "limiter", "monitor", "tone")) \
+                           for k in ("enabled", "rumble", "noise", "leveling", "limiter", "monitor", "tone", "muted")) \
                 or not all(_whole(voice.get(k, 0), 100) for k in ("noise_strength", "leveling_amount")) \
                 or not _db(voice.get("limiter_ceiling", -1.0), -20, 0) \
                 or not all(_db(voice.get(k, 0.0), -12, 12) for k in ("tone_warmth", "tone_presence", "tone_air")):

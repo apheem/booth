@@ -1295,6 +1295,82 @@ class Heal(unittest.TestCase):
                          (True, False, False))
 
 
+MUTED = {"voice": {"muted": True}}
+
+
+class Muted(unittest.TestCase):
+    """#21: muted, Booth Mic's chain carries silence (its master mixer, both gains 0) from its first sample, so a Booth
+    Mic recreated by a booth-voice restart is never heard before Booth puts its node mute back; and Booth never restarts
+    a running Booth Mic while muted, since a call falls back to the raw mic during the gap."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.file = Path(tmp.name) / "voice.conf"
+        self.ran = []
+
+    def apply(self, settings, dump=CHAIN_DUMP, state=None):
+        return voice.apply(settings, state, run=lambda cmd: self.ran.append(cmd) or True, dump=lambda: dump,
+                           file=self.file)
+
+    def test_muted_booth_mic_carries_silence_whatever_the_switches(self):
+        for v in ({}, {"enabled": False}, {"rumble": False}, {"enabled": False, "rumble": False}):
+            self.assertEqual(flow(config({"voice": dict(v, muted=True)})), {}, v)
+            self.assertNotEqual(flow(config({"voice": dict(v, muted=False)})), {}, v)
+
+    def test_mute_changes_only_control_values_so_it_is_live_never_a_restart(self):
+        self.assertEqual(voice.shape(config(MUTED)), voice.shape(config()))
+        self.apply(ON)
+        self.ran.clear()
+        self.apply(MUTED)
+        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"]])
+        params = json.loads(self.ran[0][4])["params"]
+        pairs = dict(zip(params[::2], params[1::2]))
+        self.assertEqual((pairs["master:Gain 1"], pairs["master:Gain 2"]), (0.0, 0.0))
+
+    def test_the_pre_start_writes_a_silent_chain_while_muted(self):
+        with mock.patch.object(voice.store, "load", lambda: MUTED):
+            self.assertIsNone(voice.write(self.file))
+        self.assertEqual(flow(json.loads(self.file.read_text())), {})
+
+    def old_shape(self):
+        old = config(MUTED)
+        module(old, "libpipewire-module-filter-chain")["filter.graph"]["nodes"].pop(1)  # an older chain's shape
+        self.file.write_text(json.dumps(old))
+        return self.file.read_text()
+
+    def test_a_new_shape_never_restarts_a_running_booth_mic_while_muted(self):
+        before = self.old_shape()
+        said = self.apply(MUTED)
+        self.assertTrue(said.startswith("not "), said)  # not recorded: the first apply after unmuting restarts it
+        self.assertNotIn(RESTART, self.ran)
+        self.assertEqual(self.file.read_text(), before)
+        self.ran.clear()
+        self.assertEqual(self.apply(ON), "restarted")
+        self.assertEqual(self.ran, [RESTART])
+
+    def test_a_booth_mic_that_isnt_running_is_still_started_while_muted(self):  # no gap to fall back in
+        self.old_shape()
+        self.assertEqual(self.apply(MUTED, dump=json.dumps([node(71, voice.INPUT)])), "restarted")
+        self.assertEqual(self.ran, [RESTART])
+
+    def test_a_held_restart_still_moves_the_selector(self):  # only the selector restarts: Booth Mic and its mute stay
+        self.old_shape()
+        self.assertIn("not restarted", self.apply(MUTED, state=STATE))
+        self.assertEqual(self.ran, [ACTIVE, RESTART_SELECT])
+        self.assertEqual(json.loads(self.file.with_name(voice.SELECT_CONF).read_text()), selector())
+
+    def test_reload_never_restarts_a_running_booth_mic_while_muted(self):
+        changed = {k: v for k, v in FOUND.items() if k != "sc4m_1916.so"}
+        self.file.write_text(voice.build(MUTED, changed))
+        for settings, dump, want in ((MUTED, CHAIN_DUMP, []), (MUTED, "[]", [RESTART]), (ON, CHAIN_DUMP, [RESTART])):
+            self.ran.clear()
+            with mock.patch.object(voice, "verified", lambda: FOUND), \
+                    mock.patch.object(voice.store, "load", lambda: settings), mock.patch.object(voice, "_dump", lambda: dump):
+                self.assertEqual(voice.reload(run=lambda cmd: self.ran.append(cmd) or True, file=self.file), want != [])
+            self.assertEqual(self.ran, want, (settings, dump))
+
+
 TONE_PATH = "tone_air(tone_presence(tone_warmth({})))"
 
 

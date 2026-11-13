@@ -6,6 +6,8 @@ from booth.ui.camera import CameraPage
 from booth.ui.headphones import HeadphonesPage
 from booth.ui.microphone import MicrophonePage
 
+MUTE_ACTION = "app.mute"  # booth.app's: Booth Mic's node mute (#21)
+
 
 def main_menu():
     menu = Gio.Menu()
@@ -18,6 +20,9 @@ def page(title, child, menu=None, banner=None):
     if menu:
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, primary=True,
                                        tooltip_text="Main Menu"))
+        # #21: pressed while Booth Mic is muted, by Booth, GNOME (Ctrl+Alt+M) or another app
+        header.pack_start(Gtk.ToggleButton(icon_name="microphone-sensitivity-muted-symbolic", action_name=MUTE_ACTION,
+                                           tooltip_text="Mute Booth Mic (Ctrl+M)"))
     view.add_top_bar(header)
     if banner:
         view.add_top_bar(banner)
@@ -56,6 +61,10 @@ class Window(Adw.ApplicationWindow):
             for subtitle in subtitles:
                 labels.append(subtitle)
             row.append(labels)
+            if title == "Microphone":  # #21: the red dot, while Booth Mic is muted
+                self.mute_dot = Gtk.Label(label="●", css_classes=["error"], visible=False, hexpand=True, xalign=1,
+                                          tooltip_text="Booth Mic is muted")
+                row.append(self.mute_dot)
             sidebar.append(row)
 
         self.split = Adw.NavigationSplitView(sidebar=page("Booth", sidebar, main_menu()), content=self.pages[0][2])
@@ -74,6 +83,9 @@ class Window(Adw.ApplicationWindow):
         self.mic_label.set_label(routing.label(source))
         self.mic_banner.set_title(routing.MIC_SAID[source])
         self.mic_banner.set_revealed(changed or source != voice.SCARLETT)
+
+    def show_mute(self, on):
+        self.mute_dot.set_visible(on)
 
     def on_selected(self, _box, row):
         content = self.pages[row.get_index()][2] if row else None

@@ -30,6 +30,9 @@ record of what it set live); voice-run.conf is what runs. A change in what verif
 fails for a moment, an install's new plugins) never restarts the running chain, which mapped verified code: a stage
 whose plugin stopped verifying goes dry live, one that verifies only since waits for the next start, and the page says
 both are missing (loaded()). A new shape (new code) restarts both services, never starting one the user stopped.
+Mute (#21, booth.mute): muted, the master mixer is silent (both gains 0), live and in every voice-run.conf, so a Booth
+Mic recreated by a restart is silent before Booth puts its node mute back; and a running Booth Mic is never restarted
+while muted (_held), since a call falls back to the raw mic, unmuted, while booth_mic is gone.
     python3 -m booth.voice            write the configs from the saved settings and the Scarlett now, start the services
     python3 -m booth.voice --write [voice-run.conf [plugins folder]]
                                       only voice-run.conf, from the saved settings and the plugins verified now
@@ -66,6 +69,7 @@ WAITING = "Booth Mic is waiting for the Scarlett"
 NOT_ROUTED = "Booth Mic has no input: the mic isn't routed to a capture channel"
 STALE = "Booth Mic may still be using the old channel: couldn't stop it"
 STOPPED = "Booth Mic isn't running: see systemctl --user status booth-voice.service"
+HELD = "not restarted while muted: Booth Mic restarts once you unmute"
 _LOCK = threading.RLock()  # the page's poll, the service's start and heal may run at once
 HEAL_BACKOFF_S = 60
 _HEALED = {}  # (selector config, Scarlett node object.serial) → when heal last restarted the selector for it
@@ -314,6 +318,8 @@ def build(settings, found=None):
             stage(key, [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
                          "control": mapping(v.get(knob, default))}], ins, out)
     nodes.append(_mix("master", v.get("enabled", True)))
+    if v.get("muted"):  # #21: silent from its first sample, whatever its node mute (a recreated Booth Mic has none)
+        nodes[-1]["control"] = {"Gain 1": 0.0, "Gain 2": 0.0}
     links += [{"output": last, "input": "master:In 1"}, {"output": "in:Out", "input": "master:In 2"}]
     chain = {"node.description": "Booth Mic", "media.name": "Booth Mic",
              "filter.graph": {"nodes": nodes, "links": links, "inputs": ["in:In"], "outputs": ["master:Out"]},
@@ -492,6 +498,12 @@ def _restarted(key, clock):
     _HEALED[key] = clock()
 
 
+def _held(settings, dump):
+    """#21: muted with Booth Mic running, so no restart: while booth_mic is gone a call falls back to the raw mic,
+    unmuted. A Booth Mic that isn't running has no gap to fall back in, so it still starts."""
+    return bool((settings.get("voice") or {}).get("muted")) and _node_id(dump(), NODE) is not None
+
+
 def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
     """Bring both configs up to date with the settings and `state`, the Scarlett now (scarlett.read). New control values
     are set live on the chain, then recorded; a new chain shape (new code; never a change in what verifies alone, see
@@ -519,6 +531,8 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             if shape(same) == shape(now):  # nothing else changed: no restart; its next start loads what verifies
                 chain = same
         restart = shape(now) != shape(chain)
+        if restart and _held(settings, dump):  # not recorded: the first apply after unmuting restarts it
+            said = HELD
         # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
         # kept run conf holds older ones), else voice.conf's, what apply set live since
         # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
@@ -704,7 +718,7 @@ def reload(run=service.run, file=None):
     when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
     with _LOCK:
         _VERIFIED.clear()  # an install's fresh plugins: hashed now
-        return _plugins(_running(file or path())) == verified() or run(RESTART)
+        return _plugins(_running(file or path())) == verified() or (not _held(store.load(), _dump) and run(RESTART))
 
 
 def main():
