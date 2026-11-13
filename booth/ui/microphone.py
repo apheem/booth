@@ -1,5 +1,6 @@
 """The Microphone page's Scarlett Solo group: 48V, Air, Inst/Line, Direct Monitor, firmware and sync, and which input is
-the mic. The rules live in booth.scarlett; this only wires. amixer and pw-dump run off the main loop.
+the mic, plus the routing's saved setting (booth.routing) to turn Direct Monitor on when the PRO X turns off. The rules
+live in booth.scarlett; this only wires. amixer and pw-dump run off the main loop.
 
 Outside changes (the Scarlett's own buttons, alsamixer) and unplug/replug are followed by a poll every POLL_S seconds
 while the window exists, as on the Headphones page: the card is found by name and its controls read by name each time.
@@ -14,12 +15,13 @@ import threading
 
 from gi.repository import Adw, GLib, Gtk
 
-from booth import headset, meter, scarlett, store, voice
+from booth import headset, meter, routing, scarlett, store, voice
 from booth.ui.levelmeter import LevelMeter
 
 POLL_S = 2
 MASTER = "Off sends your mic to Booth Mic untouched"
 RUMBLE = "Cuts low rumble and desk thumps below 80 Hz"
+AUTO = "Booth turns it back off when the headset is on again"
 
 
 class MicrophonePage(Adw.PreferencesPage):
@@ -39,11 +41,14 @@ class MicrophonePage(Adw.PreferencesPage):
         self.level.connect("notify::selected", self.on_enum, scarlett.LEVEL)
         self.direct = Adw.SwitchRow(title="Direct Monitor", subtitle="Hear yourself in the Scarlett's jack")
         self.direct.connect("notify::active", self.on_direct)
+        # the routing policy's setting (booth.routing), saved; never a Scarlett write, so never greyed out
+        self.auto = Adw.SwitchRow(title="Turn on Direct Monitor when the PRO X turns off", subtitle=AUTO)
+        self.auto.connect("notify::active", self.on_auto)
         self.firmware = Adw.ActionRow(title="Firmware")
         self.sync = Adw.ActionRow(title="Sync")
         self.rows = {scarlett.PHANTOM: self.phantom, scarlett.AIR: self.air, scarlett.LEVEL: self.level,
                      scarlett.DIRECT: self.direct, scarlett.FIRMWARE: self.firmware, scarlett.SYNC: self.sync}
-        for row in (self.input, *self.rows.values()):
+        for row in (self.input, self.phantom, self.air, self.level, self.direct, self.auto, self.firmware, self.sync):
             self.group.add(row)
         for row in self.rows.values():
             row.set_sensitive(False)  # until the first poll finds the Scarlett
@@ -64,6 +69,7 @@ class MicrophonePage(Adw.PreferencesPage):
         self.quiet = True  # showing the saved state is no change
         self.master.set_active(v.get("enabled", True))
         self.rumble.set_active(v.get("rumble", True))
+        self.auto.set_active(settings.setdefault("routing", {}).get(routing.SETTING, True))
         self.quiet = False
         self.rumble.set_sensitive(self.master.get_active())
         self.voice.add(self.master)
@@ -184,6 +190,17 @@ class MicrophonePage(Adw.PreferencesPage):
         if not self.quiet:
             on = row.get_active()
             self.writer.want(scarlett.DIRECT, lambda card: scarlett.cset_cmd(card, scarlett.DIRECT, on))
+
+    def on_auto(self, row, _param):
+        if self.quiet:
+            return
+        # by key each time: the routing replaces settings["routing"] when it saves its record (also on the main loop)
+        self.settings["routing"][routing.SETTING] = row.get_active()
+        try:
+            store.save(self.settings)
+            row.set_subtitle(AUTO)
+        except OSError as e:  # set for this session: the user must know it won't last
+            row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
 
     def on_input(self, row, _param):
         self.settings["microphone"]["input"] = list(scarlett.INPUTS)[row.get_selected()]

@@ -77,6 +77,22 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_the_routing_policys_saved_move_round_trips(self):
+        settings = store.load(self.path)
+        self.assertEqual(settings["routing"], {})  # no move saved
+        settings["routing"] = {"moved": True, "direct": False, "direct_monitor": False}  # and the user's switch
+        store.save(settings, self.path)
+        self.assertEqual(store.load(self.path)["routing"], {"moved": True, "direct": False, "direct_monitor": False})
+
+    def test_a_bad_routing_value_counts_as_corrupt(self):
+        # the policy writes Direct Monitor back from it: only a real on/off
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"routing": 7}', '{"routing": {"moved": 1}}', '{"routing": {"direct": "off"}}',
+                     '{"routing": {"direct": null}}', '{"routing": {"direct_monitor": "off"}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+            self.assertFalse(self.path.exists(), text)
+
     def test_sidetone_and_auto_off_round_trip_at_their_limits(self):
         for sidetone, auto_off in ((0, 0), (1, 1), (128, 90)):
             settings = store.load(self.path)

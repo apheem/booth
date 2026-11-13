@@ -14,13 +14,26 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from booth import camera, devices, headset, service, store, voice  # noqa: E402
+from booth import camera, devices, headset, routing, service, store, voice  # noqa: E402
 from booth.ui.window import Window  # noqa: E402
 
 APP_ID = "io.github.apheem.Booth"
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
 RESTORING = camera.WRITING  # the startup, replug and window-open restores and the page's writes never interleave
 BATTERY_S = 10  # the PRO X battery poll: also how soon "headset off" is noticed
+ON_MAIN_S = 10  # how long a worker waits for the main loop before taking "no" (it is quitting)
+
+
+def on_main(f, *args):
+    """From a worker: f(*args) on the main loop, waited for → its result, or False when the main loop didn't run it."""
+    done, out = threading.Event(), [False]
+
+    def call():
+        out[0] = f(*args)
+        done.set()
+    GLib.idle_add(call)
+    done.wait(ON_MAIN_S)
+    return out[0]
 
 
 def off_main(work, done):
@@ -70,7 +83,7 @@ class Application(Adw.Application):
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.snd_monitor, self.dongle, self.healing = None, None, False
-        self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # #12 subscribes to its listeners
+        self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # watch() subscribes the routing
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Run with no window, re-applying the camera settings now and on replug", None)
         self.run_in_background = Gio.SimpleAction.new_stateful("run-in-background", None, GLib.Variant.new_boolean(False))
@@ -117,8 +130,14 @@ class Application(Adw.Application):
         self.snd_monitor.connect("changed", self.on_snd_by_id)
         self.fix_headset()
         self.sync_voice()
+        # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
+        # before the first poll, whose reading is the startup transition
+        self.routing = routing.Executor(self.settings, lambda text: GLib.idle_add(self.routed, text),
+                                        lambda state: on_main(self.save_routing, state))
+        self.headset_monitor.listeners.append(self.routing.listener)
         self.headset_monitor.poll()  # the PRO X's battery and on/off, now and every BATTERY_S, with a window or not
         GLib.timeout_add_seconds(BATTERY_S, self.headset_monitor.poll)
+        GLib.timeout_add_seconds(BATTERY_S, self.routing.retry)  # a rule not settled yet (the PRO X sink not back) again
         # Booth Mic's selector back within 10 s of its Scarlett: a replug, a login race or a profile switch (no by-id event)
         GLib.timeout_add_seconds(BATTERY_S, self.heal_voice)
         if self.background:
@@ -160,6 +179,23 @@ class Application(Adw.Application):
         note = Gio.Notification.new("Headset battery low")
         note.set_body(f"PRO X Wireless is at ~{percent} % (est.).")
         self.send_notification("headset-battery", note)
+
+    def routed(self, text):
+        self.send_notification("routing", Gio.Notification.new(text))  # one id: the newest replaces the last
+        return GLib.SOURCE_REMOVE
+
+    def save_routing(self, state):
+        """The routing's record → True when it reached the disk. On the main loop, as every other save of the shared
+        dict, so the user's switch next to it (the Microphone page's) is never lost."""
+        self.settings["routing"] = state | {k: v for k, v in self.settings.get("routing", {}).items()
+                                            if k == routing.SETTING}
+        try:
+            store.save(self.settings)
+            return True
+        except OSError as e:  # disk full, read-only: kept in memory, but a restart won't know Booth moved the sound
+            self.send_notification("routing-unsaved",
+                                   Gio.Notification.new(f"Sound routing set, but not saved: {e.strerror or e}"))
+            return False
 
     def restore_saved(self):
         # one writer: the page queues it behind its own writes, even a closed one's whose last write isn't saved yet
