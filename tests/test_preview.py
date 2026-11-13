@@ -266,6 +266,9 @@ class Shown(unittest.TestCase):
     def test_wanted(self):
         self.assertEqual([preview.wanted(m, s) for m in (True, False) for s in (False, True)], [True, False, False, False])
 
+    def test_the_preview_is_16_9_at_the_width_it_gets(self):  # 576: the page's column in a wide window
+        self.assertEqual([preview.height(w) for w in (640, 576, 336)], [360, 324, 189])
+
     def page(self):
         import gi
         gi.require_version("Gtk", "4.0")
