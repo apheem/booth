@@ -7,7 +7,7 @@ from unittest import mock
 
 from gi.repository import GObject
 
-from booth import meter, monitor, plugins, scarlett, voice
+from booth import meter, monitor, plugins, scarlett, stereo, voice
 from booth.ui import microphone
 from booth.ui import window as ui_window
 from tests.fixture import read
@@ -156,6 +156,7 @@ class PageCase(unittest.TestCase):
         self.monitor_on = []  # every monitor.sync's `on`: the PRO X headset's HeadsetMonitor.on
         self.headset = types.SimpleNamespace(on=True)
         self.labels = []  # every Gtk.Label the page made, as {its keyword arguments}
+        self.stereo_synced, self.stereo_lived, self.stereo_said = [], [], "Right: the Scarlett's Instrument input, capture channel 1 (FL)"
 
         real_send = scarlett.send
 
@@ -194,7 +195,14 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.monitor, "LAST", None, create=True),  # no sync yet this run
                 mock.patch.object(microphone.monitor, "sync",
                                   lambda settings, on: self.monitor_on.append(on)
-                                  or self.monitored.append(dict(settings["voice"])) or self.monitor_said)):
+                                  or self.monitored.append(dict(settings["voice"])) or self.monitor_said),
+                # Booth Stereo (#19): every sync's voice settings; what it returns; what it found last
+                mock.patch.object(microphone.stereo, "sync",
+                                  lambda settings: self.stereo_synced.append(dict(settings["voice"])) or self.stereo_said),
+                mock.patch.object(microphone.stereo, "live",  # a knob tick's: only its chain's values
+                                  lambda settings: self.stereo_lived.append(dict(settings["voice"])) or self.stereo_said),
+                mock.patch.object(microphone.stereo, "LAST", None),
+                mock.patch.object(microphone.stereo, "SOURCES", [])):
             patch.start()
             self.addCleanup(patch.stop)
         self.page = Page()
@@ -941,6 +949,75 @@ class Monitoring(PageCase):
         for f, a in idle:  # the main loop
             f(*a)
         self.assertEqual(self.page.monitoring.subtitle, monitor.NO_PROX)
+
+
+class BoothStereo(PageCase):
+    """#19: the voice's side, the other side's source and the privacy note: saved, then stereo.sync off the main loop,
+    which restarts only Booth Stereo; never Booth Mic's chain, never the Scarlett."""
+    BRIO = "alsa_input.usb-046d_Logitech_BRIO_FAKESER1-03.analog-stereo"
+
+    def test_it_says_its_for_recording_not_calls_and_starts_on_the_left_with_the_scarletts_other_input(self):
+        self.assertEqual(self.page.stereo.description, stereo.NOTE)
+        self.assertEqual((self.page.side.model, self.page.side.selected), (["Left", "Right"], 0))
+        self.assertEqual((self.page.other.model, self.page.other.selected),
+                         (["Scarlett instrument input", "Computer sound"], 0))
+        self.assertEqual(self.stereo_synced, [])  # showing the saved state starts nothing
+
+    def test_the_saved_side_and_source_are_shown_at_start_and_a_missing_source_stays_chosen(self):
+        page = Page()
+        page.root_ = _Root()
+        microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {"stereo_side": "R",
+                                                                             "stereo_source": self.BRIO}})
+        self.assertEqual(page.side.selected, 1)
+        self.assertEqual((page.other.model[2], page.other.selected), (f"{self.BRIO} (not connected)", 2))
+        self.assertEqual(self.stereo_synced, [])
+
+    def test_a_side_or_source_change_is_saved_and_synced_never_touching_booth_mic(self):
+        self.select(self.page.side, 1)
+        self.assertEqual(self.stereo_synced, [{"stereo_side": "R"}])
+        self.assertEqual(self.saved, [self.settings])
+        self.select(self.page.other, 1)
+        self.assertEqual(self.stereo_synced[-1], {"stereo_side": "R", "stereo_source": "computer"})
+        self.assertEqual(self.page.other.subtitle, self.stereo_said)
+        self.assertEqual((self.applied, self.ran), ([], []))  # never Booth Mic's chain, never the Scarlett
+
+    def test_each_poll_lists_the_sources_found_and_shows_what_the_other_side_carries(self):
+        with mock.patch.object(stereo, "SOURCES", [(self.BRIO, "BRIO Ultra HD Webcam Analog Stereo")]), \
+                mock.patch.object(stereo, "LAST", stereo.NO_MIC):
+            self.show(state())
+        self.assertEqual(self.page.other.model[2], "BRIO Ultra HD Webcam Analog Stereo")
+        self.assertEqual(self.page.other.subtitle, stereo.NO_MIC)
+        self.select(self.page.other, 2)
+        self.assertEqual(self.stereo_synced[-1]["stereo_source"], self.BRIO)
+        self.assertEqual(self.stereo_synced, [{"stereo_source": self.BRIO}])  # a poll's new list chose nothing
+
+    def test_a_failed_save_says_so_and_still_syncs(self):
+        with mock.patch.object(microphone.store, "save", side_effect=OSError(28, "No space left on device")):
+            self.select(self.page.side, 1)
+        self.assertEqual(self.page.other.subtitle, "Set, but not saved: No space left on device")
+        self.assertEqual(self.stereo_synced, [{"stereo_side": "R"}])
+
+    def test_a_voice_change_reaches_booth_stereos_chain_too(self):  # a knob, a switch or a preset, live on both
+        self.page.knobs["tone_air"].row.set_value(1.5)
+        self.assertEqual((self.applied[-1][0], self.stereo_lived), ({"tone_air": 1.5}, [{"tone_air": 1.5}]))
+        self.assertEqual(self.stereo_synced, [])  # #10: no shape work (pw-dumps, amixer) on a knob tick
+        self.stereo_said = "not applied: Booth Stereo didn't take tone_air:Gain"
+        self.page.knobs["tone_air"].row.set_value(2.0)
+        self.assertEqual(self.page.other.subtitle, self.stereo_said)
+
+    def test_sync_runs_on_a_worker_thread_and_the_row_changes_only_on_the_main_loop(self):
+        threads, idle = [], []
+        with mock.patch.object(microphone.threading, "Thread",
+                               lambda target, daemon: types.SimpleNamespace(start=lambda: threads.append(target))), \
+                mock.patch.object(microphone.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            self.select(self.page.side, 1)
+            self.assertEqual((len(threads), self.stereo_synced), (1, []))
+            threads.pop()()
+        self.assertEqual(self.stereo_synced, [{"stereo_side": "R"}])
+        self.assertIsNone(self.page.other.subtitle)
+        for f, a in idle:
+            f(*a)
+        self.assertEqual(self.page.other.subtitle, self.stereo_said)
 
 
 class WindowClose(unittest.TestCase):

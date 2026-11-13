@@ -24,6 +24,8 @@ def defaults():
     #   switch "tone" (False when absent: an upgrade's sound unchanged) and its knobs "tone_warmth", "tone_presence" and
     #   "tone_air", gains −12..12 dB (0 when absent). Fresh settings start on booth.voice's DEFAULT_PRESET. "muted":
     #   Booth's record of Booth Mic's node mute (booth.mute), False when absent: muted, its chain carries silence.
+    #   Booth Stereo (booth.stereo): "stereo_side", the voice's side, "L" or "R" ("L" when absent), and
+    #   "stereo_source", the other side's: "scarlett", "computer" or a source's node name ("scarlett" when absent).
     # routing: {"direct_monitor": the "Turn on Direct Monitor when the PRO X turns off" switch, True when absent}, and
     #   the routing policy's own record next to it, written only by booth.routing: none, or "moved": True with "direct":
     #   Direct Monitor's value before Booth moved output to the Scarlett, put back when the PRO X turns on, or "direct":
@@ -76,7 +78,9 @@ def load(file=None):
                            for k in ("enabled", "rumble", "noise", "leveling", "limiter", "monitor", "tone", "muted")) \
                 or not all(_whole(voice.get(k, 0), 100) for k in ("noise_strength", "leveling_amount")) \
                 or not _db(voice.get("limiter_ceiling", -1.0), -20, 0) \
-                or not all(_db(voice.get(k, 0.0), -12, 12) for k in ("tone_warmth", "tone_presence", "tone_air")):
+                or not all(_db(voice.get(k, 0.0), -12, 12) for k in ("tone_warmth", "tone_presence", "tone_air")) \
+                or voice.get("stereo_side", "L") not in ("L", "R") \
+                or not isinstance(voice.get("stereo_source", "scarlett"), str) or not voice.get("stereo_source", "x"):
             raise ValueError("not a settings object")
         routing = data.get("routing", {})
         if not isinstance(routing, dict) or not all(isinstance(routing.get(k, True), bool)

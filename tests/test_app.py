@@ -362,6 +362,22 @@ class BackgroundLaunch(unittest.TestCase):
         sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)
         self.assertFalse(stub.healing)
 
+    def test_booth_stereo_is_started_at_start_and_brought_back_every_heal_tick_off_the_main_loop(self):  # #19
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync"), mock.patch.object(app.monitor, "sync"), \
+                mock.patch.object(app.voice, "heal", side_effect=OSError("boom")), \
+                mock.patch.object(app.stereo, "sync") as sync:
+            app.Application.sync_voice(stub)
+            app.Application.heal_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+            with self.assertRaises(OSError):  # Booth Mic's heal failed: Booth Stereo is still looked after
+                threads[1]()
+        self.assertEqual(sync.call_args_list, [mock.call(stub.settings, notify=stub.stereo_switched)] * 2)
+        self.assertFalse(stub.healing)
+
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
         threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False, mic={})
         stub.heal_once = lambda: app.Application.heal_once(stub)
@@ -681,6 +697,16 @@ class HeadsetBattery(unittest.TestCase):
         self.assertEqual(stub.settings["routing"], {"moved": True, "direct": False})
         notification.new.assert_called_once_with("Sound routing set, but not saved: No space left on device")
         stub.send_notification.assert_called_once_with("routing-unsaved", notification.new.return_value)
+
+    def test_booth_stereos_notice_is_sent_on_the_main_loop_under_its_own_id(self):  # #19: from sync's worker
+        with mock.patch.object(app.Gio, "Notification") as notification, \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: f(*a)):
+            stub = mock.Mock()
+            app.Application.stereo_switched(stub, "Booth Stereo switched computer sound to X — a recording on it "
+                                                  "restarted")
+        notification.new.assert_called_once_with("Booth Stereo switched computer sound to X — a recording on it "
+                                                  "restarted")
+        stub.send_notification.assert_called_once_with("booth-stereo", notification.new.return_value)
 
     def test_the_low_battery_notification_says_the_estimate(self):
         with mock.patch.object(app.Gio, "Notification") as notification:
