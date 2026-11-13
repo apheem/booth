@@ -1,6 +1,10 @@
 """The Headphones page: the PRO X's volume (0–100 %, never more) and "Use for all sound". The rules live in
 booth.headset; this only wires. wpctl and pw-dump run off the main loop.
 
+On top, Sound Output: where sound plays now. While that isn't the PRO X (the backup Booth moved sound to when the
+headset turned off, or the user's own pick), that output's volume and, on the Scarlett, its Direct Monitor (the jack's
+sidetone; the same switch as the Microphone page's).
+
 Outside changes (GNOME's volume keys, Settings) are followed by a poll every POLL_S seconds while the window exists:
 two short commands (pw-dump, ~15 ms, and wpctl get-volume), no state kept between them, and the sink re-resolved on
 every tick. A `pw-dump --monitor` stream would need a long-lived process and a merged JSON model of the whole graph to
@@ -9,9 +13,10 @@ import threading
 
 from gi.repository import Adw, Gdk, GLib, Gtk
 
-from booth import headset, store
+from booth import headset, scarlett, store
 
 POLL_S = 2
+DIRECT = "Hear yourself in the Scarlett's jack"
 SWITCH_SUBTITLE = "Play all sound through the headset"
 SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
 NOT_SET = "Not set in Booth"  # the headset can't report its own value: the widget's position means nothing yet
@@ -37,16 +42,19 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.settings, self.status, self.quiet, self.polling = settings, status, False, False
         self.monitor, self.state = monitor, None
         self.writer = headset.Writer(self.spawn)
+        self.output = Adw.PreferencesGroup(title="Sound Output")
+        self.playing = Adw.ActionRow(title="Playing Through")
+        self.backup, self.backup_row = self.slider(self.on_backup)
+        self.direct = Adw.SwitchRow(title="Direct Monitor", subtitle=DIRECT)
+        self.direct.connect("notify::active", self.on_direct)
+        for row in (self.playing, self.backup_row, self.direct):
+            self.output.add(row)
+        for row in (self.backup_row, self.direct):
+            row.set_visible(False)  # until a poll finds sound on another output
         self.group = Adw.PreferencesGroup(title="PRO X Wireless")
         self.battery = Adw.ActionRow(title="Battery")
         self.group.add(self.battery)
-        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.scale.set_hexpand(True)
-        self.scale.set_draw_value(True)
-        self.scale.set_format_value_func(lambda _s, v: f"{v:.0f} %")
-        self.scale.connect("value-changed", self.on_volume)
-        volume = Adw.ActionRow(title="Volume")
-        volume.add_suffix(self.scale)
+        self.scale, volume = self.slider(self.on_volume)
         self.switch = Adw.SwitchRow(title="Use for all sound", subtitle=SWITCH_SUBTITLE)
         self.switch.connect("notify::active", self.on_default)
         self.rows = [volume, self.switch]
@@ -81,9 +89,22 @@ class HeadphonesPage(Adw.PreferencesPage):
         self.group.add(self.note)
         monitor.listeners.append(self.on_headset)
         self.on_headset()
+        self.add(self.output)
         self.add(self.group)
         self.poll()
         self.timer = GLib.timeout_add_seconds(POLL_S, self.poll)
+
+    @staticmethod
+    def slider(changed):
+        """A 0–100 % volume slider in its row → (the scale, the row)."""
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        scale.set_hexpand(True)
+        scale.set_draw_value(True)
+        scale.set_format_value_func(lambda _s, v: f"{v:.0f} %")
+        scale.connect("value-changed", changed)
+        row = Adw.ActionRow(title="Volume")
+        row.add_suffix(scale)
+        return scale, row
 
     def stop(self):
         """The window closed: no more polls. Returns None, so close-request goes on."""
@@ -101,6 +122,12 @@ class HeadphonesPage(Adw.PreferencesPage):
             row.set_visible(on and kind not in refused)
         self.note.set_title("This headset doesn't accept " + " or ".join(NAMES[k] for k in refused))
         self.note.set_visible(on and bool(refused))
+        self.say()
+
+    def say(self):
+        """Where sound plays, why the card's rows are away, and the sidebar: after a poll and a headset on/off."""
+        self.playing.set_subtitle(headset.playing(self.state, self.monitor.on))
+        self.group.set_description(headset.note(self.state, self.monitor.on))
         self.status(headset.status(self.state, self.monitor))
 
     def on_setting(self, kind, value):
@@ -134,14 +161,32 @@ class HeadphonesPage(Adw.PreferencesPage):
             self.quiet = True
             for row in self.rows:
                 row.set_sensitive(state is not None)
-            self.group.set_description(None if state else "Not connected")
             if state:
                 self.scale.set_value(headset.percent(state["volume"]))
                 self.switch.set_active(state["default"])
+            output = state["output"] if state else None
+            self.backup_row.set_visible(output is not None)
+            self.direct.set_visible(output is not None and output["direct"] is not None)
+            if output:
+                self.backup.set_value(headset.percent(output["volume"]))
+                self.direct.set_active(output["direct"] is True)
             self.quiet = False
             self.state = state
-            self.status(headset.status(state, self.monitor))
+            self.say()
         return GLib.SOURCE_REMOVE
+
+    def on_backup(self, scale):
+        output = self.state and self.state["output"]
+        if not self.quiet and output:
+            p, name = round(scale.get_value()), output["name"]  # the output shown: never another one's volume
+            self.writer.want("backup", lambda dump: headset.volume_cmd(dump, p, name))
+
+    def on_direct(self, row, _param):
+        if not self.quiet:
+            on = row.get_active()
+            # scarlett.send finds the card and writes; it returns None, so headset.send has no command left to run
+            self.writer.want("direct", lambda _dump: scarlett.send(
+                lambda card: scarlett.cset_cmd(card, scarlett.DIRECT, on)))
 
     def on_volume(self, scale):
         if not self.quiet:

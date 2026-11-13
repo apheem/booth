@@ -91,6 +91,9 @@ class _W:
     def set_subtitle(self, text):
         self.subtitle = text
 
+    def set_label(self, text):
+        self.label = text
+
     def add_response(self, rid, _label):
         self.responses.append(rid)
 
@@ -153,6 +156,7 @@ class PageCase(unittest.TestCase):
         self.running = True  # voice.running: Booth Mic's own process is in PipeWire
         self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
+        self.take = mock.Mock(proc=None)  # the page's test recording (booth.take.Take), idle
         self.monitored, self.monitor_said = [], "on"  # every monitor.sync's switch; what it returns
         self.monitor_on = []  # every monitor.sync's `on`: the PRO X headset's HeadsetMonitor.on
         self.headset = types.SimpleNamespace(on=True)
@@ -176,6 +180,7 @@ class PageCase(unittest.TestCase):
                                                         ResponseAppearance=ns(DESTRUCTIVE=2))),
                 mock.patch.object(microphone, "Gtk", ns(StringList=ns(new=list), INVALID_LIST_POSITION=4294967295,
                                                         Box=_W, Label=lambda **kw: self.labels.append(kw),
+                                                        Button=_W, Align=ns(CENTER=3),
                                                         Adjustment=ns(new=lambda value, lower, upper, *_: dict(
                                                             value=value, lower=lower, upper=upper)))),
                 mock.patch.object(microphone.GLib, "timeout_add_seconds", lambda *a: 1),
@@ -184,6 +189,7 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.threading, "Thread", Inline),
                 mock.patch.object(microphone.scarlett, "send", send),
                 mock.patch.object(microphone.store, "save", self.saved.append),
+                mock.patch.object(microphone.take, "Take", lambda say: self.take),  # never a real pw-record
                 mock.patch.object(microphone.voice, "apply",
                                   lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
@@ -392,6 +398,34 @@ class ScarlettGroup(PageCase):
         with mock.patch.object(microphone.GLib, "source_remove", removed.append):
             self.page.stop()
         self.assertEqual(removed, [self.page.timer])
+
+
+class TestRecording(PageCase):
+    def test_the_button_records_and_then_stops(self):
+        self.page.take_button.emit("clicked")
+        self.take.toggle.assert_called_once_with()
+
+    def test_the_row_says_what_the_take_says_and_the_button_turns_to_stop(self):
+        self.assertEqual(self.page.take_row.subtitle, microphone.take.HINT)
+        self.page.on_take("Recording — speak now: 9 s left", True)
+        self.assertEqual((self.page.take_row.subtitle, self.page.take_button.label),
+                         ("Recording — speak now: 9 s left", "Stop"))
+        self.page.on_take(None, False)
+        self.assertEqual((self.page.take_row.subtitle, self.page.take_button.label), (microphone.take.HINT, "Record"))
+
+    def test_a_stopped_booth_mic_is_never_recorded_but_a_running_take_can_still_be_stopped(self):
+        self.show(state())
+        self.assertIs(self.page.take_button.sensitive, True)
+        self.page.show(state(), self.page.writer.writes, running=False)
+        self.assertIs(self.page.take_button.sensitive, False)
+        self.take.proc = object()  # recording or playing
+        self.page.show(state(), self.page.writer.writes, running=False)
+        self.assertIs(self.page.take_button.sensitive, True)
+
+    def test_closing_the_window_ends_the_take(self):
+        with mock.patch.object(microphone.GLib, "source_remove"):
+            self.page.stop()
+        self.take.stop.assert_called_once_with()
 
 
 class DirectMonitorSetting(PageCase):
