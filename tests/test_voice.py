@@ -34,8 +34,19 @@ def plugged(mic):
     return {"ctrls": CTRLS, "mic": mic}
 
 
-def node(i, name):
-    return {"id": i, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": name}}}
+def node(i, name, serial=None):
+    props = {"node.name": name} if serial is None else {"node.name": name, "object.serial": serial}
+    return {"id": i, "type": "PipeWire:Interface:Node", "info": {"props": props}}
+
+
+def chain_unsaved(cfg, file):
+    """store.save with voice.conf unwritable (disk full, read-only): the selector's own config still saves."""
+    if Path(file).name == "voice.conf":
+        raise OSError(28, "No space left on device")
+    real_save(cfg, file)
+
+
+real_save = voice.store.save
 
 
 CHAIN_DUMP = json.dumps([node(70, "booth_mic"), node(71, "booth.mic.input")])  # Booth Mic, then its input
@@ -260,11 +271,47 @@ class Apply(unittest.TestCase):
             self.assertEqual(self.ran, [])
 
     def test_a_mic_with_no_channel_to_take_stops_the_selector(self):
-        for mic in (dict(MIC, position=None), dict(MIC, node=None, position=None)):  # fewer channels; not in PipeWire
-            self.apply()
-            self.ran.clear()
-            self.apply(state=plugged(mic))
-            self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False), mic)
+        self.apply()
+        self.ran.clear()
+        self.apply(state=plugged(dict(MIC, position=None)))  # the Scarlett's node has fewer channels
+        self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False))
+
+    def test_a_pw_dump_that_fails_leaves_a_correctly_routed_selector_alone(self):
+        self.apply()
+        before, self.ran = self.select.read_text(), []
+        blip = plugged(scarlett.mic(CTRLS, "", "XLR"))  # pw-dump timed out: no node, still routed to capture 2
+        self.assertEqual(self.apply(state=blip), "unchanged")
+        self.assertEqual((self.ran, self.select.read_text()), ([], before))
+
+    def test_an_unsaved_chain_change_never_holds_back_a_new_channel(self):
+        self.apply()
+        instrument = scarlett.mic(CTRLS, DUMP, "Instrument")
+        self.ran.clear()
+        with mock.patch.object(voice.store, "save", chain_unsaved):
+            said = self.apply({"voice": {"rumble": False}}, state=plugged(instrument))
+        self.assertIn("not saved", said)
+        self.assertEqual(json.loads(self.select.read_text()), selector(instrument))
+        self.assertEqual([c[:3] for c in self.ran], [["pw-cli", "set-param", "71"], RESTART_SELECT[:3]])
+        self.assertEqual(self.ran[-1], RESTART_SELECT)
+
+    def test_a_live_change_booth_mic_didnt_take_never_holds_back_a_new_channel(self):
+        self.apply()
+        instrument = scarlett.mic(CTRLS, DUMP, "Instrument")
+        self.ran, self.fails = [], ("pw-cli",)
+        self.assertIn("not applied", self.apply({"voice": {"rumble": False}}, state=plugged(instrument)))
+        self.assertEqual(json.loads(self.select.read_text()), selector(instrument))
+        self.assertEqual(self.ran[-1], RESTART_SELECT)
+        self.assertEqual(json.loads(self.file.read_text()), config())  # not recorded: the next apply retries it
+
+    def test_a_new_channel_with_booth_mics_input_down_is_saved_never_restarted(self):
+        self.apply()
+        instrument = scarlett.mic(CTRLS, DUMP, "Instrument")
+        self.ran.clear()
+        said = voice.apply(ON, plugged(instrument), run=lambda cmd: self.ran.append(cmd) or True,
+                           dump=lambda: json.dumps([node(40, MIC["node"])]), file=self.file)
+        self.assertFalse(said.startswith("not "), said)
+        self.assertEqual(self.ran, [])  # BindsTo would pull a stopped booth-voice.service back up
+        self.assertEqual(json.loads(self.select.read_text()), selector(instrument))  # heal starts it with the chain
 
     def test_a_selector_that_wont_stop_keeps_its_config_and_is_stopped_next_time(self):
         self.apply()
@@ -336,11 +383,11 @@ class Apply(unittest.TestCase):
             self.assertEqual(self.apply(), "restarted", text)
             self.assertEqual((self.ran, json.loads(self.file.read_text())), ([RESTART], config()), text)
 
-    def test_a_config_that_cant_be_written_restarts_nothing(self):
+    def test_a_config_that_cant_be_written_never_restarts_the_chain(self):
         self.file.parent.mkdir(parents=True)
         self.file.mkdir()  # a folder where the file goes: the write fails
-        self.assertTrue(self.apply().startswith("not saved"))
-        self.assertEqual(self.ran, [])
+        self.assertIn("not saved", self.apply())
+        self.assertNotIn(RESTART, self.ran)
 
     def test_it_only_ever_runs_systemctl_on_booth_mics_two_units(self):
         self.apply()
@@ -392,6 +439,12 @@ class Sync(unittest.TestCase):
         self.assertIn("capture channel 2 (FR)", voice.describe({"ctrls": CTRLS, "mic": MIC}))
         self.assertEqual(voice.describe({"ctrls": CTRLS, "mic": MIC}, selecting=False), voice.WAITING)
 
+    def test_a_selector_that_wont_stop_is_never_shown_as_no_input(self):
+        said = "not stopped: Booth Mic's source still takes the mic's old channel"
+        self.assertEqual(voice.describe(rerouted("PCM 1"), True, said), voice.STALE)
+        self.assertIn("old channel", voice.STALE)
+        self.assertEqual(voice.describe(rerouted("PCM 1"), True, "unchanged"), voice.NOT_ROUTED)
+
     def test_the_config_lives_beside_the_settings(self):
         from booth import store
         self.assertEqual(voice.path(), store.path().parent / "voice.conf")
@@ -411,8 +464,8 @@ class Heal(unittest.TestCase):
         voice._HEALED.clear()
         self.addCleanup(voice._HEALED.clear)
 
-    def heal(self, dump, state=STATE, t=1000.0):
-        return voice.heal(ON, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or True,
+    def heal(self, dump, state=STATE, t=1000.0, settings=ON, fails=()):
+        return voice.heal(settings, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or cmd[0] not in fails,
                           dump=lambda: dump, file=self.file, clock=lambda: t)
 
     def saved(self):
@@ -474,6 +527,55 @@ class Heal(unittest.TestCase):
         replugged = json.dumps([node(71, "booth.mic.input"), node(41, MIC["node"])])  # a new node id: a replug
         self.assertTrue(self.heal(replugged, t=1061.0))
         self.assertEqual(self.ran, [RESTART_SELECT] * 3)
+
+    def test_an_unsaved_chain_change_never_holds_back_reviving_the_selector(self):
+        self.saved()
+        with mock.patch.object(voice.store, "save", chain_unsaved):
+            self.assertTrue(self.heal(SCARLETT_BACK, settings={"voice": {"rumble": False}}))
+        self.assertEqual(self.ran[-1], RESTART_SELECT)
+
+    def test_a_new_channel_with_an_unsaved_chain_change_restarts_the_selector_once(self):
+        self.saved()
+        instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
+        with mock.patch.object(voice.store, "save", chain_unsaved):
+            self.assertTrue(self.heal(SCARLETT_BACK, state=instrument, settings={"voice": {"rumble": False}}))
+        self.assertEqual([c for c in self.ran if c[0] == "systemctl"], [RESTART_SELECT])  # apply's: coming up
+
+    def test_a_failed_selector_move_is_never_revived_on_the_old_channel(self):
+        self.saved()
+        instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
+        self.assertFalse(self.heal(SCARLETT_BACK, state=instrument, fails=("systemctl",)))
+        self.assertEqual(self.ran, [RESTART_SELECT])  # apply's try, put back: the next tick tries the move again
+        self.assertEqual(json.loads(self.select.read_text()), selector())
+
+    def test_a_replug_that_reuses_the_node_id_restarts_the_selector_at_once(self):
+        self.saved()
+        before = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"], serial=500)])
+        after = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"], serial=530)])  # same id, a new node
+        self.assertTrue(self.heal(before, t=1000.0))
+        self.assertFalse(self.heal(before, t=1010.0))  # the same node failing again: waits out the minute
+        self.assertTrue(self.heal(after, t=1020.0))
+        self.assertEqual(self.ran, [RESTART_SELECT] * 2)
+
+    def test_heal_moves_the_selector_but_starts_it_only_with_booth_mics_input(self):
+        self.saved()
+        name = MIC["node"].replace("analog-surround-40", "pro-input-0")
+        moved = plugged(dict(MIC, node=name, position="AUX1"))
+        self.assertFalse(self.heal(json.dumps([node(41, name)]), state=moved))  # booth-voice.service down
+        self.assertEqual(self.ran, [])
+        self.assertEqual(module(json.loads(self.select.read_text()), "libpipewire-module-loopback")
+                         ["capture.props"]["target.object"], name)
+        self.assertTrue(self.heal(json.dumps([node(71, "booth.mic.input"), node(41, name)]), state=moved, t=1010.0))
+        self.assertEqual(self.ran, [RESTART_SELECT])
+
+    def test_heal_takes_the_chosen_input(self):
+        self.saved()
+        settings = {"voice": {}, "microphone": {"input": "Instrument"}}
+        voice.heal(settings, read=lambda choice: plugged(scarlett.mic(CTRLS, DUMP, choice)),
+                   run=lambda cmd: self.ran.append(cmd) or True, dump=lambda: SCARLETT_BACK, file=self.file,
+                   clock=lambda: 1000.0)
+        sel = module(json.loads(self.select.read_text()), "libpipewire-module-loopback")["capture.props"]
+        self.assertEqual(sel["audio.position"], ["FL"])  # the Instrument's channel 1, never the XLR's FR
 
     def test_selecting_reads_the_selector_node_by_name(self):
         self.assertEqual((voice.selecting(SELECTING), voice.selecting(SCARLETT_BACK), voice.selecting("")),

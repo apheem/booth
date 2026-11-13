@@ -398,6 +398,15 @@ class VoiceGroup(PageCase):
         self.page.poll()
         self.assertEqual(self.applied, [({}, s)])
 
+    def test_a_selector_that_wont_stop_says_booth_mic_may_still_take_the_old_channel(self):
+        s = state(**{"PCM 02 Capture Enum": 5})  # rerouted, and systemctl stop failed: the old selector still feeds
+        self.said = "not stopped: Booth Mic's source still takes the mic's old channel"
+        idle = self.real_poll(lambda choice: s)
+        self.page.poll()
+        f, a = idle[0]
+        f(*a)
+        self.assertEqual(self.page.voice.description, voice.STALE)
+
     def test_an_unplugged_poll_applies_nothing(self):
         self.real_poll(lambda choice: None)
         self.page.poll()
@@ -521,7 +530,7 @@ class Worker(unittest.TestCase):
         page.writer.writes = 4
         with mock.patch.object(microphone.scarlett, "read", boom), self.assertRaises(Boom):
             microphone.MicrophonePage.poll(page)
-        self.assertEqual(self.idle, [(page.show, (None, 4, True))])
+        self.assertEqual(self.idle, [(page.show, (None, 4, True, ""))])
 
 
 if __name__ == "__main__":

@@ -89,23 +89,23 @@ class MicrophonePage(Adw.PreferencesPage):
         return GLib.SOURCE_CONTINUE
 
     def read(self, since):
-        state, selecting = None, True
+        state, selecting, said = None, True, ""
         try:
             state = scarlett.read(self.choice())
             if state:  # unplugged: the running chain keeps its last config
-                voice.apply(self.settings, state)  # not routed: the selector stops
+                said = voice.apply(self.settings, state)  # not routed: the selector stops
                 selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
         finally:  # always: show() clears polling, else the page stops following outside changes
-            GLib.idle_add(self.show, state, since, selecting)
+            GLib.idle_add(self.show, state, since, selecting, said)
 
-    def show(self, state, since, selecting=True):
+    def show(self, state, since, selecting=True, said=""):
         self.polling = False
         self.record, problem = meter.source(state)
         self.levels.set_description(problem or meter.COACHING)
         if problem:
             self.on_meter_failed(problem)
         self.meter_update()
-        self.voice.set_description(voice.describe(state, selecting))
+        self.voice.set_description(voice.describe(state, selecting, said))
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
             ctrls = state["ctrls"] if state else {}
