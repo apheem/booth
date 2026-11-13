@@ -1,9 +1,11 @@
 """The PRO X headset: the dongle's hardware-volume fix (amixer), and its volume and default output through wpctl, with
 the card and sink resolved fresh on every use. Fixtures are the live device's output."""
+import contextlib
+import io
 import json
 import unittest
 
-from booth import devices, headset
+from booth import devices, headset, hidpp
 from tests.fixture import read
 
 CGET, CONTENTS = read("headset/amixer-cget-pcm.txt"), read("headset/amixer-contents.txt")
@@ -179,6 +181,165 @@ class State(unittest.TestCase):
         self.assertEqual(headset.status({"volume": 0.63, "default": False}), "Volume 63 %")
         self.assertEqual(headset.status({"volume": 1.5, "default": False}), "Volume 150 %")  # boosted elsewhere: the truth
         self.assertEqual(headset.status(None), "Not connected")
+
+    def test_sidebar_subtitle_with_the_battery(self):
+        on, off = monitor((3990, False)), monitor(hidpp.OFF)
+        self.assertEqual(headset.status({"volume": 0.63, "default": False}, on), "~75 % · Volume 63 %")
+        self.assertEqual(headset.status({"volume": 0.63, "default": False}, off), "Off · Volume 63 %")
+        self.assertEqual(headset.status(None, off), "Not connected")  # the dongle itself is gone
+        self.assertEqual(headset.status({"volume": 0.63, "default": False}, headset.HeadsetMonitor()), "Volume 63 %")
+
+
+def monitor(*readings):
+    """A HeadsetMonitor after these battery readings, recording its events and notifications."""
+    m = headset.HeadsetMonitor(notify=lambda pct: m.log.append(("notify", pct)))
+    m.log = []
+    m.listeners.append(lambda event: m.log.append(event))
+    for r in readings:
+        m.update(r)
+    return m
+
+
+class Battery(unittest.TestCase):
+    """The service's 10 s battery poll: on/off and battery events, smoothing, and the warn-once rule."""
+
+    def test_the_first_answer_is_on_and_a_battery_level(self):
+        m = monitor((3990, False))
+        self.assertEqual((m.on, m.percent, m.charging, m.log), (True, 75, False, ["on", "battery"]))
+
+    def test_the_error_reply_is_off_at_once(self):
+        m = monitor(hidpp.OFF)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["off"]))
+        m = monitor((3990, False), hidpp.OFF)
+        self.assertEqual((m.on, m.log[-1]), (False, "off"))
+
+    def test_one_missed_reply_does_not_flap_off_and_on(self):  # adjudication: a single ~1 s timeout is a miss
+        m = monitor((3990, False), None, (3990, False))
+        self.assertEqual((m.on, m.percent, m.log), (True, 75, ["on", "battery"]))
+
+    def test_one_missed_reply_keeps_the_smoothing(self):
+        m = monitor((3990, False), None, (3830, False))  # a load spike after a miss still moves only part of the way
+        self.assertEqual(m.percent, monitor((3990, False), (3830, False)).percent)
+        self.assertGreater(m.percent, 50)
+
+    def test_two_missed_replies_in_a_row_are_off(self):
+        m = monitor((3990, False), None)
+        self.assertEqual((m.on, m.percent), (True, 75))
+        m.update(None)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
+
+    def test_misses_count_only_in_a_row(self):
+        m = monitor((3990, False), None, (3990, False), None)
+        self.assertEqual((m.on, m.log), (True, ["on", "battery"]))
+
+    def test_no_answer_before_the_first_reply_is_off_after_two_misses(self):
+        m = monitor(None)
+        self.assertEqual((m.on, m.log), (None, []))
+        m.update(None)
+        self.assertEqual((m.on, m.log), (False, ["off"]))
+
+    def test_going_off_drops_the_last_level(self):  # no stale percent for a headset that no longer answers
+        m = monitor((3990, False), hidpp.OFF)
+        self.assertEqual((m.on, m.percent, m.log), (False, None, ["on", "battery", "off"]))
+
+    def test_on_off_on_emits_each_change_once(self):
+        m = monitor((3990, False), (3990, False), None, None, (3990, False))
+        self.assertEqual(m.log, ["on", "battery", "off", "on", "battery"])
+
+    def test_an_unchanged_level_emits_nothing(self):
+        m = monitor((3990, False))
+        m.log.clear()
+        m.update((3990, False))
+        self.assertEqual(m.log, [])
+
+    def test_a_level_change_alone_is_a_battery_event(self):
+        m = monitor((3990, False))
+        m.log.clear()
+        m.update((3830, False))  # smoothed, still discharging, but the estimate moved
+        self.assertLess(m.percent, 75)
+        self.assertEqual(m.log, ["battery"])
+
+    def test_readings_are_smoothed(self):
+        m = monitor((3990, False), (3830, False))  # one low read (a load spike) moves it only part of the way
+        self.assertGreater(m.percent, 50)
+        self.assertLess(m.percent, 75)
+        for _ in range(30):
+            m.update((3830, False))
+        self.assertEqual(m.percent, 50)  # a lasting change gets there
+
+    def test_charging_or_coming_back_on_starts_the_smoothing_afresh(self):
+        m = monitor((3830, False), (4150, True))  # plugged in: the voltage jumps, and that is the truth
+        self.assertEqual((m.percent, m.charging), (100, True))
+        m = monitor((3830, False), hidpp.OFF, (4150, False))  # swapped/charged while off
+        self.assertEqual(m.percent, 100)
+
+    def test_a_charging_change_alone_is_a_battery_event(self):
+        m = monitor((4150, False))
+        m.log.clear()
+        m.update((4150, True))
+        self.assertEqual(m.log, ["battery"])
+
+    def test_one_warning_per_discharge_at_15_percent(self):
+        m = monitor(*[(3710, False)] * 5)  # ~13 %
+        self.assertEqual([e for e in m.log if e[0] == "notify"], [("notify", 13)])
+
+    def test_exactly_15_percent_warns(self):
+        m = monitor((3717, False))  # 3717 mV → 15 % on the curve
+        self.assertEqual((m.percent, [e for e in m.log if e[0] == "notify"]), (15, [("notify", 15)]))
+
+    def test_above_15_percent_no_warning(self):
+        m = monitor((3746, False))  # ~21 %
+        self.assertNotIn("notify", [e[0] for e in m.log])
+
+    def test_it_rearms_only_above_30_percent(self):
+        m = monitor((3710, False))
+        for mv in [3780] * 30:  # back to 30 %: not re-armed
+            m.update((mv, False))
+        for _ in range(30):
+            m.update((3710, False))
+        self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 1)
+        for _ in range(30):
+            m.update((3830, False))  # 50 %: re-armed
+        for _ in range(30):
+            m.update((3710, False))
+        self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 2)
+
+    def test_off_and_on_again_low_is_the_same_discharge(self):
+        m = monitor((3710, False), hidpp.OFF, (3710, False))
+        self.assertEqual(len([e for e in m.log if e[0] == "notify"]), 1)
+
+    def test_no_warning_while_charging(self):
+        m = monitor((3710, True))
+        self.assertNotIn("notify", [e[0] for e in m.log])
+
+    def test_a_listener_that_raises_does_not_stop_the_others_or_the_warning(self):
+        m = headset.HeadsetMonitor(notify=lambda pct: seen.append(("notify", pct)))
+        seen = []
+        m.listeners += [lambda e: 1 / 0, seen.append]
+        with contextlib.redirect_stderr(io.StringIO()):
+            m.update((3710, False))
+        self.assertEqual(seen, ["on", "battery", ("notify", 13)])
+
+    def test_card_texts(self):
+        self.assertEqual(headset.card(monitor((3990, False))), ("PRO X Wireless — Connected", "~75 % (est.)"))
+        self.assertEqual(headset.card(monitor((3990, True))), ("PRO X Wireless — Connected", "~75 % (est.), charging"))
+        self.assertEqual(headset.card(monitor(hidpp.OFF)), ("PRO X Wireless — Off", None))
+        self.assertEqual(headset.card(headset.HeadsetMonitor()), ("PRO X Wireless", None))  # before the first poll
+
+
+class Poll(unittest.TestCase):
+    def test_the_query_runs_off_the_main_loop_and_polls_never_pile_up(self):
+        spawned = []
+        m = headset.HeadsetMonitor(spawn=lambda work, done: spawned.append((work, done)))
+        self.assertIs(m.poll(), True)  # a GLib timeout that keeps going
+        m.poll()  # the first one hasn't answered yet
+        self.assertEqual(len(spawned), 1)
+        work, done = spawned[0]
+        self.assertIs(work, headset.hidpp.battery)
+        done((3990, False))
+        self.assertEqual((m.on, m.percent), (True, 75))
+        m.poll()
+        self.assertEqual(len(spawned), 2)
 
 
 class WriterTest(unittest.TestCase):

@@ -1,13 +1,14 @@
 """The Headphones page's wiring: its writes and polls run on a worker and always report back to the main loop, even
 when the worker raises, so Writer.busy and the page's polling flag never stay stuck; "Use for all sound" keeps the
 sink it replaces in the settings, saved on the main loop."""
+import contextlib
 import types
 import unittest
 from unittest import mock
 
 from gi.repository import GObject
 
-from booth import headset
+from booth import headset, hidpp
 from booth.ui import headphones
 from tests.test_app import Inline
 from tests.test_headset import DUMP, PRO_X, SCARLETT, default_sink, dump
@@ -56,11 +57,13 @@ class Worker(unittest.TestCase):
             headphones.HeadphonesPage.poll(page)
         self.assertEqual(len(reads), 2)
 
-    def test_stop_removes_the_poll_timer(self):
-        page, removed = mock.Mock(timer=7), []
+    def test_stop_removes_the_poll_timer_and_the_battery_listener(self):
+        page, removed = mock.Mock(timer=7, monitor=headset.HeadsetMonitor()), []
+        page.monitor.listeners += [print, page.on_headset]
         with mock.patch.object(headphones.GLib, "source_remove", removed.append):
             headphones.HeadphonesPage.stop(page)
         self.assertEqual(removed, [7])
+        self.assertEqual(page.monitor.listeners, [print])  # the service's other subscribers stay
 
 
 class UseForAllSound(unittest.TestCase):
@@ -118,8 +121,8 @@ class _W:
     """A widget stand-in: GTK can't start without a display, so the page's rows are these."""
     active = False
 
-    def __init__(self, *_args, **_kwargs):
-        self.handlers = {}
+    def __init__(self, *_args, **kwargs):
+        self.handlers, self.set = {}, {f"set_{k}": (v,) for k, v in kwargs.items()}
 
     def connect(self, signal, handler):
         self.handlers[signal] = handler
@@ -127,14 +130,76 @@ class _W:
     def get_active(self):
         return self.active
 
-    def __getattr__(self, _name):  # set_hexpand, add_suffix, set_sensitive…
-        return lambda *_args: None
+    def __getattr__(self, name):  # set_hexpand, add_suffix, set_sensitive…: the last call's arguments are kept
+        return lambda *args: self.set.__setitem__(name, args)
 
 
 # A real GObject with the page's own methods (a widget can't be made headless); __init__ is the page's own, run below.
 Page = type("HeadphonesStandIn", (GObject.Object,), {
     **{k: v for k, v in vars(headphones.HeadphonesPage).items() if callable(v) and not k.startswith("__")},
     "add": lambda self, _group: None, "poll": lambda self: True})
+
+
+@contextlib.contextmanager
+def stand_ins():
+    """The page's widgets as _W, its threads inline, and the main loop's idle_add run at once."""
+    ns = types.SimpleNamespace
+    with mock.patch.object(headphones, "super", lambda *a: ns(__init__=lambda: None), create=True), \
+            mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W)), \
+            mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0))), \
+            mock.patch.object(headphones.GLib, "timeout_add_seconds", lambda *a: 1), \
+            mock.patch.object(headphones.GLib, "idle_add", lambda f, *a: f(*a)), \
+            mock.patch.object(headphones.threading, "Thread", Inline):
+        yield
+
+
+class Battery(unittest.TestCase):
+    """The status card and sidebar follow the service's HeadsetMonitor through the page's real __init__."""
+
+    def page(self, monitor, state={"volume": 0.63, "default": False}):
+        page, sidebar = Page(), []
+        with stand_ins():
+            headphones.HeadphonesPage.__init__(page, {"headphones": {}}, sidebar.append, monitor)
+            page.show(state, page.writer.writes)  # a volume poll came back
+        return page, sidebar
+
+    def test_before_the_first_answer_the_card_shows_no_state(self):
+        page, sidebar = self.page(headset.HeadsetMonitor())
+        self.assertEqual(page.group.set["set_title"], ("PRO X Wireless",))
+        self.assertEqual(sidebar[-1], "Volume 63 %")
+
+    def test_connected_shows_the_estimate_on_the_card_and_in_the_sidebar(self):
+        monitor = headset.HeadsetMonitor()
+        page, sidebar = self.page(monitor)
+        monitor.update((3990, False))  # the service's poll, after the page opened
+        self.assertEqual(page.group.set["set_title"], ("PRO X Wireless — Connected",))
+        self.assertEqual(page.battery.set["set_subtitle"], ("~75 % (est.)",))
+        self.assertEqual(page.battery.set["set_visible"], (True,))
+        self.assertEqual(sidebar[-1], "~75 % · Volume 63 %")
+
+    def test_off_says_off_and_hides_the_battery(self):
+        monitor = headset.HeadsetMonitor()
+        monitor.update((3990, False))
+        page, sidebar = self.page(monitor)  # opened while on: shown at once, no event needed
+        self.assertEqual(sidebar[-1], "~75 % · Volume 63 %")
+        monitor.update(hidpp.OFF)
+        self.assertEqual(page.group.set["set_title"], ("PRO X Wireless — Off",))
+        self.assertEqual(page.battery.set["set_visible"], (False,))
+        self.assertEqual(sidebar[-1], "Off · Volume 63 %")
+
+    def test_the_dongle_unplugged_is_not_connected(self):
+        monitor = headset.HeadsetMonitor()
+        monitor.update(hidpp.OFF)
+        _, sidebar = self.page(monitor, state=None)
+        self.assertEqual(sidebar[-1], "Not connected")
+
+    def test_a_closed_page_stops_listening(self):
+        monitor = headset.HeadsetMonitor()
+        page, sidebar = self.page(monitor)
+        with mock.patch.object(headphones.GLib, "source_remove"):
+            page.stop()
+        monitor.update((3990, False))
+        self.assertEqual(sidebar[-1], "Volume 63 %")
 
 
 class Click(unittest.TestCase):
@@ -147,17 +212,10 @@ class Click(unittest.TestCase):
         def run(*cmd):
             ran.append(list(cmd))
             return pw_dump if cmd == ("pw-dump",) else ""
-        ns, send = types.SimpleNamespace, headset.send
-        page = Page()
-        with mock.patch.object(headphones, "super", lambda *a: ns(__init__=lambda: None), create=True), \
-                mock.patch.object(headphones, "Adw", ns(PreferencesGroup=_W, ActionRow=_W, SwitchRow=_W)), \
-                mock.patch.object(headphones, "Gtk", ns(Scale=ns(new_with_range=_W), Orientation=ns(HORIZONTAL=0))), \
-                mock.patch.object(headphones.GLib, "timeout_add_seconds", lambda *a: 1), \
-                mock.patch.object(headphones.GLib, "idle_add", lambda f, *a: f(*a)), \
-                mock.patch.object(headphones.threading, "Thread", Inline), \
-                mock.patch.object(headphones.headset, "send", lambda make: send(make, run)), \
+        page, send = Page(), headset.send
+        with stand_ins(), mock.patch.object(headphones.headset, "send", lambda make: send(make, run)), \
                 mock.patch.object(headphones.store, "save", saved.append):
-            headphones.HeadphonesPage.__init__(page, settings)
+            headphones.HeadphonesPage.__init__(page, settings, lambda text: None, headset.HeadsetMonitor())
             self.assertEqual([n for n in vars(page) if hasattr(headphones.HeadphonesPage, n)], [])  # none shadowed
             switch = page.rows[1]
             switch.active = on
