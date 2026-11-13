@@ -1,5 +1,6 @@
-"""The Scarlett's stuck output: found by what PipeWire sends against the device's own Level Meter, restarted by one
-pair of silent streams at another rate. Fixtures and fakes only: no pw-record, pw-play or amixer runs here."""
+"""The Scarlett's stuck output: heard by one passive listener on the sink's monitor against the device's own Level
+Meter, restarted by one pair of silent streams at another rate. Fixtures and fakes only: no pw-record, pw-play or
+amixer runs here."""
 import array
 import os
 import unittest
@@ -12,25 +13,22 @@ SOURCE = "alsa_input.usb-Focusrite_Scarlett_Solo_4th_Gen_FAKESER1-00.analog-surr
 # `amixer -c Gen cget iface=PCM,name='Level Meter'` as captured: playing, then stuck (only the mic's points move)
 METER = ("numid=46,iface=PCM,name='Level Meter'\n  ; type=INTEGER,access=r--v----,values=12,min=0,max=4095,step=1\n"
          "  : values={}\n")
-PLAYING, STUCK, IDLE = "25,25,25,25,0,3,0,3,0,3,25,25", "0,0,0,0,0,1,0,1,0,1,0,0", "0,0,0,0,0,0,0,0,0,0,0,0"
-
-
-def running(objects, state="running"):
-    node(objects, SCARLETT)["info"]["state"] = state
+PLAYING, STUCK = METER.format("25,25,25,25,0,3,0,3,0,3,25,25"), METER.format("0,0,0,0,0,1,0,1,0,1,0,0")
+GAIN = 0.438993  # the captured sink's volume
 
 
 def floats(*values):
     return array.array("f", values).tobytes()
 
 
-class Nodes(unittest.TestCase):
-    def test_the_scarletts_sink_and_source_by_name_its_state_and_its_volume(self):
-        found = revive.nodes(dump(running))
-        self.assertEqual((found["sink"], found["source"], found["running"]), (SCARLETT, SOURCE, True))
-        self.assertAlmostEqual(found["gain"], 0.438993)
+LOUD, QUIET = floats(0.2, -0.4), floats(0.001, 0.0)  # 0.4 x GAIN is well above SENT_MIN; 0.001 never is
 
-    def test_a_suspended_sink_is_not_running(self):
-        self.assertIs(revive.nodes(DUMP)["running"], False)
+
+class Nodes(unittest.TestCase):
+    def test_the_scarletts_sink_and_source_by_name_its_id_and_its_volume(self):
+        found = revive.nodes(DUMP)
+        self.assertEqual((found["sink"], found["source"], found["id"]), (SCARLETT, SOURCE, 176))
+        self.assertAlmostEqual(found["gain"], GAIN)
 
     def test_a_muted_sink_sends_nothing(self):
         muted = dump(lambda o: node(o, SCARLETT)["info"]["params"]["Props"][0].update(mute=True))
@@ -49,119 +47,202 @@ class Nodes(unittest.TestCase):
                 "media.class": "Stream/Output/Audio", "application.name": "Idle"}}})
         self.assertEqual(revive.nodes(dump(spotify))["apps"], ["Spotify"])
 
+    def test_the_pro_x_is_never_the_one_watched(self):
+        self.assertNotIn(PRO_X, str(revive.nodes(DUMP)))
+
 
 class Meter(unittest.TestCase):
     def test_the_level_meters_points(self):
-        self.assertEqual(revive.parse_meter(METER.format(PLAYING)), [25, 25, 25, 25, 0, 3, 0, 3, 0, 3, 25, 25])
+        self.assertEqual(revive.parse_meter(PLAYING), [25, 25, 25, 25, 0, 3, 0, 3, 0, 3, 25, 25])
         self.assertEqual(revive.parse_meter("amixer: Cannot find the given element from control sysdefault:6\n"), [])
 
-    def test_the_peak_of_what_was_recorded(self):
+    def test_the_peak_of_what_was_heard(self):
         self.assertAlmostEqual(revive.peak(floats(0.0, -0.25, 0.1)), 0.25)
         self.assertEqual(revive.peak(b""), 0.0)
         self.assertAlmostEqual(revive.peak(floats(0.5) + b"\x01"), 0.5)  # a torn last sample is dropped
 
-    def test_signal_sent_and_no_playback_point_moving_is_stuck(self):
-        self.assertIs(revive.stuck(0.05, revive.parse_meter(METER.format(STUCK))), True)  # the mic's points don't count
-        self.assertIs(revive.stuck(0.05, revive.parse_meter(METER.format(PLAYING))), False)
-        self.assertIs(revive.stuck(0.05, [0] * 11 + [1]), False)  # one playback point is enough
 
-    def test_quiet_or_unknown_is_never_stuck(self):
-        idle = revive.parse_meter(METER.format(IDLE))
-        self.assertIs(revive.stuck(revive.SENT_MIN / 2, idle), False)  # too quiet for the meter to show: unknown
-        self.assertIs(revive.stuck(revive.SENT_MIN, idle), True)
-        self.assertIs(revive.stuck(0.5, []), False)  # the meter couldn't be read
-        self.assertIs(revive.stuck(0.5, [0] * 8), False)  # another device's layout
-
-
-class Look(unittest.TestCase):
-    def look(self, raw, meters, card="Gen"):
-        asked, texts = [], iter(meters)
-
-        def run(*cmd):
-            asked.append(list(cmd))
-            return next(texts)
-        listen = mock.Mock()
-        listen.return_value.communicate.return_value = (raw, None)
-        with mock.patch.object(revive.time, "sleep"):
-            out = revive.look({"sink": SCARLETT, "gain": 0.5}, run, lambda: card, listen)
-        return out, asked, listen
-
-    def test_the_peak_sent_times_the_volume_and_each_points_highest_of_three_reads(self):
-        (sent, meters), asked, listen = self.look(floats(0.2, -0.4), [METER.format(IDLE), METER.format(PLAYING),
-                                                                      METER.format(STUCK)])
-        self.assertAlmostEqual(sent, 0.2)
-        self.assertEqual(meters, [25, 25, 25, 25, 0, 3, 0, 3, 0, 3, 25, 25])
-        self.assertEqual(asked, [["amixer", "-c", "Gen", "cget", "iface=PCM,name=Level Meter"]] * 3)
-        listen.assert_called_once_with(SCARLETT)
-
-    def test_a_read_that_failed_gives_no_meter(self):
-        self.assertEqual(self.look(floats(0.4), [METER.format(STUCK), "", METER.format(STUCK)])[0][1], [])
-
-    def test_the_card_gone_listens_to_nothing(self):
-        out, asked, listen = self.look(floats(0.4), [], card=None)
-        self.assertEqual((out, asked, listen.called), ((0.0, []), [], False))
-
-    def test_it_listens_to_the_sinks_monitor_by_name_briefly_and_never_another_one(self):
+class Listener(unittest.TestCase):
+    def test_one_passive_internal_stream_on_the_sinks_monitor_by_name_and_never_another_one(self):
         with mock.patch.object(revive.subprocess, "Popen") as popen:
             revive.listen(SCARLETT)
         cmd = popen.call_args[0][0]
-        self.assertEqual(cmd[:3], ["timeout", str(revive.LOOK_S), "pw-record"])
-        self.assertEqual(cmd[cmd.index("--target") + 1], SCARLETT)
+        self.assertEqual(cmd[:3], ["pw-record", "--target", SCARLETT])
         props = cmd[cmd.index("-P") + 1]
-        self.assertIn("stream.capture.sink = true", props)
-        self.assertIn("node.dont-reconnect = true", props)
-        # mono at 8 kHz: the whole look fits in the pipe, so a recorder is never left blocked on it
-        self.assertLess(revive.LOOK_S * 8000 * 4, 65536)
-        self.assertEqual((cmd[cmd.index("--channels") + 1], cmd[cmd.index("--rate") + 1]), ("1", "8000"))
+        for wanted in ("stream.capture.sink = true",  # the output's monitor, not a microphone
+                       "node.dont-reconnect = true",  # never moved to another node, a mic least of all
+                       "node.passive = true",  # the Scarlett still sleeps when nothing plays
+                       "media.class = Stream/Input/Audio/Internal"):  # no recording indicator, in no app's list
+            self.assertIn(wanted, props)
+        self.assertEqual((cmd[cmd.index("--channels") + 1], cmd[cmd.index("--rate") + 1], cmd[cmd.index("--format") + 1]),
+                         ("1", "8000", "f32"))
+        self.assertEqual(revive.CHUNK, int(8000 * revive.CHUNK_S) * 4)  # hear()'s chunk is CHUNK_S of that
 
 
-class Watching(unittest.TestCase):
-    ALIVE, DEAD, QUIET = (0.05, [25] * 12), (0.05, [0] * 12), (0.0, [0] * 12)
+class Hearing(unittest.TestCase):
+    """Watch.hear, a chunk at a time: the meter is whatever self.meter says, the volume whatever self.dump gives."""
 
-    def watch(self, looks, text=None):
-        self.looks, self.restarts, self.now, self.said = iter(looks), [], 1000.0, []
-        return revive.Watch(run=lambda *cmd: dump(running) if text is None else text,
-                            look=lambda found: next(self.looks), restart=self.restarts.append,
-                            clock=lambda: self.now, sleep=lambda s: None, log=self.said.append)
+    def setUp(self):
+        self.meter, self.dump, self.now, self.card = PLAYING, DUMP, 100.0, "Gen"
+        self.asked, self.restarts, self.logged = [], [], []
+        self.watch = revive.Watch(None, self.tool, lambda: self.card, self.restart, None, lambda: self.now,
+                                  self.logged.append)
+        self.watch.found, self.watch.dumped = revive.nodes(DUMP), self.now
 
-    def test_a_sink_that_is_not_running_is_never_looked_at(self):
-        self.assertIsNone(self.watch([], DUMP).check())  # suspended: an exhausted `looks` would raise
-        self.assertIsNone(self.watch([], "").check())
+    def tool(self, *cmd):
+        self.asked.append(cmd[0])
+        return self.dump if cmd[0] == "pw-dump" else self.meter
 
-    def test_playing_and_heard_inside_the_device_does_nothing(self):
-        watch = self.watch([self.ALIVE])
-        self.assertEqual((watch.check(), self.restarts), (None, []))
+    def restart(self, found):
+        self.restarts.append(found["sink"])
+        self.now += 0.56  # as measured
 
-    def test_silence_being_played_is_unknown_and_does_nothing(self):
-        watch = self.watch([self.QUIET])
-        self.assertEqual((watch.check(), self.restarts), (None, []))
+    def hear(self, *chunks):
+        return [self.watch.hear(chunk) for chunk in chunks]
 
-    def test_stuck_in_two_looks_is_restarted_and_said_once_it_is_heard_again(self):
-        watch = self.watch([self.DEAD, self.DEAD, self.ALIVE])
-        self.assertEqual(watch.check(), revive.REVIVED)
-        self.assertEqual([found["sink"] for found in self.restarts], [SCARLETT])
-        self.assertIn("stuck", self.said[0])
+    def test_sound_heard_inside_the_device_does_nothing_and_the_meter_is_read_sparingly(self):
+        self.assertEqual(set(self.hear(*[LOUD] * 13)), {None})
+        self.assertEqual(self.asked, ["amixer"] * 3)  # at SUSTAIN chunks, then every EVERY: 3, 8, 13
+        self.assertEqual(self.restarts, [])
 
-    def test_stuck_in_one_look_only_is_not_restarted(self):  # the music started as the look ended
-        watch = self.watch([self.DEAD, self.ALIVE])
-        self.assertEqual((watch.check(), self.restarts), (None, []))
+    def test_silence_and_quiet_sound_are_unknown_and_the_meter_is_not_even_read(self):
+        self.meter = STUCK
+        self.hear(*[QUIET] * 20)
+        self.assertEqual((self.asked, self.restarts), ([], []))
 
-    def test_a_restart_that_did_not_help_says_to_replug_and_is_not_tried_again_until_it_is_heard(self):
-        watch = self.watch([self.DEAD, self.DEAD, self.DEAD, self.DEAD, self.DEAD, self.ALIVE, self.DEAD, self.DEAD,
-                            self.ALIVE])
-        self.assertEqual(watch.check(), revive.GAVE_UP)
-        self.now += 10 * revive.BACKOFF_S
-        self.assertEqual((watch.check(), watch.check(), len(self.restarts)), (None, None, 1))  # still stuck: quiet
-        self.assertIsNone(watch.check())  # heard again (a replug)
-        self.assertEqual((watch.check(), len(self.restarts)), (revive.REVIVED, 2))  # a new stop gets its own restart
+    def test_unbroken_sound_and_a_dead_meter_twice_is_restarted_within_half_a_second_of_sound(self):
+        self.meter = STUCK
+        self.assertEqual(set(self.hear(*[LOUD] * 4)), {None})  # 3 chunks to judge, the 4th confirms: 0.4 s of sound
+        self.assertEqual(self.restarts, [SCARLETT])
+        self.assertIn("stuck", self.logged[0])
+        self.assertEqual(self.asked, ["amixer", "pw-dump", "amixer"])  # the volume read again before believing it
 
-    def test_stuck_again_right_after_a_restart_waits(self):
-        watch = self.watch([self.DEAD, self.DEAD, self.ALIVE, self.DEAD, self.DEAD, self.DEAD, self.ALIVE])
-        self.assertEqual(watch.check(), revive.REVIVED)
-        self.now += revive.BACKOFF_S - 1
-        self.assertEqual((watch.check(), len(self.restarts)), (None, 1))
-        self.now += 2
-        self.assertEqual((watch.check(), len(self.restarts)), (revive.REVIVED, 2))
+    def test_a_pause_between_the_two_reads_starts_over(self):  # speech: the meter may have been read in the gap
+        self.meter = STUCK
+        self.hear(LOUD, LOUD, LOUD, QUIET, LOUD, LOUD, LOUD, QUIET)
+        self.assertEqual(self.restarts, [])
+
+    def test_sound_too_short_to_judge_is_never_judged(self):  # the device's own buffer is behind the monitor
+        self.meter = STUCK
+        self.hear(*[LOUD, LOUD, QUIET] * 5)
+        self.assertEqual((self.asked, self.restarts), ([], []))
+
+    def test_a_volume_turned_down_since_it_was_read_is_not_a_dead_device(self):
+        self.meter = STUCK
+        self.dump = dump(lambda o: node(o, SCARLETT)["info"]["params"]["Props"][0].update(channelVolumes=[0.001] * 2))
+        self.hear(*[LOUD] * 10)
+        self.assertEqual(self.restarts, [])
+
+    def test_a_volume_turned_up_since_it_was_read_is_followed(self):
+        self.watch.found["gain"], self.meter = 0.0001, STUCK
+        self.hear(*[LOUD] * 4)
+        self.assertEqual(self.restarts, [])  # still the old volume: too quiet to judge
+        self.now += revive.GAIN_S + 1
+        self.hear(*[LOUD] * 4)
+        self.assertEqual(self.restarts, [SCARLETT])
+
+    def test_a_muted_sink_is_never_judged(self):
+        self.watch.found["gain"], self.meter = 0.0, STUCK
+        self.hear(*[LOUD] * 10)
+        self.assertEqual(self.restarts, [])
+
+    def test_a_meter_that_cannot_be_read_or_has_another_layout_is_never_judged(self):
+        for self.meter in ("", METER.format("0,0,0,0,0,0,0,0")):
+            self.hear(*[LOUD] * 10)
+        self.card, self.meter = None, STUCK
+        self.hear(*[LOUD] * 10)
+        self.assertEqual(self.restarts, [])
+
+    def test_the_mics_points_moving_do_not_count_as_playback(self):
+        self.meter = METER.format("0,0,0,0,900,900,900,900,900,900,0,0")
+        self.hear(*[LOUD] * 4)
+        self.assertEqual(self.restarts, [SCARLETT])
+
+    def stuck_then(self, meter):
+        """A restart, then the chunks that piled up while it ran, then sound with `meter`."""
+        self.meter = STUCK
+        self.hear(*[LOUD] * 4)
+        self.meter = meter
+        return self.hear(*[LOUD] * 14)
+
+    def test_a_restart_is_said_once_the_device_is_heard_again(self):
+        said = self.stuck_then(PLAYING)
+        self.assertEqual([s for s in said if s], [revive.REVIVED])
+        self.assertEqual(said[:7], [None] * 7)  # 0.56 s of backlog is skipped: it is older than the meter
+
+    def test_a_second_stop_in_the_same_call_is_restarted_again_at_once(self):
+        self.stuck_then(PLAYING)
+        self.meter = STUCK
+        self.hear(*[LOUD] * 8)
+        self.assertEqual(self.restarts, [SCARLETT] * 2)
+
+    def test_a_restart_that_did_not_help_says_to_replug_once_and_is_not_repeated_until_the_device_is_heard(self):
+        said = self.stuck_then(STUCK) + self.hear(*[LOUD] * 40)
+        self.assertEqual(([s for s in said if s], self.restarts), ([revive.GAVE_UP], [SCARLETT]))
+        # the volume read once per verdict (the stop, the restart's check), never over and over once given up
+        self.assertEqual(self.asked.count("pw-dump"), 2)
+        self.meter = PLAYING  # replugged
+        self.hear(*[LOUD] * 8)
+        self.meter = STUCK
+        self.hear(*[LOUD] * 8)
+        self.assertEqual(self.restarts, [SCARLETT] * 2)  # a new stop gets its own restart
+
+
+class Following(unittest.TestCase):
+    def watch(self, text=DUMP):
+        self.said, self.text, self.procs = [], text, []
+        return revive.Watch(self.said.append, lambda *cmd: self.text, lambda: "Gen", None, self.listen,
+                            lambda: 100.0, lambda text: None)
+
+    def listen(self, sink):
+        proc = mock.Mock(sink=sink)
+        proc.stdout.read.side_effect = [LOUD.ljust(revive.CHUNK, b"\0"), b"x"]  # one chunk, then the stream ends
+        self.procs.append(proc)
+        return proc
+
+    def test_the_listener_starts_on_the_scarletts_sink_hears_every_chunk_and_ends_its_stream(self):
+        watch = self.watch()
+        with mock.patch.object(watch, "hear", return_value=revive.REVIVED) as hear:
+            watch.ensure()
+            watch.thread.join(2)
+        self.assertEqual([p.sink for p in self.procs], [SCARLETT])
+        hear.assert_called_once_with(LOUD.ljust(revive.CHUNK, b"\0"))
+        self.assertEqual(self.said, [revive.REVIVED])
+        self.procs[0].kill.assert_called_once_with()  # the stream never outlives its thread
+        self.procs[0].stdout.read.assert_called_with(revive.CHUNK)
+
+    def test_no_scarlett_or_an_unreadable_dump_starts_nothing(self):
+        for text in (dump(lambda o: o.remove(node(o, SCARLETT))), ""):
+            watch = self.watch(text)
+            watch.ensure()
+            self.assertEqual((self.procs, watch.thread), ([], None))
+
+    def test_a_listener_that_runs_is_left_alone_and_one_on_a_replaced_sink_is_ended(self):
+        watch = self.watch()
+        watch.found, watch.proc, watch.thread = revive.nodes(DUMP), mock.Mock(), mock.Mock()
+        watch.ensure()
+        self.text = ""  # pw-dump unreadable this once
+        watch.ensure()
+        self.assertEqual((self.procs, watch.proc.kill.called), ([], False))
+        self.text = dump(lambda o: node(o, SCARLETT).update(id=301))  # replugged: the same name, a new node
+        watch.ensure()
+        watch.proc.kill.assert_called_once_with()
+        self.assertEqual(self.procs, [])  # the next tick starts the new one, once that thread has ended
+
+    def test_an_ended_listener_is_started_again(self):
+        watch = self.watch()
+        watch.thread = mock.Mock(is_alive=lambda: False)
+        with mock.patch.object(watch, "hear", return_value=None):
+            watch.ensure()
+            watch.thread.join(2)
+        self.assertEqual(len(self.procs), 1)
+
+    def test_stop_ends_the_stream_and_is_fine_before_any(self):
+        watch = self.watch()
+        watch.stop()
+        watch.proc = mock.Mock()
+        watch.stop()
+        watch.proc.kill.assert_called_once_with()
 
 
 class Restart(unittest.TestCase):
@@ -193,9 +274,10 @@ class Restart(unittest.TestCase):
         cap.kill.assert_called_once_with()
         cap.wait.assert_called_once_with()
 
-    def test_already_at_44100_it_goes_to_48000(self):  # the same rate again changes nothing in the device
+    def test_a_second_restart_goes_on_to_88200_never_back_to_the_graphs_own_48000(self):
         ran = self.restart({"sink": SCARLETT, "source": SOURCE}, "rate: 44100 (44100/1)\n")
-        self.assertIn("node.force-rate = 48000", ran[0][4])
+        self.assertIn("node.force-rate = 88200", ran[0][4])  # 48000 is ignored while streams run; 44100 changes nothing
+        self.assertEqual([revive.other_rate(f"rate: {r} ({r}/1)\n") for r in (48000, 88200, 96000)], [44100] * 3)
         self.assertEqual(revive.other_rate("closed\n"), 44100)
 
     def test_without_a_source_only_the_playback_stream(self):
@@ -207,6 +289,3 @@ class Restart(unittest.TestCase):
             self.restart({"sink": SCARLETT, "source": SOURCE}, fail=True)
         self.started[0].kill.assert_called_once_with()
         self.assertFalse(os.path.exists(self.path))
-
-    def test_the_pro_x_is_never_restarted(self):
-        self.assertNotIn(PRO_X, str(revive.nodes(dump(running))))

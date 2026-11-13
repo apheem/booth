@@ -315,6 +315,7 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertEqual(every.call_args_list, [mock.call(10, stub.headset_monitor.poll),
                                                 mock.call(10, executor.return_value.retry), mock.call(10, stub.heal_voice),
                                                 mock.call(10, stub.watch_output)])
+        stub.watch_output.assert_called_once_with()  # and its listener at once, not a tick later
         monitor = folders["/dev/v4l/by-id"].monitor_directory.return_value
         self.assertIs(stub.monitor, monitor)
         monitor.connect.assert_called_once_with("changed", stub.on_by_id)
@@ -803,27 +804,28 @@ class MicFallback(unittest.TestCase):
         stub.window.microphone.save_voice.assert_called_once_with()
         stub.window.microphone.take.stop.assert_called_once_with()  # no test recording outlives Booth
 
-    def test_the_scarletts_stuck_output_is_watched_off_the_main_loop_one_look_at_a_time(self):
-        stub, spawned = mock.Mock(watching=False), []
-        with mock.patch.object(app, "off_main", lambda work, done: spawned.append((work, done))):
+    def test_the_scarletts_output_listener_is_kept_running_off_the_main_loop(self):
+        stub, started = mock.Mock(), []
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: started.append(target) or mock.Mock()):
             self.assertIs(app.Application.watch_output(stub), True)  # True: the timer goes on
-            self.assertIs(app.Application.watch_output(stub), True)  # the first look still out: no second one
-        self.assertEqual(spawned, [(stub.output_watch.check, stub.output_watched)])
+        self.assertEqual(started, [stub.output_watch.ensure])  # its pw-dump never on the main loop
 
-    def test_a_restarted_output_is_said_and_the_next_look_may_run(self):
-        stub = mock.Mock(watching=True)
-        with mock.patch.object(app.Gio.Notification, "new", lambda text: text):
-            app.Application.output_watched(stub, None)  # nothing found, or the look raised
-            self.assertIs(stub.watching, False)
+    def test_a_restarted_output_is_said_on_the_main_loop(self):
+        stub, idle = mock.Mock(), []
+        with mock.patch.object(app.Gio.Notification, "new", lambda text: text), \
+                mock.patch.object(app.GLib, "idle_add", idle.append):
+            app.Application.output_said(stub, app.revive.REVIVED)  # from the listener's thread
             stub.send_notification.assert_not_called()
-            app.Application.output_watched(stub, app.revive.REVIVED)
+            idle[0]()
         stub.send_notification.assert_called_once_with("scarlett-output", app.revive.REVIVED)
 
-    def test_quitting_ends_the_mute_watchers_pw_dump(self):  # #21: no pw-dump --monitor outlives Booth
+    def test_quitting_ends_the_mute_watchers_pw_dump_and_the_output_listener(self):  # #21: neither outlives Booth
+        stub = mock.Mock()
         with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"), \
                 mock.patch.object(app.mute, "stop") as stop:
-            app.Application.do_shutdown(mock.Mock())
+            app.Application.do_shutdown(stub)
         stop.assert_called_once_with()
+        stub.output_watch.stop.assert_called_once_with()
 
     def test_the_bus_name_the_selector_unit_asks_for_is_the_apps(self):
         self.assertEqual(app.APP_ID, service.APP_ID)
