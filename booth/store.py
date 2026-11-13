@@ -20,16 +20,28 @@ def defaults():
     # voice: {"enabled": the Voice processing master switch, "rumble": the rumble filter, "noise", "leveling", "limiter":
     #   the plugin stages' switches}, booleans, True when absent; the stages' knobs "noise_strength" and
     #   "leveling_amount" 0..100 (50 when absent) and "limiter_ceiling" −20..0 dB (−1 when absent), see booth.voice;
-    #   "monitor": the "Hear processed voice in headphones" switch, False when absent (booth.monitor).
+    #   "monitor": the "Hear processed voice in headphones" switch, False when absent (booth.monitor); the Tone stage's
+    #   switch "tone" (False when absent: an upgrade's sound unchanged) and its knobs "tone_warmth", "tone_presence" and
+    #   "tone_air", gains −12..12 dB (0 when absent). Fresh settings (no file) start on booth.voice's DEFAULT_PRESET;
+    #   an existing file without "voice" keeps ABSENT's sound. "muted": Booth's record of Booth Mic's node mute
+    #   (booth.mute), False when absent: muted, its chain carries silence.
+    #   Booth Stereo (booth.stereo): "stereo_side", the voice's side, "L" or "R" ("L" when absent), and
+    #   "stereo_source", the other side's: "scarlett", "computer" or a source's node name ("scarlett" when absent).
     # routing: {"direct_monitor": the "Turn on Direct Monitor when the PRO X turns off" switch, True when absent}, and
     #   the routing policy's own record next to it, written only by booth.routing: none, or "moved": True with "direct":
     #   Direct Monitor's value before Booth moved output to the Scarlett, put back when the PRO X turns on, or "direct":
     #   False alone while that is still to put back (the Scarlett gone).
-    return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {}, "voice": {}, "routing": {}}
+    from booth import voice  # here, not at the top: voice imports store
+    return {"version": VERSION, "camera": {}, "headphones": {}, "microphone": {},
+            "voice": dict(voice.PRESETS[voice.DEFAULT_PRESET]), "routing": {}}
 
 
 def _whole(value, top):
     return type(value) is int and 0 <= value <= top  # not a bool (JSON true), not a float (64.0)
+
+
+def _db(value, lo, hi):
+    return type(value) in (int, float) and lo <= value <= hi  # not a bool, not NaN or infinity
 
 
 def path():
@@ -39,7 +51,8 @@ def path():
     return Path(base) / "booth" / "settings.json"
 
 
-def load(file=None):
+def load(file=None, strict=False):
+    """The settings in `file`; `strict`: a file that can't be read now (EIO, EACCES…) raises OSError, never defaults."""
     file = Path(file or path())
     try:
         raw = file.read_bytes()
@@ -48,6 +61,8 @@ def load(file=None):
     except IsADirectoryError:
         raw = b""  # a folder where the file goes: moved aside below, so the next save can write the file
     except OSError:  # EIO, EACCES, EMFILE…: the file may well be fine, so it stays exactly where it is
+        if strict:
+            raise
         return defaults()
     try:
         data = json.loads(raw.decode())
@@ -64,9 +79,12 @@ def load(file=None):
         voice = data.get("voice", {})
         if not isinstance(voice, dict) \
                 or not all(isinstance(voice.get(k, True), bool)
-                           for k in ("enabled", "rumble", "noise", "leveling", "limiter", "monitor")) \
+                           for k in ("enabled", "rumble", "noise", "leveling", "limiter", "monitor", "tone", "muted")) \
                 or not all(_whole(voice.get(k, 0), 100) for k in ("noise_strength", "leveling_amount")) \
-                or not (type(c := voice.get("limiter_ceiling", -1.0)) in (int, float) and -20 <= c <= 0):  # not NaN
+                or not _db(voice.get("limiter_ceiling", -1.0), -20, 0) \
+                or not all(_db(voice.get(k, 0.0), -12, 12) for k in ("tone_warmth", "tone_presence", "tone_air")) \
+                or voice.get("stereo_side", "L") not in ("L", "R") \
+                or not isinstance(voice.get("stereo_source", "scarlett"), str) or not voice.get("stereo_source", "x"):
             raise ValueError("not a settings object")
         routing = data.get("routing", {})
         if not isinstance(routing, dict) or not all(isinstance(routing.get(k, True), bool)
@@ -79,7 +97,8 @@ def load(file=None):
         except OSError:
             pass  # can't move it aside (read-only folder): it stays as it is, and Booth still starts
         return defaults()
-    return defaults() | data
+    # a missing section takes its default, but an existing file's voice is never the preset: an upgrade keeps its sound
+    return defaults() | {"voice": {}} | data
 
 
 def save(settings, file=None):

@@ -11,8 +11,8 @@ from unittest import mock
 
 from booth import routing, voice
 from tests.test_headset import DUMP
-from tests.test_voice import (ACTIVE, MIC, ON, RESTART_SELECT, STATE, STOP_SELECT, UNITS, module, node, rerouted,
-                              selector)
+from tests.test_voice import (ACTIVE, MIC, ON, RESTART_SELECT, STATE, STOP_SELECT, UNITS, landing, module, node,
+                              rerouted, selector)
 
 PROX_MIC = "alsa_input.usb-Logitech_PRO_X_Wireless_Gaming_Headset-00.mono-fallback"  # the fixture's, MONO
 BRIO_MIC = "alsa_input.usb-046d_Logitech_BRIO_FAKESER1-03.analog-stereo"  # the fixture's, FL,FR
@@ -179,6 +179,19 @@ class Fallback(unittest.TestCase):
         self.assertTrue(self.ran)
         self.assertEqual({tuple(c[:3]) for c in self.ran if UNITS[0] in c}, {tuple(ACTIVE[:3])})  # only asked
         self.assertLessEqual(touched, set(UNITS))
+
+    def test_muted_every_fallback_moves_only_the_selector_and_booth_mic_stays_silent(self):  # #21
+        muted = {"voice": {"muted": True}}
+        landing(muted, STATE, run=lambda cmd: True, dump=desk, file=self.file)  # muted live (and read back): silent
+        for state, dump, on in ((None, ABSENT, True), (None, ABSENT, False), (STATE, desk(), True)):
+            voice.heal(muted, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or True,
+                       dump=lambda: dump, file=self.file, clock=lambda: 1000.0, on=lambda: on)
+        self.assertEqual(self.ran, [ACTIVE, RESTART_SELECT] * 3)  # never booth-voice, never a mute write
+        cfg = json.loads(self.file.read_text())
+        self.assertEqual(cfg, json.loads(voice.build(muted, {})))
+        master = next(n for n in module(cfg, "libpipewire-module-filter-chain")["filter.graph"]["nodes"]
+                      if n["name"] == "master")
+        self.assertEqual(master["control"], {"Gain 1": 0.0, "Gain 2": 0.0})
 
     def test_no_mic_left_stops_a_backup_selector_and_the_scarlett_brings_it_back(self):
         self.heal(None, ABSENT, on=False)  # on the BRIO

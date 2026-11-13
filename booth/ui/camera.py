@@ -19,10 +19,7 @@ class CameraPage(Adw.PreferencesPage):
         self.values = {n: c["value"] for n, c in self.ctrls.items() if "value" in c}
         self.rows, self.widgets, self.errors, self.quiet = {}, {}, {}, False
         self.setter = camera.Setter(settings, node, self.spawn, store.save, self.values)
-        if camera.ZOOM not in self.ctrls:
-            group = Adw.PreferencesGroup(title="Camera")
-            group.add(Adw.ActionRow(title="BRIO not found", subtitle="Plug in the camera and reopen Booth"))
-            self.add(group)
+        if camera.ZOOM not in self.ctrls:  # no BRIO: the window shows its not-connected page, and a new page on replug
             status(camera.status(self.ctrls, self.values))
             return
 
@@ -156,6 +153,12 @@ class CameraPage(Adw.PreferencesPage):
         self.show(dict(writes))
         self.setter.set(camera.reset_batch(self.ctrls, names))
         self.refresh()
+
+    def reset_zoom(self):
+        """Ctrl+0: zoom back to the camera's own default (1×), sent and saved as a slider move is, and shown."""
+        if camera.ZOOM in self.ctrls:
+            self.changed(camera.ZOOM, self.ctrls[camera.ZOOM]["default"])
+            self.show([camera.ZOOM])
 
     def reapply(self):
         """A replug reset the camera: send the saved controls again behind the page's writes, and show them."""

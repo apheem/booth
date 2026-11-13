@@ -20,7 +20,9 @@ longer picks. A backup feeds Booth Mic only while a Booth primary instance runs 
 shutdown stops it (release()), and booth-mic-select.service's ExecCondition (`--select`) never starts one without Booth:
 it removes its config, so Booth Mic is silent until Booth starts, heals and says it.
 Every stage and the master switch is a dry/wet `mixer`, set live with `pw-cli set-param` on booth.mic.input: a switch
-or a knob changes only control values, so it never restarts anything; a new shape restarts both.
+or a knob changes only control values, so it never restarts anything; a new shape restarts both. Tone (#17, builtin
+biquads) is always in the graph, and a preset (PRESETS) is every stage's switch and knob at once: live too. The page sends
+its changes through one Throttle, about 20 a second.
 The plugin stages (STAGES) are in the graph exactly when their plugin verified (booth.plugins) as the chain was built
 for its start: booth-voice.service's ExecStartPre runs `--write`, which writes voice-run.conf, the only file its pipewire
 loads and one nothing else writes, so a plugin changed since is never loaded. voice.conf is what Booth wants (apply's
@@ -28,6 +30,10 @@ record of what it set live); voice-run.conf is what runs. A change in what verif
 fails for a moment, an install's new plugins) never restarts the running chain, which mapped verified code: a stage
 whose plugin stopped verifying goes dry live, one that verifies only since waits for the next start, and the page says
 both are missing (loaded()). A new shape (new code) restarts both services, never starting one the user stopped.
+Mute (#21, booth.mute): muted, the master mixer is silent (both gains 0), live and in every voice-run.conf, so a Booth
+Mic recreated by a restart is silent before Booth puts its node mute back; and a running Booth Mic is never restarted
+while muted (_held: the record, or booth_mic's live node mute), since a call falls back to the raw mic, unmuted, while
+booth_mic is gone. This module's own runs record a live node mute the record lacks (_saved): no Booth may be watching.
     python3 -m booth.voice            write the configs from the saved settings and the Scarlett now, start the services
     python3 -m booth.voice --write [voice-run.conf [plugins folder]]
                                       only voice-run.conf, from the saved settings and the plugins verified now
@@ -37,7 +43,9 @@ both are missing (loaded()). A new shape (new code) restarts both services, neve
     python3 -m booth.voice --select voice-select.conf
                                       booth-mic-select.service's ExecCondition: may_select (exit 0) or not (1)"""
 import copy
+import itertools
 import json
+import math
 import os
 import sys
 import threading
@@ -64,6 +72,9 @@ WAITING = "Booth Mic is waiting for the Scarlett"
 NOT_ROUTED = "Booth Mic has no input: the mic isn't routed to a capture channel"
 STALE = "Booth Mic may still be using the old channel: couldn't stop it"
 STOPPED = "Booth Mic isn't running: see systemctl --user status booth-voice.service"
+HELD = "not restarted while muted: Booth Mic restarts once you unmute"
+HELD_RELOAD = "install.sh: Booth Mic is muted: its new plugins load the next time Booth Mic starts"
+HELD_UNREAD = "install.sh: Booth's settings couldn't be read: Booth Mic's new plugins load the next time it starts"
 _LOCK = threading.RLock()  # the page's poll, the service's start and heal may run at once
 HEAL_BACKOFF_S = 60
 _HEALED = {}  # (selector config, Scarlett node object.serial) → when heal last restarted the selector for it
@@ -131,12 +142,98 @@ def ceiling(db):
 # The plugin stages after the rumble filter, in chain order: (settings key = node name, plugin file, LADSPA label,
 # audio inputs, audio output, the knob's settings key, its default, its mapping). The names are #14's fixture's exactly.
 # The limiter is stereo: the mono chain feeds both its inputs and takes Output 1.
-# #17's tone stage (builtin bq_* filters, no plugin) goes between "noise" and "leveling".
 STAGES = (("noise", "librnnoise_ladspa.so", "noise_suppressor_mono", ("Input",), "Output",
            "noise_strength", 50, strength),
           ("leveling", "sc4m_1916.so", "sc4m", ("Input",), "Output", "leveling_amount", 50, amount),
           ("limiter", "fast_lookahead_limiter_1913.so", "fastLookaheadLimiter", ("Input 1", "Input 2"), "Output 1",
            "limiter_ceiling", -1.0, ceiling))
+# The Tone stage (#17), between "noise" and "leveling": PipeWire's builtin biquads, no plugin, so always in the graph.
+# Its bands in chain order: (node name = its knob's settings key, builtin label, Freq in Hz, Q). Warmth is the voice's
+# body, Presence its intelligibility, Air the top end a dynamic mic rolls off.
+TONE = (("tone_warmth", "bq_lowshelf", 150.0, 0.707), ("tone_presence", "bq_peaking", 4000.0, 1.0),
+        ("tone_air", "bq_highshelf", 10000.0, 0.707))
+
+
+def band(key, db):
+    """A Tone knob, a gain in dB (−12..12, 0 flat) → its biquad's controls: the band's fixed Freq and Q, and Gain = the
+    knob as it is. Control names as PipeWire 1.0.5's builtin bq_* filters have them ("Freq", "Q", "Gain")."""
+    freq, q = next((f, q) for k, _label, f, q in TONE if k == key)
+    return {"Freq": freq, "Q": q, "Gain": float(db)}
+
+
+# What an absent value means: every switch on but Tone, which an upgrade adds off (its sound unchanged); the knobs as
+# STAGES says, the Tone bands flat. Fresh settings start from DEFAULT_PRESET instead (booth.store).
+ABSENT = {"rumble": True, "noise": True, "leveling": True, "limiter": True, "tone": False,
+          **{s[5]: s[6] for s in STAGES}, **{t[0]: 0.0 for t in TONE}}
+# The presets set every stage's switch and knob (never the master switch or monitoring): one apply, all of it live.
+PRESETS = {
+    "Natural": {  # a condenser in a quiet room: it should sound like the mic
+        "rumble": True,  # desk thumps are never wanted
+        "noise": True, "noise_strength": 25,  # hiss and hum only: a light gate keeps soft word ends
+        "tone": False, "tone_warmth": 0.0, "tone_presence": 0.0, "tone_air": 0.0,  # a condenser's own sound
+        "leveling": True, "leveling_amount": 30,  # gentle: evens out, keeps the voice's dynamics
+        "limiter": True, "limiter_ceiling": -1.0},  # a safety net only
+    "Broadcast": {  # a dynamic mic up close (#2: a Shure Beta 57A/58A): the dense, even radio voice
+        "rumble": True,  # a handheld or boom-mounted dynamic picks up thumps
+        "noise": True, "noise_strength": 50,  # a dynamic up close hears little of the room
+        "tone": True,
+        "tone_warmth": 2.0,  # body at 150 Hz, without the boom of leaning in
+        "tone_presence": 3.0,  # 4 kHz: words cut through on a call
+        "tone_air": 4.0,  # a dynamic rolls off above ~10 kHz: this gives the top end back
+        "leveling": True, "leveling_amount": 70,  # dense: quiet and loud words come out alike
+        "limiter": True, "limiter_ceiling": -1.0},  # heavy leveling's peaks never clip
+    "Noisy room": {  # fans, traffic, a keyboard: the voice first, the room as gone as it gets
+        "rumble": True,  # HVAC and traffic rumble
+        "noise": True, "noise_strength": 85,  # mutes the room between words; higher clips soft word ends
+        "tone": True,
+        "tone_warmth": -3.0,  # cuts the room's boom that suppression leaves
+        "tone_presence": 3.0,  # the voice stands out over what noise is left
+        "tone_air": 0.0,  # a lift up top would lift the hiss too
+        "leveling": True, "leveling_amount": 40,  # more would raise the room between words
+        "limiter": True, "limiter_ceiling": -1.0}}
+DEFAULT_PRESET = "Broadcast"  # #2: the user's mic is dynamic (a condenser would take Natural)
+
+
+def preset_of(v):
+    """The preset the voice settings `v` match on every stage (absent: ABSENT), or None: the page shows Custom."""
+    return next((name for name, p in PRESETS.items() if all(v.get(k, ABSENT[k]) == x for k, x in p.items())), None)
+
+
+class Throttle:
+    """Knob changes → `send` (apply(), which reads the settings as they are when it runs, so the latest value wins), in
+    a worker `spawn` starts, never on the caller's thread: at most one send every `gap` s (0.05: about 20 set-params a
+    second while a knob turns); changes that come while it waits or sends coalesce into one, and the last always lands.
+    One per process: the Microphone page's."""
+
+    def __init__(self, send, spawn, gap=0.05, clock=time.monotonic, sleep=time.sleep):
+        self.send, self.spawn, self.gap, self.clock, self.sleep = send, spawn, gap, clock, sleep
+        self.lock, self.dirty, self.busy, self.last = threading.Lock(), False, False, float("-inf")
+
+    def kick(self):
+        with self.lock:
+            self.dirty = True
+            if self.busy:  # the running worker sends it
+                return
+            self.busy = True
+        self.spawn(self.work)
+
+    def work(self):
+        try:
+            while True:
+                self.sleep(max(0.0, self.last + self.gap - self.clock()))
+                with self.lock:  # checked and cleared as one with kick(): a change is never left unsent
+                    if not self.dirty:
+                        self.busy = False
+                        return
+                    self.dirty = False
+                self.last = self.clock()
+                self.send()
+        except BaseException:  # a send that raised: a change that came meanwhile gets a new worker, else the next one
+            with self.lock:
+                again = self.busy = self.dirty
+            if again:
+                self.spawn(self.work)
+            raise
 
 
 def _stat(path, pin):
@@ -209,16 +306,27 @@ def build(settings, found=None):
              {"output": "rumble:Out", "input": "rumble_mix:In 1"},
              {"output": "in:Out", "input": "rumble_mix:In 2"}]
     last = "rumble_mix:Out"
-    for key, file, label, ins, out, knob, default, mapping in STAGES:
-        if file not in found:
-            continue
-        nodes += [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
-                   "control": mapping(v.get(knob, default))},
-                  _mix(f"{key}_mix", v.get(key, True))]
-        links += [{"output": last, "input": f"{key}:{port}"} for port in ins]
-        links += [{"output": f"{key}:{out}", "input": f"{key}_mix:In 1"}, {"output": last, "input": f"{key}_mix:In 2"}]
+
+    def stage(key, series, ins, out):
+        """`series`: the stage's nodes, each fed by the one before; its `<key>_mix` takes the last one's or the dry."""
+        nonlocal last
+        prev = last
+        for n in series:
+            links.extend({"output": prev, "input": f"{n['name']}:{port}"} for port in ins)
+            prev = f"{n['name']}:{out}"
+        nodes.extend(series + [_mix(f"{key}_mix", v.get(key, ABSENT[key]))])
+        links.extend([{"output": prev, "input": f"{key}_mix:In 1"}, {"output": last, "input": f"{key}_mix:In 2"}])
         last = f"{key}_mix:Out"
+    for key, file, label, ins, out, knob, default, mapping in STAGES:
+        if key == "leveling":  # Tone, after noise suppression: no plugin, so in the graph whatever verified
+            stage("tone", [{"type": "builtin", "name": k, "label": lb, "control": band(k, v.get(k, ABSENT[k]))}
+                           for k, lb, _f, _q in TONE], ("In",), "Out")
+        if file in found:
+            stage(key, [{"type": "ladspa", "name": key, "plugin": found[file], "label": label,
+                         "control": mapping(v.get(knob, default))}], ins, out)
     nodes.append(_mix("master", v.get("enabled", True)))
+    if v.get("muted"):  # #21: silent from its first sample, whatever its node mute (a recreated Booth Mic has none)
+        nodes[-1]["control"] = {"Gain 1": 0.0, "Gain 2": 0.0}
     links += [{"output": last, "input": "master:In 1"}, {"output": "in:Out", "input": "master:In 2"}]
     chain = {"node.description": "Booth Mic", "media.name": "Booth Mic",
              "filter.graph": {"nodes": nodes, "links": links, "inputs": ["in:In"], "outputs": ["master:Out"]},
@@ -334,13 +442,56 @@ def selecting(dump=None):
     return _node_id(_dump() if dump is None else dump, SELECTOR) is not None
 
 
-def set_params_cmd(dump, cfg):
-    """The live change to every control in `cfg`, on the running chain's input node (by name, now), or None."""
-    node = _node_id(dump, INPUT)
+CHUNK = 12  # controls per pw-cli call: 1.0.5 sends an empty Props above ~25 (prints `Object: size 8`) and exits 0
+
+
+def set_params_cmds(dump, cfg, node=INPUT):
+    """The live change to every control in `cfg`, on the running chain's input node (`node`, by name, now): pw-cli
+    calls of at most CHUNK controls; or None. Master's gains alone and first when they silence the chain (a mute lands even if a
+    later call fails), else last (the voice goes live only after everything else)."""
+    node = _node_id(dump, node)
     if node is None:
         return None
-    params = [x for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items() for x in (f"{n['name']}:{k}", v)]
-    return ["pw-cli", "set-param", str(node), "Props", json.dumps({"params": params})]
+    pairs = [(f"{n['name']}:{k}", v) for n in _graph_nodes(cfg) for k, v in n.get("control", {}).items()]
+    master = [p for p in pairs if p[0].startswith("master:")]
+    rest = [p for p in pairs if p not in master]
+    silent = not any(v for _, v in master)
+    chunks = ([master] if silent else []) + list(itertools.batched(rest if silent else rest + master, CHUNK))
+    return [["pw-cli", "set-param", str(node), "Props", json.dumps({"params": [x for p in c for x in p]})]
+            for c in chunks]
+
+
+def _live_params(dump, node=INPUT):
+    """{node:control: value} the chain's input node `node` reports in its Props in `pw-dump` JSON now ({}: none read)."""
+    props = (((_node(dump, node) or {}).get("info") or {}).get("params") or {}).get("Props")
+    return {k: v for p in props if isinstance(p, dict) and isinstance(p.get("params"), list)
+            for k, v in zip(p["params"][::2], p["params"][1::2])} if isinstance(props, list) else {}
+
+
+def _same(want, have):
+    try:  # the chain stores floats: 0.707 reads back as 0.7070000171661377
+        return math.isclose(float(want), float(have), rel_tol=1e-5, abs_tol=1e-6)
+    except (TypeError, ValueError):
+        return want == have
+
+
+def set_live(cfg, run, dump, node=INPUT):
+    """Every control in `cfg` set on the running chain (set_params_cmds), then read back from pw-dump, never trusted to
+    pw-cli's exit status; a call whose controls didn't all land is sent once more. → the controls that didn't land
+    ([]: every one did), or None when the chain's input node isn't there (pw-dump failed): nothing sent. `node`: the
+    chain's input node, Booth Mic's or Booth Stereo's (#19), which runs its own copy of the chain."""
+    cmds = set_params_cmds(dump(), cfg, node)
+    if cmds is None:
+        return None
+    sent = [(c, list(itertools.batched(json.loads(c[4])["params"], 2))) for c in cmds]
+    for _ in range(2):
+        for cmd, _pairs in sent:
+            run(cmd)
+        have = _live_params(dump(), node)
+        sent = [(c, ps) for c, ps in sent if not all(k in have and _same(v, have[k]) for k, v in ps)]
+        if not sent:
+            return []
+    return [k for _c, ps in sent for k, v in ps if not (k in have and _same(v, have[k]))]
 
 
 def _text(file):
@@ -397,6 +548,58 @@ def _restarted(key, clock):
     _HEALED[key] = clock()
 
 
+def _live_muted(text):
+    """booth_mic's own node mute in `pw-dump` JSON `text` (booth.mute.find's): True only when it reads muted."""
+    from booth import mute  # here, not at the top: mute imports voice
+    try:
+        node = mute.find(json.loads(text))
+    except (TypeError, ValueError):
+        return False
+    return bool(node and node[2])
+
+
+def _held(settings, dump):
+    """#21: muted (the record, or booth_mic's live node mute: GNOME's Ctrl+Alt+M with no Booth to record it) with Booth
+    Mic running, so no restart: while booth_mic is gone a call falls back to the raw mic, unmuted. A Booth Mic that
+    isn't running has no gap to fall back in, so it still starts. Fail closed: only a pw-dump that read a list without
+    booth_mic says it isn't running, never a failed or empty one."""
+    text = dump()
+    if not ((settings.get("voice") or {}).get("muted") or _live_muted(text)):
+        return False
+    try:
+        listed = isinstance(json.loads(text), list)
+    except (TypeError, ValueError):
+        listed = False
+    return not listed or _node_id(text, NODE) is not None
+
+
+def _saved():
+    """The saved settings for booth.voice's own runs (install.sh's sync and --reload, the pre-start), with no Booth to
+    watch booth_mic: its live node mute recorded when the record lacks it, so the chain built now and a booth_mic
+    recreated later (a PipeWire restart: booth.mute --enforce) are muted too. OSError: unreadable, never written over."""
+    settings = store.load(strict=True)
+    if not (settings.get("voice") or {}).get("muted") and _live_muted(_dump()):
+        settings.setdefault("voice", {})["muted"] = True
+        try:
+            store.save(settings)
+        except OSError:
+            pass  # the chain built from it now is silent anyway
+    return settings
+
+
+def _within(cfg, running):
+    """`cfg` with only the controls the running chain `running` (its config on disk) has, master's gains alone when it
+    can't be read: a held restart's new controls can't land on the chain that runs, only the mute must."""
+    try:
+        has = {n["name"]: set(n.get("control", {})) for n in _graph_nodes(running)}
+    except (AttributeError, KeyError, TypeError):
+        has = {"master": {"Gain 1", "Gain 2"}}
+    cfg = copy.deepcopy(cfg)
+    for n in _graph_nodes(cfg):
+        n["control"] = {k: v for k, v in n.get("control", {}).items() if k in has.get(n["name"], ())}
+    return cfg
+
+
 def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
     """Bring both configs up to date with the settings and `state`, the Scarlett now (scarlett.read). New control values
     are set live on the chain, then recorded; a new chain shape (new code; never a change in what verifies alone, see
@@ -407,7 +610,7 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
     restarted, only while Booth Mic runs: with it stopped the selector is stopped and its new config kept for its next
     start, never the old channel. Returns what it did, with "not …" when it couldn't: then that change isn't recorded
     (a failed chain restart puts the old voice.conf back; a failed selector restart removes its config), so the next
-    apply retries. A live change is recorded only once set-param took it.
+    apply retries. A live change is recorded only once every control read back as set (set_live).
     A chain change that fails never holds back the selector."""
     file = file or path()
     select_file = file.with_name(SELECT_CONF)
@@ -424,13 +627,18 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
             if shape(same) == shape(now):  # nothing else changed: no restart; its next start loads what verifies
                 chain = same
         restart = shape(now) != shape(chain)
+        held = restart and _held(settings, dump)
+        if held:  # not recorded: the first apply after unmuting restarts it; its values (a mute's 0s) still go live
+            said = HELD
         # the values Booth Mic runs with: its run conf's when its pre-start ran after apply last recorded voice.conf (a
         # kept run conf holds older ones), else voice.conf's, what apply set live since
         # an equal mtime counts as voice.conf's; shortcut: a same-tick tie can miss one live send, use >= if seen
         live = now if not restart and _mtime(file.with_name(RUN_CONF)) > _mtime(file) else old
         changed = old != chain or live != chain
-        if live != chain and not restart and not ((cmd := set_params_cmd(dump(), chain)) and run(cmd)):
-            said = "not applied: Booth Mic didn't take the change"  # no input node (pw-dump failed): not sent either
+        if live != chain and (held or not restart) and (missed := set_live(_within(chain, now) if held else chain,
+                                                                          run, dump)) != []:
+            # not recorded: the next apply sends every control again
+            said = f"not applied: Booth Mic didn't take {', '.join(missed) if missed else 'the change'}"
         # no Scarlett node (pw-dump failed, or it left PipeWire): kept only on the channel the ALSA routing still gives
         mic = state and state["mic"]
         kept = mic and not mic["node"] and mic["channel"] == _capture(_load(select_file), CHANNEL)
@@ -589,27 +797,43 @@ def write(file=None, where=None):
     verified now, at their verified paths, in the shape this code builds from them (else every apply would restart it):
     Booth Mic starts on it, touched so apply sends it the saved values live; "not …": then the unit doesn't start."""
     _VERIFIED.clear()  # what pipewire loads: hashed now, never a poll's cached verdict
-    file, found, settings = file or path().with_name(RUN_CONF), verified(where), store.load()
-    cfg = json.loads(build(settings, found))
-    said = None if _load(file) == cfg else _save(cfg, file)
+    file, found = file or path().with_name(RUN_CONF), verified(where)
+    try:
+        settings = _saved()
+    except OSError as e:  # EIO: never rebuilt from defaults (another sound, unmuted): the last one kept, as below
+        settings, said = None, f"not read: the settings ({e.strerror or e})"
+    else:
+        cfg = json.loads(build(settings, found))
+        said = None if _load(file) == cfg else _save(cfg, file)
     on_disk = _load(file) if said else None
     kept = _plugins(on_disk)
-    if (kept is not None and all(found.get(k) == v for k, v in kept.items())
-            and shape(on_disk) == shape(json.loads(build(settings, kept)))):
+    if (kept is not None and all(found.get(k) == v for k, v in kept.items())  # a shape is the plugins', not settings'
+            and shape(on_disk) == shape(json.loads(build(settings or {}, kept)))):
         try:
             os.utime(file)  # newer than voice.conf: its values may be older than what Booth set live
         except OSError:
             pass
+        master = lambda c: [n.get("control") for n in _graph_nodes(c) if n.get("name") == "master"]  # noqa: E731
+        if settings and (settings.get("voice") or {}).get("muted") and master(on_disk) != master(cfg):
+            return f"kept the last config, {said}; it isn't silent though Booth Mic is muted: booth.mute --enforce " \
+                   "mutes its node"
         return f"kept the last config, {said}"
     return said
 
 
 def reload(run=service.run, file=None):
     """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
-    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
+    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed;
+    HELD_RELOAD: held, muted (_held), so they load at its next start; HELD_UNREAD: held, the settings unreadable."""
     with _LOCK:
         _VERIFIED.clear()  # an install's fresh plugins: hashed now
-        return _plugins(_running(file or path())) == verified() or run(RESTART)
+        if _plugins(_running(file or path())) == verified():
+            return True
+        try:
+            settings = _saved()
+        except OSError:  # unreadable: its mute unknown, so held as if muted (fail closed, as _held is)
+            return HELD_UNREAD if _held({"voice": {"muted": True}}, _dump) else run(RESTART)
+        return HELD_RELOAD if _held(settings, _dump) else run(RESTART)
 
 
 def main():
@@ -620,10 +844,18 @@ def main():
             print(f"booth.voice: {said}", file=sys.stderr)
         return 1 if said and said.startswith("not ") else 0
     if args == ["--reload"]:
-        return 0 if reload() else 1
+        done = reload()
+        if isinstance(done, str):
+            print(done, file=sys.stderr)
+        return 0 if done else 1
     if args[:1] == ["--select"] and len(args) == 2:
         return 0 if may_select(Path(args[1])) else 1
-    print(sync(store.load()))
+    try:
+        settings = _saved()
+    except OSError as e:  # EIO: never synced from defaults (another sound, unmuted), as --write
+        print(f"booth.voice: settings not read ({e.strerror or e}) — Booth Mic left as it is", file=sys.stderr)
+        return 1
+    print(sync(settings))
     return 0
 
 

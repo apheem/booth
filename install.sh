@@ -1,7 +1,8 @@
 #!/bin/sh
 # install.sh — install Booth for this user: no sudo, nothing outside the home folder, safe to re-run.
 # Copies the repo's booth/ to ~/.local/share/booth/booth (a real copy, never a symlink into the repo or a worktree),
-# writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop.
+# writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop
+# with its icon (data/, into ~/.local/share/icons/hicolor).
 set -eu
 umask 022  # never group-writable, whatever the user's umask: verify() refuses that for a plugin, so for its pins too
 repo=$(cd "$(dirname "$0")" && pwd)
@@ -43,10 +44,15 @@ Type=Application
 Name=Booth
 Comment=Camera, microphone and headphones in one place
 Exec="$exec_arg"
-Icon=camera-web
+Icon=io.github.apheem.Booth
 Categories=AudioVideo;Settings;
 StartupNotify=true
 EOF
+# The app icon (#22), by the app's id: the desktop entry's Icon= and the window's. Staged then swapped, as the app.
+icons=$share/icons/hicolor/scalable/apps
+mkdir -p "$icons"
+cp -L "$repo/data/io.github.apheem.Booth.svg" "$icons/io.github.apheem.Booth.svg.new"
+mv "$icons/io.github.apheem.Booth.svg.new" "$icons/io.github.apheem.Booth.svg"
 
 # booth.service runs the installed launcher with --background. It's wanted by graphical-session.target, not
 # default.target: GTK needs the session's display, which default.target (also reached with no login screen) lacks.
@@ -84,7 +90,9 @@ mv "$units/booth.service.new" "$units/booth.service"
 # ExecStart loads and one Booth never writes, with the installed booth.voice from the saved settings and the plugins
 # verified right then (booth.plugins), so a plugin file changed since is left out, never loaded; if it can't write it
 # and the one there names a plugin that doesn't verify now, the unit doesn't start. It is given the paths baked here, so
-# it writes the very file ExecStart loads, whatever the user manager's XDG_*.
+# it writes the very file ExecStart loads, whatever the user manager's XDG_*. ExecStartPost (#21) mutes the new
+# booth_mic's node when the saved record is muted, with no Booth running (a kept voice-run.conf may carry live gains);
+# "-": its failure never stops Booth Mic, since a call would fall back to the raw mic, unmuted.
 voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
 [ -e "$units/booth-voice.service" ] || voice_first=1
 voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
@@ -102,6 +110,7 @@ BindsTo=pipewire.service
 ExecCondition=/usr/bin/test -f "$voice_arg"
 ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write "$run_arg" "$plugins_arg"
 ExecStart=/usr/bin/pipewire -c "$run_arg"
+ExecStartPost=-/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.mute --enforce
 Restart=on-failure
 RestartSec=5
 Slice=session.slice
@@ -149,18 +158,28 @@ RestartSec=5
 Slice=session.slice
 EOF
 mv "$units/booth-monitor.service.new" "$units/booth-monitor.service"
-# Enabled whatever the Run in Background switch says. booth.voice writes the configs from the Scarlett now and starts
-# them (restarts what changed). The first install then makes Booth Mic the default mic by name: WirePlumber picks it
-# as soon as it appears. None of this stops the install: Booth writes the configs and starts the services each run.
-systemctl --user daemon-reload && systemctl --user enable booth-voice.service booth-mic-select.service ||
-  echo "install.sh: couldn't enable booth-voice.service (Booth Mic); from your desktop session run: systemctl --user enable --now booth-voice.service booth-mic-select.service" >&2
-PYTHONPATH=$dest python3 -P -m booth.voice || echo "install.sh: couldn't set up Booth Mic (above); Booth tries again when it starts" >&2
-if [ -n "$voice_first" ]; then
-  pw-metadata -n default 0 default.configured.audio.source '{ "name": "booth_mic" }' Spa:String:JSON >/dev/null 2>&1 ||
-    echo "install.sh: couldn't make Booth Mic the default mic; choose Booth Mic in Settings → Sound → Input" >&2
-fi
+# booth-stereo.service runs Booth Stereo (#19, booth.stereo): its own copy of the voice chain on Booth Mic's input, and
+# the other side's source, into a stereo source for recording apps. Never enabled, and nothing in it names another Booth
+# unit: Booth starts it and restarts only it for a new side or source. Its ExecStartPre writes the config it loads from
+# the saved settings, the source found then and the plugins verified then, as booth-voice.service's does.
+stereo_arg=$(printf '%s' "$config/booth/stereo.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+cat > "$units/booth-stereo.service.new" <<EOF
+[Unit]
+Description=Booth Stereo: the voice on one side, a chosen source on the other, for recording apps (PipeWire)
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.stereo --write "$stereo_arg" "$plugins_arg"
+ExecStart=/usr/bin/pipewire -c "$stereo_arg"
+Restart=on-failure
+RestartSec=5
+Slice=session.slice
+EOF
+mv "$units/booth-stereo.service.new" "$units/booth-stereo.service"
 # A running Booth owns its bus name, so the restarted unit's --background would find it and exit 0 with the old code
-# still running: ask it to quit (app.quit; "not running" errors ignored) and wait up to 5 s for the name to go.
+# still running: ask it to quit (app.quit; "not running" errors ignored) and wait up to 5 s for the name to go. First:
+# before booth.voice below, so the old Booth's heal or poll never restarts Booth Mic once more.
 closed=
 gdbus call --session --dest io.github.apheem.Booth --object-path /io/github/apheem/Booth \
   --method org.gtk.Actions.Activate quit '[]' '{}' >/dev/null 2>&1 && closed=1
@@ -174,6 +193,19 @@ while owned; do
   sleep 0.5
   n=$((n + 1))
 done
+# Enabled whatever the Run in Background switch says. booth.voice writes the configs from the Scarlett now and starts
+# them (restarts what changed). The first install then makes Booth Mic the default mic by name: WirePlumber picks it
+# as soon as it appears. None of this stops the install: Booth writes the configs and starts the services each run.
+systemctl --user daemon-reload && systemctl --user enable booth-voice.service booth-mic-select.service ||
+  echo "install.sh: couldn't enable booth-voice.service (Booth Mic); from your desktop session run: systemctl --user enable --now booth-voice.service booth-mic-select.service" >&2
+PYTHONPATH=$dest python3 -P -m booth.voice || echo "install.sh: couldn't set up Booth Mic (above); Booth tries again when it starts" >&2
+# GNOME's own mic-mute action (it mutes the default source, Booth Mic) on Ctrl+Alt+M, only while it has no binding:
+# never the user's own (booth.mute.binding). gsettings writes the user's dconf; it never stops the install.
+PYTHONPATH=$dest python3 -P -m booth.mute --bind || true
+if [ -n "$voice_first" ]; then
+  pw-metadata -n default 0 default.configured.audio.source '{ "name": "booth_mic" }' Spa:String:JSON >/dev/null 2>&1 ||
+    echo "install.sh: couldn't make Booth Mic the default mic; choose Booth Mic in Settings → Sound → Input" >&2
+fi
 # Booth Mic restarted (only if it runs) when its plugins aren't the ones verified now, so a new stage loads at once. Not
 # with an old Booth still running: its poll would write its own chain back and restart Booth Mic, whose pre-start writes
 # the new one, every few seconds until Booth is closed (the hint below). Left as is, its next start loads them.

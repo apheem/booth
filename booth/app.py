@@ -13,10 +13,10 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from booth import camera, devices, headset, monitor, routing, service, store, voice  # noqa: E402
-from booth.ui.window import Window  # noqa: E402
+from booth import camera, devices, headset, monitor, mute, routing, service, stereo, store, voice  # noqa: E402
+from booth.ui.window import SHORTCUTS, Window  # noqa: E402
 
 APP_ID = service.APP_ID
 REPLUG_MS = 2000  # quiet time after the last by-id event before a restore: a flapping replug restores once
@@ -94,6 +94,15 @@ class Application(Adw.Application):
         quit_ = Gio.SimpleAction.new("quit", None)  # install.sh's way to stop a running copy: quit() ignores a hold
         quit_.connect("activate", lambda *_: self.quit())
         self.add_action(quit_)
+        # #21: Booth Mic's mute, the header button's state; activating it (the button, Ctrl+M) toggles it: on_mute
+        self.mute_known = None  # the booth_mic object.serial whose mute Booth follows (booth.mute.seen)
+        self.mute_action = Gio.SimpleAction.new_stateful("mute", None, GLib.Variant.new_boolean(False))
+        self.mute_action.connect("change-state", self.on_mute)
+        self.add_action(self.mute_action)
+        for _group, action, accel, _title in SHORTCUTS:  # Ctrl+M (#21), Ctrl+1/2/3 and Ctrl+0 (#22), Ctrl+?
+            if action:  # None: GNOME's own Ctrl+Alt+M, listed only
+                self.set_accels_for_action(action, [accel])
+        Gtk.Window.set_default_icon_name(APP_ID)  # install.sh's icon, by the app's id (as the desktop entry's Icon=)
 
     def do_handle_local_options(self, options):
         if options.contains("background"):
@@ -130,6 +139,8 @@ class Application(Adw.Application):
         self.snd_monitor = Gio.File.new_for_path(devices.SND_BY_ID).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES,
                                                                                        None)
         self.snd_monitor.connect("changed", self.on_snd_by_id)
+        # #22: the open window's Camera page follows the BRIO coming and going, once a burst of by-id events settles
+        self.camera_seen = service.Debounce(REPLUG_MS, self.check_camera, GLib.timeout_add, GLib.source_remove)
         # Booth Mic's mic fallback (#20) within seconds, not at the next tick: a heal once a sound card's (the
         # Scarlett's, the BRIO's, the dongle's) burst of links settles, or the PRO X turns on or off
         self.mic_poke = service.Debounce(REPLUG_MS, self.heal_voice, GLib.timeout_add, GLib.source_remove)
@@ -138,6 +149,7 @@ class Application(Adw.Application):
         self.fix_headset()
         self.mic_at_start()  # before sync_voice, which may move the selector
         self.sync_voice()
+        self.watch_mute()
         # the routing policy: output to the Scarlett when the PRO X turns off and back, window or not; subscribed
         # before the first poll, whose reading is the startup transition
         self.routing = routing.Executor(self.settings, lambda text: GLib.idle_add(self.routed, text),
@@ -164,6 +176,9 @@ class Application(Adw.Application):
 
     def do_shutdown(self):
         voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
+        mute.stop()  # #21: its pw-dump --monitor ends with Booth
+        if self.window is not None:  # a quit closes no window by close-request: its pending voice change saved here
+            self.window.microphone.save_voice()
         Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):
@@ -171,6 +186,29 @@ class Application(Adw.Application):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file
         if devices.replugged(entry.get_basename(), event.value_nick):
             self.replug.poke()
+        if devices.camera_moved(entry.get_basename(), event.value_nick):
+            self.camera_seen.poke()
+
+    def check_camera(self):
+        """#22: the BRIO found now (on a worker: udevadm, v4l2-ctl) shown on the open window's Camera page. Its own
+        camera back: restore_saved's reapply restores it. A camera the page lacks: restored and read for a new page."""
+        window = self.window
+        if window is None:  # a window opened later reads the camera in start()
+            return
+        page = window.camera
+
+        def find():
+            with RESTORING:  # after a restore or write in flight, so a new page reads what they left
+                node = devices.discover()["camera"]
+                if node is None or (node == page.node and camera.ZOOM in page.ctrls):
+                    return node, None
+                node = restore_camera(self.settings)
+                return node, camera.read_ctrls(node) if node else None
+
+        def show(found):
+            if found is not None and self.window is window:  # not a window closed meanwhile
+                window.show_camera(*found)
+        off_main(find, show)
 
     def on_snd_by_id(self, _monitor, file, other, event):
         entry = other if event == Gio.FileMonitorEvent.RENAMED else file  # as in on_by_id
@@ -178,21 +216,85 @@ class Application(Adw.Application):
             self.dongle.poke()
         if event.value_nick in ("created", "deleted", "moved-in", "moved-out", "renamed"):  # a mic may be back or gone
             self.mic_poke.poke()
+            self.show_dongle()
 
     def on_headset(self, event):
         if event in ("on", "off"):  # the PRO X mic is a backup only while the headset is on
             self.mic_poke.poke()
+            self.show_dongle()
+
+    def show_dongle(self):
+        """#22: the open window's Headphones page: the PRO X dongle there or not, by its by-id link now."""
+        if self.window is not None:
+            self.window.show_headset(devices.dongle_present())
 
     def fix_headset(self):
         threading.Thread(target=headset.fix_hw_volume, daemon=True).start()  # amixer, off the main loop
 
     def sync_voice(self):
         """Booth Mic's config up to date with the Scarlett and its service started, then processed monitoring as its
-        switch says (amixer, pw-dump, systemctl: off the main loop)."""
+        switch says, then Booth Stereo (amixer, pw-dump, systemctl: off the main loop)."""
         def sync():
             voice.sync(self.settings)
             monitor.sync(self.settings, on=self.headset_monitor.on)
+            stereo.sync(self.settings, notify=self.stereo_switched)
         threading.Thread(target=sync, daemon=True).start()
+
+    def watch_mute(self):
+        """#21: pw-dump's monitor on a worker for good; each sighting of booth_mic goes to on_mute_seen. Events, not a
+        poll: it prints only when the graph changes, and the record must follow GNOME's mute with the window closed too,
+        so a booth-voice restart starts Booth Mic silent."""
+        threading.Thread(target=lambda: mute.watch(lambda node: GLib.idle_add(self.on_mute_seen, node)),
+                         daemon=True).start()
+
+    def on_mute_seen(self, node):
+        self.mute_known, record, write = mute.seen(node, self.mute_known, self.muted())
+        self.record_mute(record)
+        if write is not None:  # a recreated Booth Mic: its mute put back (by name, on a worker)
+            threading.Thread(target=lambda: mute.write(write), daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def on_mute(self, action, value):
+        """The header button or Ctrl+M: Booth Mic's node mute set, and recorded at once."""
+        on = value.get_boolean()
+        self.record_mute(on)
+
+        def write():  # refused: a mute's silence applied again here, so mute_failed says whether it landed
+            if not mute.write(on):
+                GLib.idle_add(self.mute_failed, on, voice.apply(self.settings, None) if on else None)
+        threading.Thread(target=write, daemon=True).start()
+
+    def mute_failed(self, on, said=None):
+        """wpctl didn't take the button's `on`: the node keeps its mute, and the button shows it (pressing it again
+        tries again). Fail closed: the chain stays (or goes back to) silent, and the node is no longer followed, so its
+        next sighting puts the mute back instead of turning the record live. `said`: voice.apply's, for a mute."""
+        self.mute_known = None
+        self.record_mute(True)
+        self.mute_action.set_state(GLib.Variant.new_boolean(not on))
+        silenced = said in ("live", "unchanged", "restarted", voice.HELD)  # the muted chain set live, or started
+        self.send_notification("mute-failed", Gio.Notification.new(
+            "Couldn't unmute Booth Mic in GNOME — it stays muted; try again" if not on else
+            "Couldn't mute Booth Mic in GNOME — the chain is silenced; try again" if silenced else
+            f"Couldn't mute Booth Mic in GNOME, and its chain couldn't be silenced ({said}); try again"))
+        return GLib.SOURCE_REMOVE
+
+    def muted(self):
+        return bool((self.settings.get("voice") or {}).get("muted"))
+
+    def record_mute(self, on):
+        """The mute shown (button, Ctrl+M, red dot) and, when it changed, recorded: saved for booth-voice's pre-start
+        and Booth Mic's chain silenced or not, live (apply, on a worker)."""
+        self.mute_action.set_state(GLib.Variant.new_boolean(on))
+        if self.window is not None:
+            self.window.show_mute(on)
+        if self.muted() == on:
+            return
+        self.settings.setdefault("voice", {})["muted"] = on
+        try:
+            store.save(self.settings)
+        except OSError as e:  # a booth-voice restart would start Booth Mic as last saved
+            self.send_notification("mute-unsaved", Gio.Notification.new(f"Mute set, but not saved: {e.strerror or e}"))
+        threading.Thread(target=lambda: voice.apply(self.settings, None), daemon=True).start()
 
     def heal_voice(self):
         if not self.healing:  # a slow heal (amixer, pw-dump, systemctl) never overlaps the next tick
@@ -213,7 +315,14 @@ class Application(Adw.Application):
             try:  # monitoring back after Booth Mic or the PRO X dongle came back, window or not
                 monitor.sync(self.settings, on=self.headset_monitor.on)  # paused while the PRO X is off
             finally:
-                self.healing = False
+                try:  # Booth Stereo (#19) back after Booth Mic or its source came back; it follows a new source
+                    stereo.sync(self.settings, notify=self.stereo_switched)
+                finally:
+                    self.healing = False
+
+    def stereo_switched(self, text):
+        """Booth Stereo's notice (computer sound moved to a new output), from sync's worker: on the main loop."""
+        GLib.idle_add(lambda: self.send_notification("booth-stereo", Gio.Notification.new(text)))
 
     def low_battery(self, percent):
         note = Gio.Notification.new("Headset battery low")
@@ -276,8 +385,11 @@ class Application(Adw.Application):
                 self.held = True
             self.window = Window(self, settings, node, ctrls)
             self.window.show_mic(self.mic_source)  # opened on a backup: its sidebar line and banner say so
+            self.window.show_mute(self.muted())
+            self.window.show_headset(devices.dongle_present())
             self.window.connect("close-request", self.on_close)
             self.window.present()
+            self.check_camera()  # a BRIO event while starting found no window: dropped, so looked at again now
         except Exception:  # no window: release lets Booth exit instead of living on with nothing to show
             traceback.print_exc()
         finally:

@@ -9,9 +9,9 @@ import threading
 import unittest
 from unittest import mock
 
-from gi.repository import Gio, GLib
+from gi.repository import Gio, GLib, Gtk
 
-from booth import app, camera, routing, service, store, voice
+from booth import app, camera, mute, routing, service, store, voice
 from booth.ui import window as ui_window
 from tests.fixture import read
 from tests.test_service import Clock, Timers
@@ -324,8 +324,11 @@ class BackgroundLaunch(unittest.TestCase):
         self.assertIsInstance(stub.dongle, service.Debounce)
         self.assertIsInstance(stub.mic_poke, service.Debounce)  # a burst of sound-card events: one heal after it
         self.assertIs(stub.mic_poke.fire, stub.heal_voice)
+        self.assertIsInstance(stub.camera_seen, service.Debounce)  # #22: the BRIO come or gone, once a burst settles
+        self.assertIs(stub.camera_seen.fire, stub.check_camera)
         stub.fix_headset.assert_called_once_with()  # on service start, and in every primary instance
         stub.sync_voice.assert_called_once_with()  # Booth Mic's config written and its service started, window or not
+        stub.watch_mute.assert_called_once_with()  # #21: the mute's record kept, window or not
         calls = [c[0] for c in stub.mock_calls]  # the mic running now said before sync_voice may move the selector
         self.assertLess(calls.index("mic_at_start"), calls.index("sync_voice"))
         return stub
@@ -359,6 +362,22 @@ class BackgroundLaunch(unittest.TestCase):
                 threads[0]()
         # a closed window, the background service: every 10 s, paused while the PRO X is off
         sync.assert_called_once_with(stub.settings, on=stub.headset_monitor.on)
+        self.assertFalse(stub.healing)
+
+    def test_booth_stereo_is_started_at_start_and_brought_back_every_heal_tick_off_the_main_loop(self):  # #19
+        threads, stub = [], mock.Mock(settings={"voice": {}}, healing=False)
+        stub.heal_once = lambda: app.Application.heal_once(stub)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.voice, "sync"), mock.patch.object(app.monitor, "sync"), \
+                mock.patch.object(app.voice, "heal", side_effect=OSError("boom")), \
+                mock.patch.object(app.stereo, "sync") as sync:
+            app.Application.sync_voice(stub)
+            app.Application.heal_voice(stub)
+            sync.assert_not_called()
+            threads[0]()
+            with self.assertRaises(OSError):  # Booth Mic's heal failed: Booth Stereo is still looked after
+                threads[1]()
+        self.assertEqual(sync.call_args_list, [mock.call(stub.settings, notify=stub.stereo_switched)] * 2)
         self.assertFalse(stub.healing)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
@@ -681,6 +700,20 @@ class HeadsetBattery(unittest.TestCase):
         notification.new.assert_called_once_with("Sound routing set, but not saved: No space left on device")
         stub.send_notification.assert_called_once_with("routing-unsaved", notification.new.return_value)
 
+    def test_booth_stereos_notice_is_sent_on_the_main_loop_under_its_own_id(self):  # #19: from sync's worker
+        idle = []
+        with mock.patch.object(app.Gio, "Notification") as notification, \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            stub = mock.Mock()
+            app.Application.stereo_switched(stub, "Booth Stereo switched computer sound to X — a recording on it "
+                                                  "restarted")
+            stub.send_notification.assert_not_called()  # never on sync's worker
+            for f, a in idle:
+                f(*a)
+        notification.new.assert_called_once_with("Booth Stereo switched computer sound to X — a recording on it "
+                                                  "restarted")
+        stub.send_notification.assert_called_once_with("booth-stereo", notification.new.return_value)
+
     def test_the_low_battery_notification_says_the_estimate(self):
         with mock.patch.object(app.Gio, "Notification") as notification:
             stub = mock.Mock()
@@ -762,6 +795,18 @@ class MicFallback(unittest.TestCase):
         release.assert_called_once_with()
         shutdown.assert_called_once_with(stub)
 
+    def test_quitting_saves_the_microphone_pages_pending_voice_change(self):  # #17 W5 final: no close-request
+        stub = mock.Mock()
+        with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"):
+            app.Application.do_shutdown(stub)
+        stub.window.microphone.save_voice.assert_called_once_with()
+
+    def test_quitting_ends_the_mute_watchers_pw_dump(self):  # #21: no pw-dump --monitor outlives Booth
+        with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"), \
+                mock.patch.object(app.mute, "stop") as stop:
+            app.Application.do_shutdown(mock.Mock())
+        stop.assert_called_once_with()
+
     def test_the_bus_name_the_selector_unit_asks_for_is_the_apps(self):
         self.assertEqual(app.APP_ID, service.APP_ID)
 
@@ -806,6 +851,161 @@ class MicFallback(unittest.TestCase):
         ui_window.Window.show_mic(win, voice.SCARLETT, True)  # the return: said too
         win.mic_banner.set_title.assert_called_once_with(routing.MIC_SAID[voice.SCARLETT])
         win.mic_banner.set_revealed.assert_called_once_with(True)
+
+
+class Mute(unittest.TestCase):
+    """#21: one mute, Booth Mic's node mute. The header button and Ctrl+M are app.mute's state; the watcher's sightings
+    of booth_mic keep the record, the chain's silence, the button and the red sidebar dot on it, window or not."""
+
+    def spawned(self, f, settings=None, **kw):
+        stub, threads = mock.Mock(**{"settings": settings or {"voice": {}}, "mute_known": None, **kw}), []
+        stub.muted = lambda: app.Application.muted(stub)
+        stub.record_mute = lambda on: app.Application.record_mute(stub, on)
+        with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
+                mock.patch.object(app.store, "save") as save:
+            f(stub)
+        return stub, threads, save
+
+    def test_the_app_registers_a_stateful_mute_action_on_ctrl_m(self):
+        booth = app.Application()
+        action = booth.lookup_action("mute")
+        self.assertEqual(action.get_state().get_type_string(), "b")  # the header toggle button's state
+        self.assertEqual(booth.get_accels_for_action("app.mute"), ["<Control>m"])
+
+    def test_every_primary_instance_watches_the_mute_on_a_worker(self):
+        stub, threads, _ = self.spawned(app.Application.watch_mute)
+        self.assertEqual(len(threads), 1)
+        idle = []
+        with mock.patch.object(app.mute, "watch") as watch, \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))):
+            threads[0]()
+            (found,), _ = watch.call_args
+            found((70, 9001, True))
+        self.assertEqual(idle, [(stub.on_mute_seen, ((70, 9001, True),))])  # to the main loop
+
+    def test_gnome_muting_booth_mic_is_recorded_saved_silences_the_chain_and_shows(self):
+        stub, threads, save = self.spawned(lambda s: app.Application.on_mute_seen(s, (70, 9001, True)),
+                                           mute_known=9001)
+        self.assertIs(stub.settings["voice"]["muted"], True)
+        save.assert_called_once_with(stub.settings)
+        stub.mute_action.set_state.assert_called_once_with(GLib.Variant.new_boolean(True))
+        stub.window.show_mute.assert_called_once_with(True)
+        with mock.patch.object(app.voice, "apply") as apply:
+            for t in threads:
+                t()
+        apply.assert_called_once_with(stub.settings, None)  # the chain's master silenced live
+
+    def test_a_recreated_booth_mic_gets_the_mute_put_back(self):
+        stub, threads, save = self.spawned(lambda s: app.Application.on_mute_seen(s, (80, 9050, False)),
+                                           settings={"voice": {"muted": True}}, mute_known=9001)
+        self.assertIs(stub.settings["voice"]["muted"], True)  # never unmuted by its new node
+        save.assert_not_called()
+        with mock.patch.object(app.mute, "write") as write:
+            for t in threads:
+                t()
+        write.assert_called_once_with(True)
+        self.assertEqual(stub.mute_known, 9001)  # followed once it shows the mute
+
+    def test_the_same_mute_again_saves_and_applies_nothing(self):
+        stub, threads, save = self.spawned(lambda s: app.Application.on_mute_seen(s, (70, 9001, False)),
+                                           settings={"voice": {"muted": False}}, mute_known=9001)
+        save.assert_not_called()
+        self.assertEqual(threads, [])
+
+    def test_the_button_and_ctrl_m_set_the_node_mute_and_the_record(self):
+        for on in (True, False):
+            stub, threads, save = self.spawned(
+                lambda s: app.Application.on_mute(s, None, GLib.Variant.new_boolean(on)),
+                settings={"voice": {"muted": not on}})
+            self.assertIs(stub.settings["voice"]["muted"], on)
+            save.assert_called_once_with(stub.settings)
+            stub.mute_action.set_state.assert_called_once_with(GLib.Variant.new_boolean(on))
+            with mock.patch.object(app.mute, "write") as write, mock.patch.object(app.voice, "apply") as apply:
+                for t in threads:
+                    t()
+            write.assert_called_once_with(on)
+            apply.assert_called_once_with(stub.settings, None)
+
+    def test_a_mute_that_cant_be_saved_is_said(self):  # a booth-voice restart would start Booth Mic unmuted
+        stub = mock.Mock(settings={"voice": {}}, window=None, muted=lambda: False)
+        with mock.patch.object(app.threading, "Thread"), \
+                mock.patch.object(app.store, "save", side_effect=OSError(28, "No space left on device")), \
+                mock.patch.object(app.Gio, "Notification") as notification:
+            app.Application.record_mute(stub, True)
+        self.assertIn("not saved", notification.new.call_args.args[0])
+        stub.send_notification.assert_called_once()
+
+    def test_a_window_opened_shows_the_mute(self):
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.SCARLETT, settings={"voice": {"muted": True}})
+        stub.muted = lambda: app.Application.muted(stub)
+        with mock.patch.object(app, "Window") as window:
+            app.Application.show_window(stub, stub.settings, None, {}, False)
+        window.return_value.show_mute.assert_called_once_with(True)
+
+    def test_the_red_sidebar_dot_shows_only_while_muted(self):
+        win = mock.Mock()
+        ui_window.Window.show_mute(win, True)
+        win.mute_dot.set_visible.assert_called_once_with(True)
+        win.reset_mock()
+        ui_window.Window.show_mute(win, False)
+        win.mute_dot.set_visible.assert_called_once_with(False)
+
+    def test_the_header_button_is_bound_to_app_mute(self):
+        self.assertEqual(ui_window.MUTE_ACTION, "app.mute")
+        self.assertIsNotNone(app.Application().lookup_action(ui_window.MUTE_ACTION.removeprefix("app.")))
+        with mock.patch.object(ui_window, "Adw") as adw, mock.patch.object(ui_window, "Gtk") as gtk:
+            ui_window.page("Booth", mock.Mock(), ui_window.main_menu())
+        self.assertEqual(gtk.ToggleButton.call_args.kwargs["action_name"], "app.mute")
+        adw.HeaderBar.return_value.pack_start.assert_called_once_with(gtk.ToggleButton.return_value)
+
+    def failed(self, on, said="live"):
+        """The button (or Ctrl+M) set to `on` with wpctl refusing it, voice.apply saying `said`; its workers and
+        main-loop calls run → the stub and the notifications sent, as their texts."""
+        idle = []
+
+        def press(s):
+            s.mute_failed = lambda on, said=None: app.Application.mute_failed(s, on, said)
+            app.Application.on_mute(s, None, GLib.Variant.new_boolean(on))
+        stub, threads, _ = self.spawned(press, settings={"voice": {"muted": not on}}, mute_known=9001)
+        with mock.patch.object(app.mute, "write", return_value=False), \
+                mock.patch.object(app.voice, "apply", return_value=said) as self.applied, \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                mock.patch.object(app.store, "save"), mock.patch.object(app.Gio.Notification, "new", lambda text: text), \
+                mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()):
+            for t in threads:
+                t()
+            for f, a in idle:
+                f(*a)
+        return stub, [c.args[1] for c in stub.send_notification.call_args_list]  # the texts sent
+
+    def test_a_failed_mute_keeps_the_chain_silent_shows_the_node_and_says_so(self):
+        stub, notes = self.failed(True)
+        self.assertIs(stub.settings["voice"]["muted"], True)  # fail closed: the chain stays silent
+        self.assertEqual(stub.mute_action.set_state.call_args, mock.call(GLib.Variant.new_boolean(False)))  # GNOME's
+        self.assertEqual(notes, ["Couldn't mute Booth Mic in GNOME — the chain is silenced; try again"])
+        with mock.patch.object(app.threading, "Thread", Inline), mock.patch.object(app.store, "save"), \
+                mock.patch.object(app.mute, "write") as write:
+            app.Application.on_mute_seen(stub, (70, 9001, False))  # booth_mic's next info event: still unmuted
+        self.assertIs(stub.settings["voice"]["muted"], True)  # never turned live by it
+        write.assert_called_once_with(True)  # the mute tried again
+
+    def test_skeptic_a_failed_mute_says_the_chain_is_silenced_only_when_it_is(self):
+        for said in ("unchanged", voice.HELD, "restarted"):
+            self.assertEqual(self.failed(True, said)[1],
+                             ["Couldn't mute Booth Mic in GNOME — the chain is silenced; try again"], said)
+        for said in ("not applied: Booth Mic didn't take the change", "not restarted: Booth Mic's service didn't start"):
+            stub, notes = self.failed(True, said)
+            self.assertEqual(notes, [f"Couldn't mute Booth Mic in GNOME, and its chain couldn't be silenced ({said}); "
+                                     "try again"])
+            self.assertIs(stub.settings["voice"]["muted"], True)
+
+    def test_a_failed_unmute_keeps_the_chain_silent_and_says_so(self):  # the node keeps its mute
+        stub, notes = self.failed(False)
+        self.assertEqual(self.applied.call_count, 1)  # the unmute's own: never one more with the record still live
+        self.assertIs(stub.settings["voice"]["muted"], True)
+        self.assertEqual(stub.mute_action.set_state.call_args, mock.call(GLib.Variant.new_boolean(True)))
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Couldn't unmute Booth Mic", notes[0])
 
 
 class RunInBackgroundSwitch(unittest.TestCase):
@@ -884,6 +1084,232 @@ class MenuWiring(unittest.TestCase):
         action = app.Application().lookup_action(name.removeprefix("app."))
         self.assertIsNotNone(action)
         self.assertEqual(action.get_state().get_type_string(), "b")  # a check item
+
+
+class Shortcuts(unittest.TestCase):
+    """#22: Ctrl+1/2/3 select the pages, Ctrl+0 resets the zoom; every shortcut is in the Keyboard Shortcuts window."""
+
+    def test_ctrl_1_2_3_select_the_pages_ctrl_0_resets_the_zoom_and_the_help_has_its_key(self):
+        booth = app.Application()
+        self.assertEqual([booth.get_accels_for_action(a) for a in ("win.page(0)", "win.page(1)", "win.page(2)",
+                                                                    "win.reset-zoom", "win.show-help-overlay",
+                                                                    "app.mute")],
+                         [["<Control>1"], ["<Control>2"], ["<Control>3"], ["<Control>0"], ["<Control>question"],
+                          ["<Control>m"]])
+
+    def test_the_shortcuts_window_lists_every_accelerator_the_app_sets_and_gnomes_ctrl_alt_m(self):
+        booth = app.Application()
+        bound = {accel for action in booth.list_action_descriptions() for accel in booth.get_accels_for_action(action)}
+        self.assertEqual({accel for _group, _action, accel, _title in ui_window.SHORTCUTS}, bound | {mute.SHORTCUT})
+
+    def test_the_primary_menu_opens_the_keyboard_shortcuts(self):
+        menu = ui_window.main_menu()
+        self.assertIn("win.show-help-overlay", [menu.get_item_attribute_value(i, "action", None).get_string()
+                                                for i in range(menu.get_n_items())])
+
+    def test_a_page_shortcut_selects_its_sidebar_row_and_shows_it(self):
+        win = mock.Mock()
+        ui_window.Window.select_page(win, 2)
+        win.sidebar.get_row_at_index.assert_called_once_with(2)
+        win.sidebar.select_row.assert_called_once_with(win.sidebar.get_row_at_index.return_value)
+        win.split.set_show_content.assert_called_once_with(True)  # a narrow window shows the page, not the sidebar
+
+    def test_ctrl_0_resets_the_zoom_only_while_the_brio_is_there(self):
+        for plugged in (True, False):
+            win = mock.Mock(plugged=plugged)
+            ui_window.Window.reset_zoom(win)
+            self.assertEqual(win.camera.reset_zoom.call_count, int(plugged))  # never a write to a gone camera
+
+    def test_the_shortcuts_window_lists_each_shortcut_in_its_group(self):  # m22
+        with mock.patch.object(ui_window, "Gtk") as gtk:
+            gtk.ShortcutsGroup.side_effect = lambda title: mock.Mock(title=title)
+            gtk.ShortcutsShortcut.side_effect = lambda title, accelerator: (title, accelerator)
+            ui_window.shortcuts_window()
+        groups = [c.args[0] for c in gtk.ShortcutsSection.return_value.add_group.call_args_list]
+        self.assertEqual([(g.title, *c.args[0]) for g in groups for c in g.add_shortcut.call_args_list],
+                         [(group, title, accel) for group, _action, accel, title in ui_window.SHORTCUTS])
+        gtk.ShortcutsWindow.return_value.add_section.assert_called_once_with(gtk.ShortcutsSection.return_value)
+
+    def test_a_new_window_has_the_shortcuts_window_and_shows_the_camera_as_found(self):  # m23, m33
+        win, ns = mock.Mock(), mock.Mock()
+        with mock.patch.object(ui_window, "super", lambda *a: ns, create=True), \
+                mock.patch.multiple(ui_window, Adw=mock.DEFAULT, Gtk=mock.DEFAULT, Gio=mock.DEFAULT, GLib=mock.DEFAULT,
+                                    CameraPage=mock.DEFAULT, HeadphonesPage=mock.DEFAULT, MicrophonePage=mock.DEFAULT,
+                                    shortcuts_window=mock.DEFAULT) as m:
+            ui_window.Window.__init__(win, mock.Mock(), {"camera": {}}, DEV, {})
+        win.set_help_overlay.assert_called_once_with(m["shortcuts_window"].return_value)
+        win.show_camera.assert_called_once_with(DEV)
+
+    def test_the_mute_button_says_booth_stereo_keeps_recording(self):  # #19 W5 final
+        with mock.patch.object(ui_window, "Gtk") as gtk, mock.patch.object(ui_window, "Adw"):
+            ui_window.page("Booth", mock.Mock(), ui_window.main_menu())
+        tip = next(c.kwargs["tooltip_text"] for c in gtk.ToggleButton.call_args_list)
+        self.assertEqual(tip, "Mute Booth Mic (Ctrl+M) — Booth Stereo keeps recording")
+
+    def test_the_window_uses_the_apps_own_icon(self):
+        app.Application()
+        self.assertEqual(Gtk.Window.get_default_icon_name(), app.APP_ID)
+
+
+class NotConnected(unittest.TestCase):
+    """#22: unplugging the BRIO or the PRO X dongle shows a status page, live, and the sidebar says so; both follow
+    the by-id watchers (and the HeadsetMonitor), each device resolved again on every event."""
+    DONGLE = "/dev/snd/by-id/usb-Logitech_PRO_X_Wireless_Gaming_Headset-00"
+
+    def by_id(self, stub, file, event):
+        app.Application.on_by_id(stub, None, Gio.File.new_for_path(file), None, event)
+
+    def test_the_brio_coming_or_going_checks_the_camera_once_the_burst_settles(self):
+        stub = mock.Mock()
+        self.by_id(stub, DEV, Gio.FileMonitorEvent.DELETED)  # the unplug
+        self.by_id(stub, "/dev/v4l/by-id", Gio.FileMonitorEvent.DELETED)  # udev removes the folder with the last camera
+        self.by_id(stub, DEV.replace("index0", "index2"), Gio.FileMonitorEvent.CREATED)  # never the IR node
+        self.assertEqual(stub.camera_seen.poke.call_count, 2)
+        stub.replug.poke.assert_not_called()  # an unplug restores nothing
+
+    def check(self, page, found, window=True):
+        stub = mock.Mock(settings={"camera": {"zoom_absolute": 250}})
+        stub.window = mock.Mock(camera=page) if window else None
+        ctrls, done = camera.parse_ctrls(read("brio/ctrls-index0.txt")), []
+        with mock.patch.object(app, "off_main", lambda work, then: done.append((work, then))), \
+                mock.patch.object(app.devices, "discover", return_value={"camera": found}) as discover, \
+                mock.patch.object(app, "restore_camera", return_value=found) as restore, \
+                mock.patch.object(camera, "read_ctrls", return_value=ctrls) as read_ctrls:
+            app.Application.check_camera(stub)
+            for work, then in done:  # off the main loop, then back on it
+                then(work())
+        return stub, discover, restore, read_ctrls, ctrls
+
+    def test_the_brio_gone_shows_the_status_page(self):
+        stub, _, restore, _, _ = self.check(mock.Mock(node=DEV, ctrls={camera.ZOOM: {}}), None)
+        stub.window.show_camera.assert_called_once_with(None, None)
+        restore.assert_not_called()
+
+    def test_the_same_brio_back_shows_its_page_and_leaves_the_restore_to_its_setter(self):
+        stub, _, restore, read_ctrls, _ = self.check(mock.Mock(node=DEV, ctrls={camera.ZOOM: {}}), DEV)
+        stub.window.show_camera.assert_called_once_with(DEV, None)
+        restore.assert_not_called()  # restore_saved's page.reapply sends the saved values, behind its own writes
+        read_ctrls.assert_not_called()
+
+    def test_a_brio_the_page_lacks_is_restored_then_read_for_a_new_page(self):
+        stub, _, restore, read_ctrls, ctrls = self.check(mock.Mock(node=None, ctrls={}), DEV)  # opened unplugged
+        restore.assert_called_once_with(stub.settings)
+        read_ctrls.assert_called_once_with(DEV)  # after the restore: the new page shows the saved values
+        stub.window.show_camera.assert_called_once_with(DEV, ctrls)
+
+    def test_a_page_whose_read_failed_gets_a_new_page_for_the_same_brio(self):  # found, but its controls weren't read
+        stub, _, restore, read_ctrls, ctrls = self.check(mock.Mock(node=DEV, ctrls={}), DEV)
+        restore.assert_called_once_with(stub.settings)
+        stub.window.show_camera.assert_called_once_with(DEV, ctrls)
+
+    def test_the_camera_is_probed_under_the_restore_lock(self):  # m32: never between a restore's writes
+        lock, held = mock.MagicMock(), []
+        lock.__enter__.side_effect = lambda *_: held.append(True)
+        lock.__exit__.side_effect = lambda *_: held.pop() and False
+        with mock.patch.object(app, "RESTORING", lock), mock.patch.object(app, "off_main", lambda w, t: t(w())), \
+                mock.patch.object(app.devices, "discover", side_effect=lambda: {"camera": DEV} if held else 1 / 0):
+            app.Application.check_camera(mock.Mock(window=mock.Mock(camera=mock.Mock(node=DEV,
+                                                                                    ctrls={camera.ZOOM: {}}))))
+
+    def test_a_window_shown_checks_the_camera_again(self):  # #22 W5 final: an event while starting was dropped
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.SCARLETT)
+        with mock.patch.object(app, "Window"), mock.patch.object(app.devices, "dongle_present", return_value=True):
+            app.Application.show_window(stub, {"camera": {}}, DEV, {}, False)
+        stub.check_camera.assert_called_once_with()
+
+    def test_a_brio_whose_controls_werent_read_shows_the_status_page(self):  # m05: no zoom, no page to show
+        win = mock.Mock()
+        win.camera.node, win.camera.ctrls, win.camera.values = DEV, {}, {}
+        ui_window.Window.show_camera(win, DEV)
+        win.camera_stack.set_visible_child_name.assert_called_once_with("missing")
+
+    def test_with_no_window_nothing_is_probed(self):
+        _, discover, _, _, _ = self.check(None, DEV, window=False)
+        discover.assert_not_called()  # a window opened later reads the camera in start()
+
+    def test_a_window_closed_while_the_camera_was_probed_is_never_told(self):
+        stub = mock.Mock(window=mock.Mock(camera=mock.Mock(node=DEV, ctrls={camera.ZOOM: {}})))
+        old, done = stub.window, []
+        with mock.patch.object(app, "off_main", lambda work, then: done.append(then)):
+            app.Application.check_camera(stub)
+        stub.window = None
+        done[0]((None, None))
+        old.show_camera.assert_not_called()
+
+    def test_an_unplugged_brio_shows_the_status_page_and_a_late_refresh_never_says_ready(self):
+        win = mock.Mock()
+        win.camera.node, win.camera.values = DEV, {camera.ZOOM: 250}
+        win.camera.ctrls = {camera.ZOOM: {"min": 100, "value": 100}}
+        win.camera_said = lambda text: ui_window.Window.camera_said(win, text)
+        ui_window.Window.show_camera(win, None)
+        win.camera_stack.set_visible_child_name.assert_called_once_with("missing")
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Not connected",))
+        win.camera_said("Ready · 2.5×")  # a write the gone camera refused refreshes the page
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Not connected",))
+        ui_window.Window.show_camera(win, DEV)  # the same BRIO back: its page and its zoom, live
+        win.camera_stack.set_visible_child_name.assert_called_with("camera")
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Ready · 2.5×",))
+
+    def test_a_brio_the_page_lacks_gets_a_new_page(self):
+        win, ctrls = mock.Mock(), camera.parse_ctrls(read("brio/ctrls-index0.txt"))
+        old = win.camera
+        win.camera_said = lambda text: ui_window.Window.camera_said(win, text)
+        with mock.patch.object(ui_window, "CameraPage") as page:
+            page.return_value.configure_mock(node=DEV, ctrls=ctrls, values={camera.ZOOM: 100})
+            ui_window.Window.show_camera(win, DEV, ctrls)
+        page.assert_called_once_with(win.settings, DEV, ctrls, win.camera_said)
+        win.camera_stack.remove.assert_called_once_with(old)
+        win.camera_stack.add_named.assert_called_once_with(page.return_value, "camera")
+        self.assertIs(win.camera, page.return_value)  # the app's camera_page() and Ctrl+0 find the new one
+        win.camera_stack.set_visible_child_name.assert_called_once_with("camera")
+        self.assertEqual(win.camera_status.set_label.call_args.args, ("Ready · 1.0×",))
+
+    def dongle_stub(self, **kw):
+        stub = mock.Mock(**kw)
+        stub.show_dongle = lambda: app.Application.show_dongle(stub)
+        return stub
+
+    def test_the_dongle_coming_or_going_shows_on_the_open_window_resolved_now(self):
+        stub = self.dongle_stub()
+        with mock.patch.object(app.devices, "dongle_present", side_effect=[False, True]):
+            for event in (Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.CREATED,
+                          Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+                app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(self.DONGLE), None, event)
+        self.assertEqual(stub.window.show_headset.call_args_list, [mock.call(False), mock.call(True)])
+        stub = self.dongle_stub(window=None)
+        with mock.patch.object(app.devices, "dongle_present") as present:
+            app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(self.DONGLE), None,
+                                         Gio.FileMonitorEvent.DELETED)
+        present.assert_not_called()
+
+    def test_the_headset_turning_on_or_off_checks_the_dongle_too(self):
+        stub = self.dongle_stub()
+        with mock.patch.object(app.devices, "dongle_present", return_value=False):
+            for event in ("off", "battery", "ack"):
+                app.Application.on_headset(stub, event)
+        stub.window.show_headset.assert_called_once_with(False)
+
+    def test_a_window_opens_showing_the_dongle_as_found_now(self):
+        stub = mock.Mock(window=None, starting=True, mic_source=voice.SCARLETT)
+        with mock.patch.object(app, "Window") as window, \
+                mock.patch.object(app.devices, "dongle_present", return_value=False):
+            app.Application.show_window(stub, {"camera": {}}, None, {}, False)
+        window.return_value.show_headset.assert_called_once_with(False)
+
+    def test_an_unplugged_dongle_shows_the_status_page_and_the_sidebar_says_so(self):
+        win = mock.Mock()
+        win.headphones_said = lambda text: ui_window.Window.headphones_said(win, text)
+        ui_window.Window.show_headset(win, False)
+        win.headphones_stack.set_visible_child_name.assert_called_once_with("missing")
+        win.headphones_status.set_label.assert_called_once_with("Not connected")
+        win.headphones_said("Off · Volume 63 %")  # the battery poll's "off", after the unplug
+        self.assertEqual(win.headphones_status.set_label.call_args.args, ("Not connected",))
+        win.reset_mock()
+        ui_window.Window.show_headset(win, True)  # back: the page, whose next poll says battery · volume
+        win.headphones_stack.set_visible_child_name.assert_called_once_with("headset")
+        win.headphones_status.set_label.assert_not_called()
+        win.headphones_said("~70 % · Volume 63 %")
+        win.headphones_status.set_label.assert_called_once_with("~70 % · Volume 63 %")
 
 
 if __name__ == "__main__":

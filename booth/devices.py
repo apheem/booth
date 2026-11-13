@@ -50,6 +50,13 @@ def replugged(name, event):
     return event in ("created", "moved-in", "renamed") and (name.endswith("-video-index0") or name == "by-id")
 
 
+def camera_moved(name, event):
+    """A by-id folder event → True when the BRIO may have come or gone (#22's Camera page): a color node (index0) or the
+    folder itself added or removed. discover() decides whether the BRIO is there."""
+    return event in ("created", "deleted", "moved-in", "moved-out", "renamed") and (
+        name.endswith("-video-index0") or name == "by-id")
+
+
 def _run(*cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
@@ -123,3 +130,11 @@ def dongle_appeared(name, event):
     """A /dev/snd/by-id event → True when the PRO X dongle may be back: its link appeared, or the folder itself (udev
     removes it with the last USB sound card). headset_card() decides whether it is there."""
     return event in ("created", "moved-in", "renamed") and (name.startswith(PRO_X_USB) or name == "by-id")
+
+
+def dongle_present(listdir=os.listdir):
+    """True while the PRO X dongle's /dev/snd/by-id link is there (by name, read now)."""
+    try:
+        return any(name.startswith(PRO_X_USB) for name in listdir(SND_BY_ID))
+    except OSError:  # the folder goes with the last USB sound card
+        return False

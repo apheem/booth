@@ -564,6 +564,31 @@ class PageQuietTest(unittest.TestCase):
         CameraPage.changed(page, "zoom_absolute", 250)  # the user moving it still sends
         self.assertEqual(sent, [[("zoom_absolute", 250)]])
 
+    def test_ctrl_0_zooms_back_to_the_cameras_default_through_the_setter_and_shows_it(self):  # #22
+        from booth.ui.camera import CameraPage
+
+        spawn, settings, moved = FakeSpawn(), {"version": 1, "camera": {}}, []
+        page = mock.Mock(quiet=False, values={"zoom_absolute": 300}, ctrls=brio())
+        page.ctrls["zoom_absolute"]["value"] = 300  # read zoomed in: Ctrl+0 is its default, never the value read
+        page.setter = camera.Setter(settings, DEV, spawn, lambda s: None, {})
+        page.changed = lambda name, v: CameraPage.changed(page, name, v)
+        page.show = lambda names: CameraPage.show(page, names)
+        page.widgets = {"zoom_absolute": lambda v: moved.append(v) or CameraPage.changed(page, "zoom_absolute", v)}
+        CameraPage.reset_zoom(page)
+        self.assertEqual(spawn.cmds, [zoom(100)])  # the camera's own default, from its listing; one write
+        self.assertEqual((moved, page.values["zoom_absolute"]), ([100], 100))  # the slider follows
+        page.refresh.assert_called_with()  # the overlay and the sidebar's zoom
+        spawn.finish(True)
+        self.assertEqual(settings["camera"], {"zoom_absolute": 100})  # saved like any other write
+
+    def test_ctrl_0_on_a_page_with_no_camera_sends_nothing(self):
+        from booth.ui.camera import CameraPage
+
+        page = mock.Mock(ctrls={})
+        CameraPage.reset_zoom(page)
+        page.setter.set.assert_not_called()
+        page.changed.assert_not_called()
+
     def test_a_replug_reapplies_the_saved_values_and_the_page_shows_them(self):
         from booth.ui.camera import CameraPage
 
