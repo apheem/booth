@@ -70,6 +70,7 @@ NOT_ROUTED = "Booth Mic has no input: the mic isn't routed to a capture channel"
 STALE = "Booth Mic may still be using the old channel: couldn't stop it"
 STOPPED = "Booth Mic isn't running: see systemctl --user status booth-voice.service"
 HELD = "not restarted while muted: Booth Mic restarts once you unmute"
+HELD_RELOAD = "install.sh: Booth Mic is muted: its new plugins load the next time Booth Mic starts"
 _LOCK = threading.RLock()  # the page's poll, the service's start and heal may run at once
 HEAL_BACKOFF_S = 60
 _HEALED = {}  # (selector config, Scarlett node object.serial) → when heal last restarted the selector for it
@@ -715,10 +716,13 @@ def write(file=None, where=None):
 
 def reload(run=service.run, file=None):
     """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
-    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
+    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed;
+    HELD_RELOAD: held, muted (_held), so they load at its next start."""
     with _LOCK:
         _VERIFIED.clear()  # an install's fresh plugins: hashed now
-        return _plugins(_running(file or path())) == verified() or (not _held(store.load(), _dump) and run(RESTART))
+        if _plugins(_running(file or path())) == verified():
+            return True
+        return HELD_RELOAD if _held(store.load(), _dump) else run(RESTART)
 
 
 def main():
@@ -729,7 +733,10 @@ def main():
             print(f"booth.voice: {said}", file=sys.stderr)
         return 1 if said and said.startswith("not ") else 0
     if args == ["--reload"]:
-        return 0 if reload() else 1
+        done = reload()
+        if done == HELD_RELOAD:
+            print(done, file=sys.stderr)
+        return 0 if done else 1
     if args[:1] == ["--select"] and len(args) == 2:
         return 0 if may_select(Path(args[1])) else 1
     print(sync(store.load()))

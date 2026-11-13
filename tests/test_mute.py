@@ -1,8 +1,10 @@
 """One mute (#21): Booth Mic's node mute, the one GNOME's mic-mute toggles, read from pw-dump's monitor, put back on a
 recreated Booth Mic, and GNOME's mic-mute bound to Ctrl+Alt+M only when it has no binding."""
+import io
 import json
 import subprocess
 import unittest
+from unittest import mock
 
 from booth import mute
 
@@ -212,6 +214,70 @@ class Watch(unittest.TestCase):
             mute.watch(lambda _: None, popen=popen, sleep=sleep)
         self.assertEqual(slept, [mute.RETRY_S])
         self.assertGreaterEqual(mute.RETRY_S, 2)
+
+    def monitors(self, *outs):
+        """subprocess.Popen stand-ins: pw-dump's monitor printing each of `outs` (bytes) in turn, decoded as Popen's own
+        keyword arguments say; each records its terminate()s."""
+        made = []
+
+        class Popen:
+            def __init__(self, cmd, text=False, encoding=None, errors=None, **kw):
+                self.stdout = io.TextIOWrapper(io.BytesIO(outs[len(made)]), encoding=encoding, errors=errors)
+                self.terminate = mock.Mock()
+                made.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return Popen, made
+
+    def run_watch(self, popen, found, runs=1):
+        slept = []
+
+        def sleep(s):
+            slept.append(s)
+            if len(slept) == runs:
+                raise KeyboardInterrupt  # out of the loop
+        with self.assertRaises(KeyboardInterrupt):
+            mute.watch(found, popen=popen, sleep=sleep)
+        return slept
+
+    def test_a_non_utf8_byte_never_ends_the_watch_and_later_changes_still_apply(self):
+        seen = []
+        popen, _ = self.monitors(b'[\n"\xff"\n]\n' + MONITOR.encode())
+        self.run_watch(popen, seen.append)
+        self.assertEqual(seen, [(70, 9001, False), (70, 9001, True)])  # the same monitor, read on past the byte
+
+    def test_any_error_restarts_the_monitor_later_and_its_changes_apply(self):
+        seen, real, calls = [], mute.find, []
+
+        def find(batch):
+            calls.append(batch)
+            if len(calls) == 1:
+                raise RuntimeError("a parser's own bug")
+            return real(batch)
+        popen, made = self.monitors(MONITOR.encode(), MONITOR.encode())
+        with mock.patch.object(mute, "find", find):
+            slept = self.run_watch(popen, seen.append, runs=2)
+        self.assertEqual(slept, [mute.RETRY_S] * 2)
+        self.assertEqual(seen, [(70, 9001, False), (70, 9001, True)])  # from the restarted monitor
+        made[0].terminate.assert_called_with()  # the broken one never outlives its loop
+
+    def test_a_monitor_left_is_terminated_never_an_orphan(self):  # it would live on until the graph next changes
+        popen, made = self.monitors(MONITOR.encode())
+        self.run_watch(popen, lambda _: None)
+        made[0].terminate.assert_called_with()
+
+    def test_stop_terminates_the_running_monitor(self):  # Booth's quit (app.do_shutdown)
+        popen, made, stopped = *self.monitors(MONITOR.encode()), []
+
+        def found(_):
+            mute.stop()
+            stopped.append(made[0].terminate.called)
+        self.run_watch(popen, found)
+        self.assertEqual(stopped[:1], [True])
 
 
 if __name__ == "__main__":

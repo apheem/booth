@@ -171,6 +171,7 @@ class Application(Adw.Application):
 
     def do_shutdown(self):
         voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
+        mute.stop()  # #21: its pw-dump --monitor ends with Booth
         Adw.Application.do_shutdown(self)
 
     def on_by_id(self, _monitor, file, other, event):
@@ -219,7 +220,19 @@ class Application(Adw.Application):
         """The header button or Ctrl+M: Booth Mic's node mute set, and recorded at once."""
         on = value.get_boolean()
         self.record_mute(on)
-        threading.Thread(target=lambda: mute.write(on), daemon=True).start()
+        threading.Thread(target=lambda: mute.write(on) or GLib.idle_add(self.mute_failed, on), daemon=True).start()
+
+    def mute_failed(self, on):
+        """wpctl didn't take the button's `on`: the node keeps its mute, and the button shows it (pressing it again
+        tries again). Fail closed: the chain stays (or goes back to) silent, and the node is no longer followed, so its
+        next sighting puts the mute back instead of turning the record live."""
+        self.mute_known = None
+        self.record_mute(True)
+        self.mute_action.set_state(GLib.Variant.new_boolean(not on))
+        self.send_notification("mute-failed", Gio.Notification.new(
+            "Couldn't mute Booth Mic in GNOME — the chain is silenced; try again" if on else
+            "Couldn't unmute Booth Mic in GNOME — it stays muted; try again"))
+        return GLib.SOURCE_REMOVE
 
     def muted(self):
         return bool((self.settings.get("voice") or {}).get("muted"))

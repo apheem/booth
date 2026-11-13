@@ -1,7 +1,9 @@
 """The voice chain builder and its service side: Booth Mic is a mono source fed only from the mic's channel, through a
 separate source selector, with every stage and the master switch a live dry/wet bypass."""
+import contextlib
 import copy
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -1367,8 +1369,17 @@ class Muted(unittest.TestCase):
             self.ran.clear()
             with mock.patch.object(voice, "verified", lambda: FOUND), \
                     mock.patch.object(voice.store, "load", lambda: settings), mock.patch.object(voice, "_dump", lambda: dump):
-                self.assertEqual(voice.reload(run=lambda cmd: self.ran.append(cmd) or True, file=self.file), want != [])
+                got = voice.reload(run=lambda cmd: self.ran.append(cmd) or True, file=self.file)
+            self.assertEqual(got, True if want else voice.HELD_RELOAD, (settings, dump))
             self.assertEqual(self.ran, want, (settings, dump))
+
+    def test_install_says_a_muted_booth_mic_loads_its_new_plugins_at_its_next_start(self):  # never "couldn't restart"
+        err = io.StringIO()
+        with mock.patch.object(voice, "reload", lambda: voice.HELD_RELOAD), \
+                mock.patch.object(voice.sys, "argv", ["x", "--reload"]), contextlib.redirect_stderr(err):
+            self.assertEqual(voice.main(), 0)  # install.sh's "couldn't restart Booth Mic" is for a failure only
+        self.assertEqual(err.getvalue(),
+                         "install.sh: Booth Mic is muted: its new plugins load the next time Booth Mic starts\n")
 
 
 TONE_PATH = "tone_air(tone_presence(tone_warmth({})))"

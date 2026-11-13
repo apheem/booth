@@ -763,6 +763,12 @@ class MicFallback(unittest.TestCase):
         release.assert_called_once_with()
         shutdown.assert_called_once_with(stub)
 
+    def test_quitting_ends_the_mute_watchers_pw_dump(self):  # #21: no pw-dump --monitor outlives Booth
+        with mock.patch.object(app.voice, "release"), mock.patch.object(app.Adw.Application, "do_shutdown"), \
+                mock.patch.object(app.mute, "stop") as stop:
+            app.Application.do_shutdown(mock.Mock())
+        stop.assert_called_once_with()
+
     def test_the_bus_name_the_selector_unit_asks_for_is_the_apps(self):
         self.assertEqual(app.APP_ID, service.APP_ID)
 
@@ -909,6 +915,47 @@ class Mute(unittest.TestCase):
     def test_the_header_button_is_bound_to_app_mute(self):
         self.assertEqual(ui_window.MUTE_ACTION, "app.mute")
         self.assertIsNotNone(app.Application().lookup_action(ui_window.MUTE_ACTION.removeprefix("app.")))
+        with mock.patch.object(ui_window, "Adw") as adw, mock.patch.object(ui_window, "Gtk") as gtk:
+            ui_window.page("Booth", mock.Mock(), ui_window.main_menu())
+        self.assertEqual(gtk.ToggleButton.call_args.kwargs["action_name"], "app.mute")
+        adw.HeaderBar.return_value.pack_start.assert_called_once_with(gtk.ToggleButton.return_value)
+
+    def failed(self, on):
+        """The button (or Ctrl+M) set to `on` with wpctl refusing it; its workers and main-loop calls run → the stub and
+        the notifications sent, as their texts."""
+        idle = []
+
+        def press(s):
+            s.mute_failed = lambda on: app.Application.mute_failed(s, on)
+            app.Application.on_mute(s, None, GLib.Variant.new_boolean(on))
+        stub, threads, _ = self.spawned(press, settings={"voice": {"muted": not on}}, mute_known=9001)
+        with mock.patch.object(app.mute, "write", return_value=False), mock.patch.object(app.voice, "apply"), \
+                mock.patch.object(app.GLib, "idle_add", lambda f, *a: idle.append((f, a))), \
+                mock.patch.object(app.store, "save"), mock.patch.object(app.Gio.Notification, "new", lambda text: text), \
+                mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()):
+            for t in threads:
+                t()
+            for f, a in idle:
+                f(*a)
+        return stub, [c.args[1] for c in stub.send_notification.call_args_list]  # the texts sent
+
+    def test_a_failed_mute_keeps_the_chain_silent_shows_the_node_and_says_so(self):
+        stub, notes = self.failed(True)
+        self.assertIs(stub.settings["voice"]["muted"], True)  # fail closed: the chain stays silent
+        self.assertEqual(stub.mute_action.set_state.call_args, mock.call(GLib.Variant.new_boolean(False)))  # GNOME's
+        self.assertEqual(notes, ["Couldn't mute Booth Mic in GNOME — the chain is silenced; try again"])
+        with mock.patch.object(app.threading, "Thread", Inline), mock.patch.object(app.store, "save"), \
+                mock.patch.object(app.mute, "write") as write:
+            app.Application.on_mute_seen(stub, (70, 9001, False))  # booth_mic's next info event: still unmuted
+        self.assertIs(stub.settings["voice"]["muted"], True)  # never turned live by it
+        write.assert_called_once_with(True)  # the mute tried again
+
+    def test_a_failed_unmute_keeps_the_chain_silent_and_says_so(self):  # the node keeps its mute
+        stub, notes = self.failed(False)
+        self.assertIs(stub.settings["voice"]["muted"], True)
+        self.assertEqual(stub.mute_action.set_state.call_args, mock.call(GLib.Variant.new_boolean(True)))
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Couldn't unmute Booth Mic", notes[0])
 
 
 class RunInBackgroundSwitch(unittest.TestCase):

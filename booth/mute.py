@@ -96,18 +96,33 @@ def batches(lines):
             buf = []
 
 
+_child = None  # the monitor running now: stop() ends it
+
+
 def watch(found, popen=subprocess.Popen, sleep=time.sleep):
     """For good, on a worker: found(find's) whenever pw-dump's monitor shows Booth Mic's node (at its start, then on
-    every change of it); a monitor that ends is started again RETRY_S later."""
+    every change of it); a monitor that ends, or any error (a byte that isn't UTF-8, a parser's), starts it again
+    RETRY_S later: the watcher thread never dies."""
+    global _child
     while True:
-        try:  # shortcut: Booth quitting leaves pw-dump until its next print (then EPIPE ends it); kill it if that matters
-            with popen(WATCH, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as p:
-                for batch in batches(p.stdout):
-                    if (node := find(batch)) is not None:
-                        found(node)
-        except OSError:
+        try:
+            with popen(WATCH, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace") as p:
+                _child = p
+                try:
+                    for batch in batches(p.stdout):
+                        if (node := find(batch)) is not None:
+                            found(node)
+                finally:  # ended now: a left pw-dump would live until the graph next changes (then EPIPE)
+                    p.terminate()
+        except Exception:
             pass
         sleep(RETRY_S)
+
+
+def stop():
+    """Booth's quit: the running monitor ended, never left an orphan."""
+    if _child is not None:
+        _child.terminate()
 
 
 def main():
