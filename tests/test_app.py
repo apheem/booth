@@ -1176,7 +1176,8 @@ class NotConnected(unittest.TestCase):
 
     def test_an_unplugged_brio_shows_the_status_page_and_a_late_refresh_never_says_ready(self):
         win = mock.Mock()
-        win.camera.node, win.camera.ctrls, win.camera.values = DEV, {camera.ZOOM: {"min": 100}}, {camera.ZOOM: 250}
+        win.camera.node, win.camera.values = DEV, {camera.ZOOM: 250}
+        win.camera.ctrls = {camera.ZOOM: {"min": 100, "value": 100}}
         win.camera_said = lambda text: ui_window.Window.camera_said(win, text)
         ui_window.Window.show_camera(win, None)
         win.camera_stack.set_visible_child_name.assert_called_once_with("missing")
@@ -1201,21 +1202,26 @@ class NotConnected(unittest.TestCase):
         win.camera_stack.set_visible_child_name.assert_called_once_with("camera")
         self.assertEqual(win.camera_status.set_label.call_args.args, ("Ready · 1.0×",))
 
+    def dongle_stub(self, **kw):
+        stub = mock.Mock(**kw)
+        stub.show_dongle = lambda: app.Application.show_dongle(stub)
+        return stub
+
     def test_the_dongle_coming_or_going_shows_on_the_open_window_resolved_now(self):
-        stub = mock.Mock()
+        stub = self.dongle_stub()
         with mock.patch.object(app.devices, "dongle_present", side_effect=[False, True]):
             for event in (Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.CREATED,
                           Gio.FileMonitorEvent.CHANGES_DONE_HINT):
                 app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(self.DONGLE), None, event)
         self.assertEqual(stub.window.show_headset.call_args_list, [mock.call(False), mock.call(True)])
-        stub = mock.Mock(window=None)
+        stub = self.dongle_stub(window=None)
         with mock.patch.object(app.devices, "dongle_present") as present:
             app.Application.on_snd_by_id(stub, None, Gio.File.new_for_path(self.DONGLE), None,
                                          Gio.FileMonitorEvent.DELETED)
         present.assert_not_called()
 
     def test_the_headset_turning_on_or_off_checks_the_dongle_too(self):
-        stub = mock.Mock()
+        stub = self.dongle_stub()
         with mock.patch.object(app.devices, "dongle_present", return_value=False):
             for event in ("off", "battery", "ack"):
                 app.Application.on_headset(stub, event)
@@ -1230,13 +1236,18 @@ class NotConnected(unittest.TestCase):
 
     def test_an_unplugged_dongle_shows_the_status_page_and_the_sidebar_says_so(self):
         win = mock.Mock()
+        win.headphones_said = lambda text: ui_window.Window.headphones_said(win, text)
         ui_window.Window.show_headset(win, False)
         win.headphones_stack.set_visible_child_name.assert_called_once_with("missing")
         win.headphones_status.set_label.assert_called_once_with("Not connected")
+        win.headphones_said("Off · Volume 63 %")  # the battery poll's "off", after the unplug
+        self.assertEqual(win.headphones_status.set_label.call_args.args, ("Not connected",))
         win.reset_mock()
         ui_window.Window.show_headset(win, True)  # back: the page, whose next poll says battery · volume
         win.headphones_stack.set_visible_child_name.assert_called_once_with("headset")
         win.headphones_status.set_label.assert_not_called()
+        win.headphones_said("~70 % · Volume 63 %")
+        win.headphones_status.set_label.assert_called_once_with("~70 % · Volume 63 %")
 
 
 if __name__ == "__main__":

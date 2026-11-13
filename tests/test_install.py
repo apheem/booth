@@ -131,6 +131,7 @@ class Install(unittest.TestCase):
     def test_a_symlink_in_the_source_is_installed_as_a_file(self):
         src = self.home.parent / "src"
         shutil.copytree(REPO / "booth", src / "booth", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(REPO / "data", src / "data")  # the icon
         shutil.copy(REPO / "install.sh", src)
         (src / "extra.py").write_text("x = 1\n")
         (src / "booth" / "extra.py").symlink_to("../extra.py")

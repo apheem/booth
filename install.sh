@@ -1,7 +1,8 @@
 #!/bin/sh
 # install.sh — install Booth for this user: no sudo, nothing outside the home folder, safe to re-run.
 # Copies the repo's booth/ to ~/.local/share/booth/booth (a real copy, never a symlink into the repo or a worktree),
-# writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop.
+# writes the launcher ~/.local/bin/booth and the app-grid entry ~/.local/share/applications/io.github.apheem.Booth.desktop
+# with its icon (data/, into ~/.local/share/icons/hicolor).
 set -eu
 umask 022  # never group-writable, whatever the user's umask: verify() refuses that for a plugin, so for its pins too
 repo=$(cd "$(dirname "$0")" && pwd)
@@ -43,10 +44,15 @@ Type=Application
 Name=Booth
 Comment=Camera, microphone and headphones in one place
 Exec="$exec_arg"
-Icon=camera-web
+Icon=io.github.apheem.Booth
 Categories=AudioVideo;Settings;
 StartupNotify=true
 EOF
+# The app icon (#22), by the app's id: the desktop entry's Icon= and the window's. Staged then swapped, as the app.
+icons=$share/icons/hicolor/scalable/apps
+mkdir -p "$icons"
+cp -L "$repo/data/io.github.apheem.Booth.svg" "$icons/io.github.apheem.Booth.svg.new"
+mv "$icons/io.github.apheem.Booth.svg.new" "$icons/io.github.apheem.Booth.svg"
 
 # booth.service runs the installed launcher with --background. It's wanted by graphical-session.target, not
 # default.target: GTK needs the session's display, which default.target (also reached with no login screen) lacks.
