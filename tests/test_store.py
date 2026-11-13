@@ -205,6 +205,27 @@ class Store(unittest.TestCase):
             self.path.write_text(text)
             self.assertEqual(store.load(self.path), store.defaults(), text)
 
+    def test_booth_stereos_side_and_source_round_trip(self):  # #19: its pre-start reads them
+        settings = store.load(self.path)
+        for side, source in (("L", "scarlett"), ("R", "computer"), ("R", "alsa_input.usb-046d_Logitech_BRIO_x")):
+            settings["voice"].update(stereo_side=side, stereo_source=source)
+            store.save(settings, self.path)
+            v = store.load(self.path)["voice"]
+            self.assertEqual((v["stereo_side"], v["stereo_source"]), (side, source))
+
+    def test_a_bad_booth_stereo_value_counts_as_corrupt(self):
+        self.path.parent.mkdir(parents=True)
+        for text in ('{"voice": {"stereo_side": "left"}}', '{"voice": {"stereo_side": "l"}}',
+                     '{"voice": {"stereo_side": true}}', '{"voice": {"stereo_side": null}}',
+                     '{"voice": {"stereo_source": ""}}', '{"voice": {"stereo_source": 1}}',
+                     '{"voice": {"stereo_source": null}}', '{"voice": {"stereo_source": ["computer"]}}'):
+            self.path.write_text(text)
+            self.assertEqual(store.load(self.path), store.defaults(), text)
+
+    def test_booth_stereos_keys_never_turn_the_preset_picker_to_custom(self):
+        v = dict(voice.PRESETS[voice.DEFAULT_PRESET], stereo_side="R", stereo_source="computer")
+        self.assertEqual(voice.preset_of(v), voice.DEFAULT_PRESET)
+
     def test_fresh_settings_start_on_the_broadcast_preset(self):  # #2: the user's mic is dynamic
         self.assertEqual(store.load(self.path)["voice"], voice.PRESETS["Broadcast"])
 

@@ -13,8 +13,10 @@ booth-mic-select or booth_mic. Its one config holds three modules:
                       silent and the row says so, never another source
   booth.stereo.input → booth_stereo, the stereo Audio/Source (FL, FR)
 Each is passive and pinned to its target (target.object + node.dont-reconnect): nothing runs and no device is opened for
-it while no app records Booth Stereo or reads Booth Mic (the two share booth.mic.input), and a source that goes is never
-replaced by WirePlumber's pick.
+it while no app records Booth Stereo or reads Booth Mic, and a source that goes is never replaced by WirePlumber's pick.
+shortcut: PipeWire 1.0.5's passive links wake both ways, so while an app reads Booth Mic (a call) Booth Stereo's chain
+and its other source run too (measured: a BRIO mic on the other side opens; nothing reaches an app); upgrade to one-way
+passive ports (PipeWire 1.2's node.passive = "in"/"out") once the desk has them.
 Mute (#21) is booth_mic's node mute and Booth Mic's master gains: Booth Stereo reads neither, so it carries the voice even
 while Booth Mic is muted (NOTE says so); its own master follows only the Voice processing switch. It is never the default
 mic: Booth never makes it one, and its priority is below any mic's.
