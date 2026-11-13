@@ -1,5 +1,6 @@
 """The voice chain builder and its service side: Booth Mic is a mono source fed only from the mic's channel, through a
 separate source selector, with every stage and the master switch a live dry/wet bypass."""
+import copy
 import json
 import tempfile
 import unittest
@@ -12,18 +13,32 @@ from tests.test_headset import DUMP
 
 CTRLS = scarlett.parse_contents(read("scarlett/amixer-contents.txt"))
 MIC = scarlett.mic(CTRLS, DUMP, "XLR")
+STATE = {"ctrls": CTRLS, "mic": MIC}  # scarlett.read: the Scarlett plugged in, the XLR on capture channel 2
 ON = {"voice": {}}  # the defaults: processing on, rumble filter on
 UNITS = ["booth-voice.service", "booth-mic-select.service"]
 RESTART = ["systemctl", "--user", "restart"] + UNITS  # a new chain: both, the selector re-links to the new input
 START = ["systemctl", "--user", "start"] + UNITS
 RESTART_SELECT = ["systemctl", "--user", "restart", "booth-mic-select.service"]
+STOP_SELECT = ["systemctl", "--user", "stop", "booth-mic-select.service"]
+
+
+def rerouted(item):
+    """scarlett.read with capture channel 2 (the XLR's) switched to another routing item, e.g. "PCM 1" (the computer's
+    playback) or "Mix A" (the loopback mix): the Scarlett is there, the mic reaches no capture channel."""
+    ctrls = copy.deepcopy(CTRLS)
+    ctrls["PCM 02 Capture Enum"]["values"] = [ctrls["PCM 02 Capture Enum"]["items"].index(item)]
+    return {"ctrls": ctrls, "mic": scarlett.mic(ctrls, DUMP, "XLR")}
+
+
+def plugged(mic):
+    return {"ctrls": CTRLS, "mic": mic}
 
 
 def node(i, name):
     return {"id": i, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": name}}}
 
 
-CHAIN_DUMP = json.dumps([node(71, "booth.mic.input")])
+CHAIN_DUMP = json.dumps([node(70, "booth_mic"), node(71, "booth.mic.input")])  # Booth Mic, then its input
 SCARLETT_BACK = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"])])  # the selector unloaded itself
 SELECTING = json.dumps([node(71, "booth.mic.input"), node(40, MIC["node"]), node(80, "booth.mic.select")])
 
@@ -132,6 +147,14 @@ class BoothMic(unittest.TestCase):
     def test_no_mic_channel_no_selector(self):
         self.assertIsNone(voice.build_selector(None))  # not routed: never a guessed channel
         self.assertIsNone(voice.build_selector(dict(MIC, node=None, position=None, channels=None)))  # not in PipeWire
+        for position in (None, ""):  # in PipeWire, but with fewer channels than the mic's: never a guessed one
+            self.assertIsNone(voice.build_selector(dict(MIC, position=position)), position)
+
+    def test_the_always_on_selector_capture_is_hidden_from_pulse_source_outputs(self):
+        # module-loopback's default Stream/Input/Audio is a pipewire-pulse source-output for as long as it runs:
+        # GNOME's mic-in-use indicator would stay on with no app reading Booth Mic
+        capture = module(selector(), "libpipewire-module-loopback")["capture.props"]
+        self.assertEqual(capture["media.class"], "Stream/Input/Audio/Internal")
 
     def test_the_config_is_quoted_whatever_the_node_name(self):
         mic = dict(MIC, node='odd "name" } ] = x')
@@ -186,8 +209,8 @@ class Apply(unittest.TestCase):
         self.select = self.file.with_name("voice-select.conf")
         self.ran, self.fails = [], ()
 
-    def apply(self, settings=ON, mic=MIC):
-        return voice.apply(settings, mic, run=lambda cmd: self.ran.append(cmd) or cmd[0] not in self.fails,
+    def apply(self, settings=ON, state=STATE):
+        return voice.apply(settings, state, run=lambda cmd: self.ran.append(cmd) or cmd[0] not in self.fails,
                            dump=lambda: CHAIN_DUMP, file=self.file)
 
     def test_the_first_config_is_written_and_the_service_restarted(self):
@@ -213,22 +236,70 @@ class Apply(unittest.TestCase):
         self.apply()
         chain, self.ran = self.file.read_text(), []
         instrument = scarlett.mic(CTRLS, DUMP, "Instrument")
-        self.apply(mic=instrument)
+        self.apply(state=plugged(instrument))
         self.assertEqual(self.ran, [RESTART_SELECT])
         self.assertEqual(self.file.read_text(), chain)  # booth-voice.service's config: untouched
         self.assertEqual(json.loads(self.select.read_text()), selector(instrument))
 
-    def test_no_mic_keeps_the_last_selector_and_runs_nothing(self):
+    def test_unplugged_keeps_the_last_selector_and_runs_nothing(self):
         self.apply()
         before, self.ran = self.select.read_text(), []
-        self.apply(mic=None)
-        self.apply(mic=dict(MIC, node=None, position=None))
+        self.assertEqual(self.apply(state=None), "unchanged")  # it unloaded itself; heal brings it back
         self.assertEqual((self.select.read_text(), self.ran), (before, []))
+
+    def test_not_routed_stops_the_selector_whose_channel_now_carries_computer_audio(self):
+        for item in ("PCM 1", "Mix A"):  # capture 2 rerouted: the computer's playback, the loopback mix
+            self.apply()
+            self.ran.clear()
+            self.assertIsNone(rerouted(item)["mic"])
+            self.apply(state=rerouted(item))
+            self.assertEqual(self.ran, [STOP_SELECT], item)
+            self.assertFalse(self.select.exists())  # nothing to restart it with: not at login, not by heal
+            self.ran.clear()
+            self.assertEqual(self.apply(state=rerouted(item)), "unchanged")  # stopped once
+            self.assertEqual(self.ran, [])
+
+    def test_a_mic_with_no_channel_to_take_stops_the_selector(self):
+        for mic in (dict(MIC, position=None), dict(MIC, node=None, position=None)):  # fewer channels; not in PipeWire
+            self.apply()
+            self.ran.clear()
+            self.apply(state=plugged(mic))
+            self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False), mic)
+
+    def test_a_selector_that_wont_stop_keeps_its_config_and_is_stopped_next_time(self):
+        self.apply()
+        self.ran, self.fails = [], ("systemctl",)
+        self.assertTrue(self.apply(state=rerouted("PCM 1")).startswith("not stopped"))
+        self.assertTrue(self.select.exists())
+        self.ran, self.fails = [], ()
+        self.apply(state=rerouted("PCM 1"))
+        self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False))
+
+    def test_a_failed_selector_restart_is_not_recorded_and_is_retried(self):
+        self.apply()
+        instrument = plugged(scarlett.mic(CTRLS, DUMP, "Instrument"))
+        self.ran, self.fails = [], ("systemctl",)
+        self.assertTrue(self.apply(state=instrument).startswith("not restarted"))
+        self.assertEqual(json.loads(self.select.read_text()), selector())  # still the old one
+        self.ran, self.fails = [], ()
+        self.assertEqual(self.apply(state=instrument), "selector restarted")
+        self.assertEqual(self.ran, [RESTART_SELECT])
+
+    def test_a_failed_chain_restart_is_not_recorded_and_is_retried(self):
+        self.fails = ("systemctl",)
+        self.assertTrue(self.apply().startswith("not restarted"))
+        self.assertEqual((self.file.exists(), self.select.exists()), (False, False))
+        self.file.write_text("{ half")
+        self.assertTrue(self.apply().startswith("not restarted"))
+        self.assertEqual(self.file.read_text(), "{ half")  # what it held before
+        self.ran, self.fails = [], ()
+        self.assertEqual(self.apply(), "restarted")
+        self.assertEqual(self.ran, [RESTART])
 
     def test_a_switch_is_applied_with_the_scarlett_unplugged(self):
         self.apply()
         self.ran.clear()
-        self.apply({"voice": {"enabled": False}}, mic=None)
+        self.apply({"voice": {"enabled": False}}, state=None)
         self.assertEqual([c[:2] for c in self.ran], [["pw-cli", "set-param"]])
 
     def test_a_live_change_that_fails_is_not_recorded_and_the_next_apply_retries(self):
@@ -256,6 +327,15 @@ class Apply(unittest.TestCase):
         self.apply()
         self.assertEqual(self.ran, [RESTART])
 
+    def test_a_config_of_the_wrong_shape_is_replaced_and_restarted(self):
+        self.file.parent.mkdir(parents=True)
+        for text in ("null", "[1]", '{"context.modules": 3}', '{"context.modules": ["x"]}',
+                     '{"context.modules": [{"args": {"filter.graph": {"nodes": ["x"]}}}]}'):
+            self.file.write_text(text)
+            self.ran.clear()
+            self.assertEqual(self.apply(), "restarted", text)
+            self.assertEqual((self.ran, json.loads(self.file.read_text())), ([RESTART], config()), text)
+
     def test_a_config_that_cant_be_written_restarts_nothing(self):
         self.file.parent.mkdir(parents=True)
         self.file.mkdir()  # a folder where the file goes: the write fails
@@ -265,7 +345,8 @@ class Apply(unittest.TestCase):
     def test_it_only_ever_runs_systemctl_on_booth_mics_two_units(self):
         self.apply()
         self.apply({"voice": {"enabled": False}})
-        self.apply(mic=scarlett.mic(CTRLS, DUMP, "Instrument"))
+        self.apply(state=plugged(scarlett.mic(CTRLS, DUMP, "Instrument")))
+        self.apply(state=rerouted("PCM 1"))
         for cmd in self.ran:
             if cmd[0] == "systemctl":
                 self.assertTrue(set(cmd[3:]) <= set(UNITS), cmd)
@@ -290,6 +371,7 @@ class Sync(unittest.TestCase):
         said = self.sync({"ctrls": CTRLS, "mic": MIC})
         self.assertEqual(self.ran, [RESTART, START])
         self.assertEqual(said, voice.describe({"ctrls": CTRLS, "mic": MIC}))
+        self.assertEqual(json.loads(self.file.with_name("voice-select.conf").read_text()), selector())
 
     def test_unplugged_with_an_old_config_still_starts_it(self):
         self.sync({"ctrls": CTRLS, "mic": MIC})
@@ -316,20 +398,25 @@ class Sync(unittest.TestCase):
 
 
 class Heal(unittest.TestCase):
-    """The selector unloads itself when its Scarlett goes (or isn't there yet at login): Booth restarts it once the
-    Scarlett is back in PipeWire."""
+    """Every 10 s, with or without a window: the Scarlett read now, Booth Mic's configs brought up to date, and the
+    selector restarted when it unloaded itself (its Scarlett went, or wasn't there yet at login) and the Scarlett and
+    Booth Mic's input are back."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.file = Path(tmp.name) / "voice.conf"
+        self.select = self.file.with_name("voice-select.conf")
         self.ran = []
+        voice._HEALED.clear()
+        self.addCleanup(voice._HEALED.clear)
 
-    def heal(self, dump):
-        return voice.heal(run=lambda cmd: self.ran.append(cmd) or True, dump=lambda: dump, file=self.file)
+    def heal(self, dump, state=STATE, t=1000.0):
+        return voice.heal(ON, read=lambda choice: state, run=lambda cmd: self.ran.append(cmd) or True,
+                          dump=lambda: dump, file=self.file, clock=lambda: t)
 
     def saved(self):
-        voice.apply(ON, MIC, run=lambda cmd: True, dump=lambda: "[]", file=self.file)
+        voice.apply(ON, STATE, run=lambda cmd: True, dump=lambda: "[]", file=self.file)
 
     def test_the_scarlett_back_and_no_selector_restarts_the_selector(self):
         self.saved()
@@ -342,9 +429,51 @@ class Heal(unittest.TestCase):
             self.assertFalse(self.heal(dump), dump)
         self.assertEqual(self.ran, [])
 
-    def test_no_selector_config_restarts_nothing(self):
-        self.assertFalse(self.heal(SCARLETT_BACK))
+    def test_unplugged_restarts_nothing_and_keeps_the_selector_config(self):
+        self.saved()
+        before = self.select.read_text()
+        self.assertFalse(self.heal(SCARLETT_BACK, state=None))
+        self.assertEqual((self.ran, self.select.read_text()), ([], before))
+
+    def test_heal_follows_a_reroute_made_with_only_the_background_booth_running(self):
+        self.saved()
+        for tick in range(3):  # capture 2 now carries the computer's playback: stopped, never revived
+            self.assertFalse(self.heal(SCARLETT_BACK, state=rerouted("PCM 1")))
+        self.assertEqual((self.ran, self.select.exists()), ([STOP_SELECT], False))
+
+    def test_heal_finds_the_scarlett_under_a_deduplicated_or_new_profile_name(self):
+        self.saved()
+        for name, position in ((MIC["node"] + ".2", "FR"),  # a fast replug: WirePlumber 0.4 dedups the name
+                               (MIC["node"].replace("analog-surround-40", "pro-input-0"), "AUX1")):  # a profile switch
+            back = json.dumps([node(71, "booth.mic.input"), node(41, name)])
+            self.assertTrue(self.heal(back, state=plugged(dict(MIC, node=name, position=position))), name)
+            sel = module(json.loads(self.select.read_text()), "libpipewire-module-loopback")["capture.props"]
+            self.assertEqual((sel["target.object"], sel["audio.position"]), (name, [position]))
+        self.assertEqual(self.ran, [RESTART_SELECT, RESTART_SELECT])
+
+    def test_heal_follows_a_profile_switch_once_even_with_the_old_selector_still_up(self):
+        self.saved()
+        name = MIC["node"].replace("analog-surround-40", "pro-input-0")
+        up = json.dumps([node(71, "booth.mic.input"), node(41, name), node(80, "booth.mic.select")])
+        self.assertTrue(self.heal(up, state=plugged(dict(MIC, node=name, position="AUX1"))))
+        self.assertEqual(self.ran, [RESTART_SELECT])
+        self.assertFalse(self.heal(json.dumps([node(71, "booth.mic.input"), node(41, name)]),
+                                   state=plugged(dict(MIC, node=name, position="AUX1")), t=1001.0))
+        self.assertEqual(self.ran, [RESTART_SELECT])  # just restarted: not again while it comes up
+
+    def test_heal_never_restarts_the_selector_without_booth_mics_input(self):
+        self.saved()  # booth-voice.service down: restarting the selector would pull it back up (BindsTo)
+        for tick in range(6):
+            self.assertFalse(self.heal(json.dumps([node(40, MIC["node"])]), t=1000.0 + 10 * tick))
         self.assertEqual(self.ran, [])
+
+    def test_a_selector_that_wont_stay_up_is_restarted_at_most_once_a_minute(self):
+        self.saved()
+        ticks = [self.heal(SCARLETT_BACK, t=1000.0 + 10 * tick) for tick in range(7)]  # it never appears
+        self.assertEqual(ticks, [True, False, False, False, False, False, True])
+        replugged = json.dumps([node(71, "booth.mic.input"), node(41, MIC["node"])])  # a new node id: a replug
+        self.assertTrue(self.heal(replugged, t=1061.0))
+        self.assertEqual(self.ran, [RESTART_SELECT] * 3)
 
     def test_selecting_reads_the_selector_node_by_name(self):
         self.assertEqual((voice.selecting(SELECTING), voice.selecting(SCARLETT_BACK), voice.selecting("")),

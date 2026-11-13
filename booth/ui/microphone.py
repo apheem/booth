@@ -55,7 +55,7 @@ class MicrophonePage(Adw.PreferencesPage):
         for widget in (self, self.mini):
             widget.connect("map", self.on_map)
             widget.connect("unmap", self.meter_update)
-        self.mic, v = None, settings.setdefault("voice", {})
+        v = settings.setdefault("voice", {})
         self.voice = Adw.PreferencesGroup(title="Voice Processing", description=voice.WAITING)
         self.master = Adw.SwitchRow(title="Voice Processing", subtitle=MASTER)
         self.rumble = Adw.SwitchRow(title="Rumble Filter", subtitle=RUMBLE)
@@ -93,7 +93,7 @@ class MicrophonePage(Adw.PreferencesPage):
         try:
             state = scarlett.read(self.choice())
             if state:  # unplugged: the running chain keeps its last config
-                voice.apply(self.settings, state["mic"])
+                voice.apply(self.settings, state)  # not routed: the selector stops
                 selecting = voice.selecting()  # down until heal() restarts it once the Scarlett is back
         finally:  # always: show() clears polling, else the page stops following outside changes
             GLib.idle_add(self.show, state, since, selecting)
@@ -105,7 +105,6 @@ class MicrophonePage(Adw.PreferencesPage):
         if problem:
             self.on_meter_failed(problem)
         self.meter_update()
-        self.mic = state["mic"] if state else None
         self.voice.set_description(voice.describe(state, selecting))
         if self.writer.fresh(since):  # else a write may have changed it since: the next poll shows it
             self.quiet = True  # what a poll shows is never written back
@@ -206,10 +205,9 @@ class MicrophonePage(Adw.PreferencesPage):
             row.set_subtitle(subtitle)
         except OSError as e:  # applied anyway: the user must know it won't last
             row.set_subtitle(f"Set, but not saved: {e.strerror or e}")
-        mic = self.mic  # unplugged (None): the chain still takes the switch; the selector keeps its last config
 
         def apply():
-            said = voice.apply(self.settings, mic)
+            said = voice.apply(self.settings, None)  # a switch never moves the selector: the polls do
             if said.startswith("not "):  # not recorded: the next poll's apply tries again
                 GLib.idle_add(row.set_subtitle, f"Set, but {said}")
         threading.Thread(target=apply, daemon=True).start()

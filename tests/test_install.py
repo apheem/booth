@@ -160,6 +160,16 @@ class Install(unittest.TestCase):
         self.assertIn("WantedBy=booth-voice.service", unit)
         self.assertIn("Restart=on-failure", unit)
 
+    def test_booth_mic_is_set_up_by_the_installed_copy_never_the_repo(self):
+        # the repo may be a worktree on another branch, or deleted later: the units run what was installed
+        python = shutil.which("python3", path=self.env["PATH"])
+        log = self.calls.parent / "python.log"
+        (self.calls.parent / "stubs" / "python3").write_text(
+            f'#!/bin/sh\necho "$PYTHONPATH $*" >> "{log}"\nexec "{python}" "$@"\n')
+        (self.calls.parent / "stubs" / "python3").chmod(0o755)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn(f"{self.app.parent} -P -m booth.voice", log.read_text().splitlines())
+
     def test_only_the_first_install_makes_booth_mic_the_default_mic(self):
         self.assertEqual(self.install().returncode, 0)
         self.assertIn(DEFAULT_MIC, self.calls.read_text().splitlines())

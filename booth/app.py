@@ -144,7 +144,7 @@ class Application(Adw.Application):
         threading.Thread(target=lambda: voice.sync(self.settings), daemon=True).start()
 
     def heal_voice(self):
-        threading.Thread(target=voice.heal, daemon=True).start()  # pw-dump, off the main loop
+        threading.Thread(target=lambda: voice.heal(self.settings), daemon=True).start()  # amixer, pw-dump: off the loop
         return True
 
     def low_battery(self, percent):

@@ -29,7 +29,8 @@ It also writes and enables `~/.config/systemd/user/booth-voice.service`, which r
 ~/.config/booth/voice.conf`, the voice chain Booth writes from your settings) with your PipeWire, whether Booth runs or
 not, and `booth-mic-select.service` (`pipewire -c ~/.config/booth/voice-select.conf`), which feeds it the Scarlett's
 mic channel; only that one restarts when the mic channel changes. The first install makes Booth Mic the default mic; a
-re-install leaves your choice alone. With no Scarlett, Booth Mic is silent until Booth sees it again.
+re-install leaves your choice alone. With no Scarlett, Booth Mic is silent until Booth sees it again; with the mic routed
+to no capture channel, Booth stops `booth-mic-select.service` and Booth Mic is silent until it is routed again.
 To check an install matches the repo:
 
     diff -rq -x __pycache__ booth ~/.local/share/booth/booth

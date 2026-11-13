@@ -154,7 +154,7 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.scarlett, "send", send),
                 mock.patch.object(microphone.store, "save", self.saved.append),
                 mock.patch.object(microphone.voice, "apply",
-                                  lambda s, mic: self.applied.append((dict(s["voice"]), mic)) or self.said),
+                                  lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst)):
@@ -342,14 +342,13 @@ class VoiceGroup(PageCase):
         microphone.MicrophonePage.__init__(page, {"microphone": {}, "voice": {"enabled": False, "rumble": False}})
         self.assertEqual((page.master.active, page.rumble.active, page.rumble.sensitive), (False, False, False))
 
-    def test_a_switch_is_saved_and_applied_to_the_mic_the_last_poll_found(self):
-        s = state()
-        self.show(s)
+    def test_a_switch_is_saved_and_applied_never_moving_the_selector(self):
+        self.show(state())
         self.click(self.page.rumble, False)
         self.assertEqual((self.settings["voice"], self.saved), ({"rumble": False}, [self.settings]))
-        self.assertEqual(self.applied, [({"rumble": False}, s["mic"])])
+        self.assertEqual(self.applied, [({"rumble": False}, None)])  # the selector follows the polls, not a switch
         self.click(self.page.master, False)
-        self.assertEqual(self.applied[-1], ({"rumble": False, "enabled": False}, s["mic"]))
+        self.assertEqual(self.applied[-1], ({"rumble": False, "enabled": False}, None))
         self.assertFalse(self.page.rumble.sensitive)
         self.assertEqual(self.ran, [])  # never the Scarlett
 
@@ -389,8 +388,15 @@ class VoiceGroup(PageCase):
         s = state()
         idle = self.real_poll(lambda choice: s)
         self.page.poll()
-        self.assertEqual(self.applied, [({}, s["mic"])])
+        self.assertEqual(self.applied, [({}, s)])
         self.assertEqual(len(idle), 1)
+
+    def test_a_not_routed_poll_reaches_apply_with_the_scarlett_there(self):
+        s = state(**{"PCM 02 Capture Enum": 5})  # capture 2 rerouted: Booth Mic's selector must stop
+        self.assertIsNone(s["mic"])
+        self.real_poll(lambda choice: s)
+        self.page.poll()
+        self.assertEqual(self.applied, [({}, s)])
 
     def test_an_unplugged_poll_applies_nothing(self):
         self.real_poll(lambda choice: None)

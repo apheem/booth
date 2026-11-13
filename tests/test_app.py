@@ -309,13 +309,13 @@ class BackgroundLaunch(unittest.TestCase):
         sync.assert_called_once_with(stub.settings)
 
     def test_heal_voice_checks_booth_mics_selector_off_the_main_loop_every_time(self):
-        threads, stub = [], mock.Mock()
+        threads, stub = [], mock.Mock(settings={"voice": {}})
         with mock.patch.object(app.threading, "Thread", lambda target, daemon: threads.append(target) or mock.Mock()), \
                 mock.patch.object(app.voice, "heal") as heal:
             self.assertIs(app.Application.heal_voice(stub), True)  # True: GLib keeps the timer
             heal.assert_not_called()
             threads[0]()
-        heal.assert_called_once_with()
+        heal.assert_called_once_with(stub.settings)  # the chosen input: heal reads the Scarlett's routing itself
 
     def test_watch_in_the_background_instance_holds_for_good_and_restores_now(self):
         stub = self.watch(background=True)
