@@ -144,7 +144,7 @@ class PageCase(unittest.TestCase):
     def setUp(self):
         self.ran, self.saved, self.dialogs, self.applied = [], [], [], []
         self.said, self.selecting = "live", True  # what voice.apply returns; whether Booth Mic's selector runs
-        self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.verified: every plugin verifies
+        self.found = dict.fromkeys(plugins.MANIFEST, "/verified")  # voice.loaded: every plugin verified and running
         self.settings = {"microphone": {}}
 
         real_send = scarlett.send
@@ -173,7 +173,9 @@ class PageCase(unittest.TestCase):
                 mock.patch.object(microphone.voice, "apply",
                                   lambda s, state: self.applied.append((dict(s["voice"]), state)) or self.said),
                 mock.patch.object(microphone.voice, "selecting", lambda: self.selecting),
-                mock.patch.object(microphone.voice, "verified", lambda: self.found),
+                # every plugin verifies; self.found: those also in the running chain (voice.loaded), the page's rows
+                mock.patch.object(microphone.voice, "verified", lambda: dict.fromkeys(plugins.MANIFEST, "/verified")),
+                mock.patch.object(microphone.voice, "loaded", lambda: self.found, create=True),
                 mock.patch.object(microphone, "LevelMeter", _Meter),
                 mock.patch.object(microphone.meter, "Meter", _Gst)):
             patch.start()
@@ -525,6 +527,7 @@ class StageRows(PageCase):
         self.assertNotEqual(row.switch.subtitle, microphone.MISSING)
 
     def test_each_poll_checks_the_plugins(self):
+        # RNNoise verifies, but Booth Mic started without it (or it changed since and is bypassed): missing
         self.found = {k: v for k, v in self.found.items() if k != "librnnoise_ladspa.so"}
         idle = ScarlettGroup.real_poll(self, lambda choice: state())
         self.page.poll()

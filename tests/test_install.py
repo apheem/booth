@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from booth import voice
+
 REPO = Path(__file__).resolve().parent.parent
 APP_ID = "io.github.apheem.Booth"
 
@@ -39,7 +41,7 @@ DEFAULT_MIC = 'pw-metadata -n default 0 default.configured.audio.source { "name"
 VOICE_UNITS = "booth-voice.service booth-mic-select.service"
 VOICE_AGAIN = ["systemctl --user daemon-reload", f"systemctl --user enable {VOICE_UNITS}",
                f"systemctl --user start {VOICE_UNITS}"]  # a re-install: the same config, no new default mic
-VOICE_CALLS = VOICE_AGAIN[:2] + [f"systemctl --user restart {VOICE_UNITS}", VOICE_AGAIN[2], DEFAULT_MIC]
+VOICE_CALLS = VOICE_AGAIN[:2] + [f"systemctl --user try-restart {VOICE_UNITS}", VOICE_AGAIN[2], DEFAULT_MIC]
 V, A = len(VOICE_CALLS), len(VOICE_AGAIN)
 STALE = "Booth is still running the old version"
 CLOSED = "Booth was closed to update it — open it again from the app grid."
@@ -161,7 +163,8 @@ class Install(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         argv = self.pre_start()
         self.assertEqual(argv, ["/usr/bin/env", f"PYTHONPATH={self.app.parent}", "python3", "-P", "-m", "booth.voice",
-                                "--write"])  # the installed copy, never the repo
+                                "--write", str(self.home / ".config/booth/voice.conf"),
+                                str(self.app.parent / "plugins")])  # the installed copy, never the repo
         # voice.conf written while sc4m verified; the file changed since: the next start must never load it
         plugin = self.app.parent / "plugins/sc4m_1916.so"
         plugin.parent.mkdir(exist_ok=True)
@@ -191,6 +194,50 @@ class Install(unittest.TestCase):
         r = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 1)
         self.assertIn("not saved", r.stderr)
+
+    def test_the_pre_start_rewrites_the_config_pipewire_loads_whatever_the_units_environment(self):
+        self.assertEqual(self.install().returncode, 0)
+        conf = self.home / ".config/booth/voice.conf"
+        conf.write_text("{}")
+        other = self.home / "other"  # the user manager's XDG_* may differ from the install's
+        env = dict(self.env, XDG_CONFIG_HOME=str(other / "config"), XDG_DATA_HOME=str(other / "data"))
+        r = subprocess.run(self.pre_start(), env=env, cwd=self.home, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("libpipewire-module-filter-chain", conf.read_text())  # the file ExecStart's pipewire loads
+        self.assertFalse(other.exists())
+
+    def chain_with_a_plugin(self):
+        """voice.conf as a running Booth Mic holds it: with sc4m, which doesn't verify now (no install test fetches)."""
+        conf = self.home / ".config/booth/voice.conf"
+        conf.write_text(voice.build({"voice": {}}, {"sc4m_1916.so": str(self.app.parent / "plugins/sc4m_1916.so")}))
+        return conf
+
+    def test_a_reinstall_restarts_booth_mic_for_its_new_plugins_once_the_old_booth_is_gone(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.chain_with_a_plugin()
+        self.env["OWNED_POLLS"] = "3"
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls.read_text().splitlines()
+        reload = f"systemctl --user try-restart {VOICE_UNITS}"  # only if it runs: its pre-start writes the new chain
+        self.assertEqual(calls.count(reload), 1, calls)
+        self.assertGreater(calls.index(reload), len(calls) - 1 - calls[::-1].index(OWNER))  # after the old Booth left
+        self.assertLess(calls.index(reload), calls.index("systemctl --user restart booth.service"))
+
+    def test_a_booth_that_wont_quit_never_has_booth_mic_restarted_under_it(self):
+        """The old Booth's poll would write its chain back and restart Booth Mic, whose pre-start writes the new one:
+        Booth Mic restarting every few seconds until Booth is closed. Left running: its next start loads the new one."""
+        self.assertEqual(self.install().returncode, 0)
+        conf = self.chain_with_a_plugin()
+        self.env["OWNED_POLLS"] = "99"
+        self.calls.write_text("")
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("restart booth-voice", self.calls.read_text())
+        self.assertEqual([n["name"] for n in json.loads(conf.read_text())["context.modules"][-1]["args"]["filter.graph"]
+                          ["nodes"] if n["type"] == "ladspa"], ["leveling"])  # the running chain's shape, kept
+        self.assertIn(STALE + " — close Booth", r.stderr)
 
     def test_installs_booth_mic_select_which_runs_the_selector_bound_to_booth_voice(self):
         r = self.install()
@@ -439,11 +486,13 @@ class Install(unittest.TestCase):
                 self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
                                  str(self.home / ".config/booth" / conf))
         line = next(ln for ln in voice_unit.read_text().splitlines() if ln.startswith("ExecStartPre="))
-        m = re.fullmatch(r'ExecStartPre=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
-                         r'booth\.voice --write', line)
+        word = r'"((?:[^"\\%$]|\\["\\]|%%|\$\$)*)"'
+        m = re.fullmatch(rf'ExecStartPre=/usr/bin/env "PYTHONPATH=((?:[^"\\%$]|\\["\\]|%%|\$\$)*)" python3 -P -m '
+                         rf'booth\.voice --write {word} {word}', line)
         self.assertIsNotNone(m, line)
-        self.assertEqual(re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], m[1]),
-                         str(self.home / ".local/share/booth"))
+        self.assertEqual([re.sub(r'\\(.)|%(%)|\$(\$)', lambda m: m[1] or m[2] or m[3], w) for w in m.groups()],
+                         [str(self.home / ".local/share/booth"), str(self.home / ".config/booth/voice.conf"),
+                          str(self.home / ".local/share/booth/plugins")])
         self.unit = unit
         pre = subprocess.run(self.pre_start(), env=self.env, cwd=self.home, capture_output=True, text=True, timeout=60)
         self.assertEqual(pre.returncode, 0, pre.stderr)  # the installed copy found, whatever the home's name

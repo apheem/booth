@@ -80,11 +80,13 @@ mv "$units/booth.service.new" "$units/booth.service"
 # yet: ExecCondition skips it cleanly. Quoting as for ExecStart above. ExecStartPre rewrites voice.conf with the
 # installed booth.voice from the saved settings and the plugins verified right then (booth.plugins), so a plugin file
 # changed since Booth last wrote the config is left out, never loaded; if it can't write it, the unit doesn't start.
+# It is given the paths baked here, so it rewrites the very file ExecStart loads, whatever the user manager's XDG_*.
 voice_first=  # only the first install makes Booth Mic the default mic: a re-install never overrides the user's choice
 [ -e "$units/booth-voice.service" ] || voice_first=1
 voice_arg=$(printf '%s' "$config/booth/voice.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 select_arg=$(printf '%s' "$config/booth/voice-select.conf" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 dest_arg=$(printf '%s' "$dest" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+plugins_arg=$(printf '%s' "$dest/plugins" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/\$/$$/g')
 cat > "$units/booth-voice.service.new" <<EOF
 [Unit]
 Description=Booth Mic: the voice chain (a PipeWire filter-chain)
@@ -93,7 +95,7 @@ BindsTo=pipewire.service
 
 [Service]
 ExecCondition=/usr/bin/test -f "$voice_arg"
-ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write
+ExecStartPre=/usr/bin/env "PYTHONPATH=$dest_arg" python3 -P -m booth.voice --write "$voice_arg" "$plugins_arg"
 ExecStart=/usr/bin/pipewire -c "$voice_arg"
 Restart=on-failure
 RestartSec=5
@@ -148,6 +150,11 @@ while owned; do
   sleep 0.5
   n=$((n + 1))
 done
+# Booth Mic restarted (only if it runs) when its plugins aren't the ones verified now, so a new stage loads at once. Not
+# with an old Booth still running: its poll would write its own chain back and restart Booth Mic, whose pre-start writes
+# the new one, every few seconds until Booth is closed (the hint below). Left as is, its next start loads them.
+[ -n "$stale" ] || PYTHONPATH=$dest python3 -P -m booth.voice --reload ||
+  echo "install.sh: couldn't restart Booth Mic for its new plugins; they load at its next start" >&2
 state=new
 [ -n "$first" ] || state=$(systemctl --user is-enabled booth.service 2>/dev/null) || true
 # restart, not start: a re-install must run the new copy. Only an explicit "disabled" is the switch turned off; no

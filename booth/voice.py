@@ -14,23 +14,31 @@ channel carries now. heal() reads the Scarlett's routing and node every 10 s, so
 (a fast replug, a profile switch) and a login race with only the background Booth running. #20's fallback changes only
 the selector's target and positions.
 Every stage and the master switch is a dry/wet `mixer`, set live with `pw-cli set-param` on booth.mic.input: a switch
-or a knob changes only control values, so it never restarts anything; a new stage restarts both.
-The plugin stages (STAGES) are in the graph exactly when their plugin verifies (booth.plugins) while the config is
-built, every time: a plugin missing or changed is left out (the mic passes it dry) and the page says so. Only a change
-in what verifies (an install, a changed file) changes the shape. booth-voice.service's ExecStartPre runs `--write`, so
-a plugin changed after Booth last wrote voice.conf is never loaded at the next start either.
+or a knob changes only control values, so it never restarts anything; a new shape restarts both.
+The plugin stages (STAGES) are in the graph exactly when their plugin verified (booth.plugins) as the chain was built
+for its start: booth-voice.service's ExecStartPre runs `--write`, so a plugin changed since is never loaded. A change in
+what verifies alone (a changed file, a read that fails for a moment, an install's new plugins) never restarts the
+running chain, which mapped verified code: a stage whose plugin stopped verifying goes dry live, one that verifies only
+since waits for the next start, and the page says both are missing (loaded()). A new shape (new code) restarts both
+services, never starting one the user stopped.
     python3 -m booth.voice            write the configs from the saved settings and the Scarlett now, start the services
-    python3 -m booth.voice --write    only voice.conf, from the saved settings and the plugins verified now (ExecStartPre)"""
+    python3 -m booth.voice --write [voice.conf [plugins folder]]
+                                      only voice.conf, from the saved settings and the plugins verified now (ExecStartPre)
+    python3 -m booth.voice --reload   restart Booth Mic, if it runs, when its plugins aren't the ones verified now
+                                      (install.sh, once no old Booth runs)"""
 import copy
 import json
 import sys
 import threading
 import time
+from pathlib import Path
 
 from booth import devices, plugins, scarlett, service, store
 
 UNIT, SELECT_UNIT = "booth-voice.service", "booth-mic-select.service"
-RESTART = ["systemctl", "--user", "restart", UNIT, SELECT_UNIT]  # a new chain: the selector re-links to its new input
+# a new chain: the selector re-links to its new input; try-: a unit the user stopped stays stopped
+RESTART = ["systemctl", "--user", "try-restart", UNIT, SELECT_UNIT]
+ACTIVE = ["systemctl", "--user", "is-active", UNIT]  # the selector's restart starts it too (BindsTo): only if it runs
 START = ["systemctl", "--user", "start", UNIT, SELECT_UNIT]
 RESTART_SELECT = ["systemctl", "--user", "restart", SELECT_UNIT]
 STOP_SELECT = ["systemctl", "--user", "stop", SELECT_UNIT]
@@ -119,6 +127,20 @@ def verified(where=None, manifest=plugins.MANIFEST):
         except (plugins.Refused, OSError):
             pass
     return found
+
+
+def _plugins(cfg):
+    """{plugin file: path} of the plugins a chain config (any JSON on disk) loads; None when it isn't a config."""
+    try:
+        return {n["plugin"].rsplit("/", 1)[-1]: n["plugin"] for n in _graph_nodes(cfg) if n.get("type") == "ladspa"}
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
+def loaded(file=None):
+    """verified() narrowed to the plugins in voice.conf, the running chain: the stages that process the voice now."""
+    kept = _plugins(_load(file or path())) or {}
+    return {k: v for k, v in verified().items() if kept.get(k) == v}
 
 
 def missing(found):
@@ -278,8 +300,8 @@ def _restarted(key, clock):
 
 def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.monotonic):
     """Bring both configs up to date with the settings and `state`, the Scarlett now (scarlett.read). New control values
-    are set live on the chain, then recorded; a new chain shape (a new stage) restarts both services; a new mic channel
-    or node restarts only the selector. Unplugged (None) keeps the last selector: it unloaded itself and heal() brings
+    are set live on the chain, then recorded; a new chain shape (new code; never a change in what verifies alone, see
+    the module) try-restarts both services; a new mic channel or node restarts only the selector, while Booth Mic runs. Unplugged (None) keeps the last selector: it unloaded itself and heal() brings
     it back. The Scarlett there with no channel to take (not routed, or none at the mic's position) stops the selector
     and removes its config: never a guessed channel, never one the mic has left; no Scarlett node (pw-dump failed) keeps
     the selector only while the ALSA routing has the mic on the channel it was built for. A new selector is always
@@ -289,9 +311,16 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
     file = file or path()
     select_file = file.with_name(SELECT_CONF)
     with _LOCK:  # built inside: the plugins verified just before the write, the latest settings applied last
-        chain, sel_text = json.loads(build(settings)), build_selector(state["mic"]) if state else None
+        found = verified()
+        chain, sel_text = json.loads(build(settings, found)), build_selector(state["mic"]) if state else None
         sel = sel_text and json.loads(sel_text)
         old, old_text, old_sel_text, said = _load(file), _text(file), _text(select_file), None
+        kept = _plugins(old)
+        if kept is not None and kept != found:  # what verifies changed: the running chain's plugins, dry if not now
+            v = dict(settings.get("voice") or {}, **dict.fromkeys(missing(found), False))
+            same = json.loads(build(dict(settings, voice=v), kept))
+            if shape(same) == shape(old):  # nothing else changed: no restart; its next start loads what verifies
+                chain = same
         restart = shape(old) != shape(chain)
         if old != chain and not restart and (cmd := set_params_cmd(dump(), chain)) and not run(cmd):
             said = "not applied: Booth Mic didn't take the change"
@@ -311,12 +340,14 @@ def apply(settings, state, run=service.run, dump=_dump, file=None, clock=time.mo
         said = said or sel_said or None
         if not (restart or moved):
             return said or ("live" if old != chain else "unchanged")
-        if not run(RESTART if restart else RESTART_SELECT):  # RESTART_SELECT: Booth Mic, and a call's link to it, stay
+        # RESTART_SELECT: Booth Mic, and a call's link to it, stay; never with Booth Mic stopped, which it would start
+        off = not restart and not run(ACTIVE)
+        if off or not run(RESTART if restart else RESTART_SELECT):
             if restart:
                 _put_back(file, old_text)
             if moved:
                 _put_back(select_file, old_sel_text)
-            return "not restarted: Booth Mic's service didn't start"
+            return "not restarted: Booth Mic is stopped" if off else "not restarted: Booth Mic's service didn't start"
         if sel is not None:  # RESTART restarts the selector too; shortcut: a pw-dump blip here keys it without the node
             _restarted(_key(sel_text, dump(), state["mic"]["node"]), clock)
         return ("restarted" if restart else "selector restarted") + (f", but {said}" if said else "")
@@ -377,19 +408,29 @@ def sync(settings, read=scarlett.read, run=service.run, dump=_dump, file=None):
     return describe(state)
 
 
-def write(file=None):
-    """booth-voice.service's ExecStartPre: voice.conf from the saved settings and the plugins verified now, so a plugin
-    changed since the last write is never loaded. No systemctl, no Scarlett: the unit is starting. None, or what went
-    wrong: then the unit doesn't start on the old config."""
-    return _save(json.loads(build(store.load())), file or path())
+def write(file=None, where=None):
+    """booth-voice.service's ExecStartPre: voice.conf (`file`: the one its pipewire loads) from the saved settings and
+    the plugins verified now in `where`, so a plugin changed since the last write is never loaded. No systemctl, no
+    Scarlett: the unit is starting. None, or what went wrong: then the unit doesn't start on the old config."""
+    return _save(json.loads(build(store.load(), verified(where))), file or path())
+
+
+def reload(run=service.run, file=None):
+    """install.sh, once no old Booth runs (its poll would fight the new chain): Booth Mic restarted, only if it runs,
+    when its chain's plugins aren't the ones verified now, so an install's plugins load now. False: that failed."""
+    with _LOCK:
+        return _plugins(_load(file or path())) == verified() or run(RESTART)
 
 
 def main():
-    if sys.argv[1:] == ["--write"]:
-        said = write()
+    args = sys.argv[1:]
+    if args[:1] == ["--write"]:
+        said = write(*(Path(a) for a in args[1:3]))
         if said:
             print(f"booth.voice: {said}", file=sys.stderr)
         return 1 if said else 0
+    if args == ["--reload"]:
+        return 0 if reload() else 1
     print(sync(store.load()))
     return 0
 
