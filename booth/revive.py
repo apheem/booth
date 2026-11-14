@@ -4,13 +4,18 @@ The fault: the Scarlett stops playing while the computer still says it plays. Pi
 advances, the kernel logs nothing and the inputs keep working; inside the device nothing arrives (its own Level Meter
 reads 0 on every playback point). It lasts through suspends, until the device's sample rate is set anew: a replug, or
 any change of rate.
-What starts it: strong content below about 20 Hz in what is played. From a working device at 48 kHz, 15 Hz at -34 dBFS
-at the device (-20 dBFS at 20 % volume) kills it within a second and 5 Hz at that level in about six; 25 Hz at that
-level, 15 Hz 10 dB quieter and anything quiet or high (1 kHz, 19 kHz) play on. Nothing else does: reading the mixer
-hard, suspend and resume, capture starting and stopping, an underrun, the camera streaming, Direct Monitor, Booth
-Mic's chain and the test suite were each tried. A 30 Hz 4th-order high-pass in front of the sink prevents it (tried
-with a filter-chain sink: 15 Hz at -6 dBFS through it for 20 s and the device played on); Booth doesn't run one yet,
-so this module is the repair, not the prevention.
+What starts it: a steady low tone at certain exact levels (measured at 48 kHz, the device's own meter the judge).
+60 Hz at -36.0 dBFS at the device stops it 0.6 to 2.2 s in, every time (17 runs); the same tone at -36.25 or -35.75
+never does. In quarter-dB steps from -38 to -30 dBFS, 7 of 33 levels do (-36, -33.75, -33.25, -32 to -31.5, -30.25).
+Tones from 15 to 80 Hz have such levels; 50 Hz, 100 Hz, 1 kHz and a constant value played on at -36, and nothing
+below -36 dBFS ever stopped it (some 40 runs, 15 to 100 Hz). In the device's loopback the tone repeats about 75 times,
+then the stream is exact zero. Nothing else does it: reading the mixer hard, suspend and resume, capture starting and
+stopping, an underrun, the camera streaming, Direct Monitor, Booth Mic's chain and the test suite were each tried.
+Nothing in front of the sink prevents it: noise added to the tone (up to +-4096 of its 24-bit steps) and a 19 kHz tone
+mixed in only move which levels do it (11 of 33 with the 19 kHz tone), and a high-pass that keeps the bass keeps 40 to
+80 Hz. A 30 Hz high-pass was built and measured for this and dropped: 20 and 25 Hz at full scale went through it and
+stopped the device. So this module is the repair; a prevention would be the device's firmware (2188 here).
+An earlier reading, "content below 20 Hz", came from test tones that sat on such levels by chance.
 
 Heard (Watch): one stream listens to the Scarlett sink's monitor for as long as the sink lasts. It is passive, so the
 Scarlett still sleeps when nothing plays, and Internal, so no app lists it and no recording indicator shows; nothing
@@ -103,8 +108,8 @@ def listen(sink):
 
 def other_rate(hw_params):
     """The playback stream's /proc hw_params → a rate the device isn't at, and never the graph's own 48000, which
-    PipeWire won't force while streams run: 44100, or 88200 from there. The device is touchier at 88200 (25 Hz at
-    -34 dBFS stopped it there within a second, twice): that stop is heard like any other and goes back to 44100."""
+    PipeWire won't force while streams run: 44100, or 88200 from there. It stops at 88200 too (25 Hz at -34 dBFS,
+    within a second, twice): that stop is heard like any other and goes back to 44100."""
     return 88200 if "rate: 44100" in hw_params else 44100
 
 
