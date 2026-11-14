@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from booth import camera, devices, headset, monitor, mute, routing, service, stereo, store, voice  # noqa: E402
+from booth import camera, devices, headset, monitor, mute, revive, routing, service, stereo, store, voice  # noqa: E402
 from booth.ui.window import SHORTCUTS, Window  # noqa: E402
 
 APP_ID = service.APP_ID
@@ -84,6 +84,7 @@ class Application(Adw.Application):
         self.window, self.starting, self.closed_page, self.settings = None, False, None, None
         self.background, self.held, self.monitor, self.replug = False, False, None, None
         self.snd_monitor, self.dongle, self.healing = None, None, False
+        self.output_watch = revive.Watch(self.output_said)  # the Scarlett's stuck output, heard and restarted
         self.mic, self.mic_source, self.mic_poke = {}, voice.SCARLETT, None  # #20: the mic rule's state, what it said
         self.headset_monitor = headset.HeadsetMonitor(self.low_battery, off_main)  # watch() subscribes the routing
         self.add_main_option("background", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
@@ -161,6 +162,10 @@ class Application(Adw.Application):
         GLib.timeout_add_seconds(BATTERY_S, self.routing.retry)  # a rule not settled yet (the PRO X sink not back) again
         # Booth Mic's selector back within 10 s of its Scarlett: a replug, a login race or a profile switch (no by-id event)
         GLib.timeout_add_seconds(BATTERY_S, self.heal_voice)
+        # the Scarlett playing into nothing (booth.revive): its listener started now, window or not, and again within
+        # a tick of the Scarlett coming back
+        self.watch_output()
+        GLib.timeout_add_seconds(BATTERY_S, self.watch_output)
         if self.background:
             self.hold()
             self.held = True
@@ -177,6 +182,7 @@ class Application(Adw.Application):
     def do_shutdown(self):
         voice.release()  # every primary instance: no backup mic feeds Booth Mic with no Booth to say it
         mute.stop()  # #21: its pw-dump --monitor ends with Booth
+        self.output_watch.stop()  # and the listener on the Scarlett's output
         if self.window is not None:  # a quit closes no window by close-request: its pending voice change saved here
             self.window.microphone.save_voice()
             self.window.microphone.take.stop()  # and no test recording is left playing, or its file kept
@@ -320,6 +326,14 @@ class Application(Adw.Application):
                     stereo.sync(self.settings, notify=self.stereo_switched)
                 finally:
                     self.healing = False
+
+    def watch_output(self):
+        threading.Thread(target=self.output_watch.ensure, daemon=True).start()  # its pw-dump, off the main loop
+        return True
+
+    def output_said(self, text):
+        """The watch restarted the Scarlett's output, or couldn't: its notice, from its thread, on the main loop."""
+        GLib.idle_add(lambda: self.send_notification("scarlett-output", Gio.Notification.new(text)))
 
     def stereo_switched(self, text):
         """Booth Stereo's notice (computer sound moved to a new output), from sync's worker: on the main loop."""
