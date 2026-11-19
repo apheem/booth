@@ -176,7 +176,21 @@ class Hearing(unittest.TestCase):
         self.hear(*[LOUD] * 8)
         self.assertEqual(self.restarts, [SCARLETT] * 2)
 
-    def test_a_restart_that_did_not_help_says_to_replug_once_and_is_not_repeated_until_the_device_is_heard(self):
+    def test_a_restart_that_did_not_help_is_tried_again_every_retry_s_said_once_and_the_return_said(self):
+        said = self.stuck_then(STUCK)
+        self.now += revive.RETRY_S - 1
+        said += self.hear(*[LOUD] * 8)
+        self.assertEqual(self.restarts, [SCARLETT])  # not yet: never one pair right behind another
+        self.now += 1
+        said += self.hear(*[LOUD] * 30)  # tried again, and that one didn't help either: not said twice
+        self.assertEqual(([s for s in said if s], self.restarts), ([revive.GAVE_UP], [SCARLETT] * 2))
+        self.now += revive.RETRY_S
+        self.hear(*[LOUD] * 4)
+        self.meter = PLAYING  # what set it off has ended: the next try holds, as Restart Output pressed later does
+        said = self.hear(*[LOUD] * 14)
+        self.assertEqual(([s for s in said if s], self.restarts), ([revive.REVIVED], [SCARLETT] * 3))
+
+    def test_a_restart_that_did_not_help_says_so_once_and_waits_before_trying_again(self):
         said = self.stuck_then(STUCK) + self.hear(*[LOUD] * 40)
         self.assertEqual(([s for s in said if s], self.restarts), ([revive.GAVE_UP], [SCARLETT]))
         # the volume read once per verdict (the stop, the restart's check), never over and over once given up

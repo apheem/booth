@@ -277,13 +277,13 @@ class SoundOutput(unittest.TestCase):
         page = self.page(self.BACKUP)
         with self.writing():
             page.backup.set_value(40)
-        self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "176", "0.40"]])
+        self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "176", "0.40"], ["wpctl", "set-mute", "176", "0"]])
 
     def test_the_pro_x_slider_still_sets_the_pro_x(self):
         page = self.page(self.BACKUP)
         with self.writing():
             page.scale.set_value(40)
-        self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "33", "0.40"]])
+        self.assertEqual(self.sent, [["wpctl", "set-volume", "-l", "1.0", "33", "0.40"], ["wpctl", "set-mute", "33", "0"]])
 
     def test_restart_output_is_shown_with_the_scarlett_and_sends_the_pair_to_the_nodes_found_now(self):
         page, restarted = self.page(self.BACKUP), []

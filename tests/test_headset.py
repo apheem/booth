@@ -129,6 +129,12 @@ class Volume(unittest.TestCase):
         self.assertIsNone(headset.volume_cmd(back, 40, SCARLETT))
         self.assertIsNone(headset.volume_cmd(dump(lambda o: o.remove(node(o, SCARLETT))), 40, SCARLETT))
 
+    def test_a_slider_moved_unmutes_the_same_sink_it_sets(self):  # wpctl set-volume leaves a mute on: silence
+        self.assertEqual(headset.unmute_cmd(DUMP), ["wpctl", "set-mute", "33", "0"])
+        self.assertEqual(headset.unmute_cmd(DUMP, SCARLETT), ["wpctl", "set-mute", "176", "0"])
+        self.assertIsNone(headset.unmute_cmd(dump(lambda o: default_sink(o, PRO_X)), SCARLETT))
+        self.assertIsNone(headset.unmute_cmd(dump(lambda o: o.remove(node(o, PRO_X)))))
+
 
 class UseForAllSound(unittest.TestCase):
     """On remembers the default sink it replaces, by node name; off puts that one back, or clears WirePlumber's
@@ -184,7 +190,7 @@ class State(unittest.TestCase):
 
     def test_volume_of_the_sink_resolved_now_and_the_output_in_use_instead(self):
         state, asked = self.state()
-        self.assertEqual(state, {"volume": 0.63, "default": False, "output": self.OUTPUT})
+        self.assertEqual(state, {"volume": 0.63, "muted": False, "default": False, "output": self.OUTPUT})
         self.assertEqual(asked, [["pw-dump"], ["wpctl", "get-volume", "33"], ["wpctl", "get-volume", "176"],
                                  ["amixer", "-c", "Gen", "contents"]])
 
@@ -193,6 +199,9 @@ class State(unittest.TestCase):
         self.assertIs(state["default"], True)
         self.assertIsNone(state["output"])
         self.assertEqual(asked, [["pw-dump"], ["wpctl", "get-volume", "33"]])
+
+    def test_a_muted_pro_x_is_said(self):
+        self.assertIs(self.state(volumes={"33": "Volume: 0.00 [MUTED]\n", "176": "Volume: 0.76\n"})[0]["muted"], True)
 
     def test_direct_monitor_as_the_scarlett_has_it(self):
         self.assertIn(DIRECT_OFF, SCARLETT_CONTENTS)
@@ -244,6 +253,7 @@ class State(unittest.TestCase):
         self.assertEqual(headset.status({"volume": 0.63, "default": False}), "Volume 63 %")
         self.assertEqual(headset.status({"volume": 1.5, "default": False}), "Volume 150 %")  # boosted elsewhere: the truth
         self.assertEqual(headset.status(None), "Not connected")
+        self.assertEqual(headset.status({"volume": 0.63, "muted": True, "default": True}), "Muted")  # why it is silent
 
     def test_sidebar_subtitle_with_the_battery(self):
         on, off = monitor((3990, False)), monitor(hidpp.OFF)

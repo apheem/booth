@@ -19,6 +19,7 @@ POLL_S = 2
 DIRECT = "Hear yourself in the Scarlett's jack"
 RESTART = "Restarts the Scarlett's output without unplugging it; Booth also does it when it sees it stopped"
 SWITCH_SUBTITLE = "Play all sound through the headset"
+MUTED = "Muted — move the slider to hear it again"
 SUBTITLES = {"sidetone": "Hear your own voice in the headset", "auto_off": "Minutes idle before it turns off; 0 = never"}
 NOT_SET = "Not set in Booth"  # the headset can't report its own value: the widget's position means nothing yet
 NAMES = {"sidetone": "sidetone", "auto_off": "auto power-off"}
@@ -166,6 +167,7 @@ class HeadphonesPage(Adw.PreferencesPage):
             self.quiet = True
             for row in self.rows:
                 row.set_sensitive(state is not None)
+            self.rows[0].set_subtitle(MUTED if state and state.get("muted") else "")
             if state:
                 self.scale.set_value(headset.percent(state["volume"]))
                 self.switch.set_active(state["default"])
@@ -186,6 +188,7 @@ class HeadphonesPage(Adw.PreferencesPage):
         if not self.quiet and output:
             p, name = round(scale.get_value()), output["name"]  # the output shown: never another one's volume
             self.writer.want("backup", lambda dump: headset.volume_cmd(dump, p, name))
+            self.writer.want("backup_unmute", lambda dump: headset.unmute_cmd(dump, name))
 
     def on_restart(self, _button):
         """The Scarlett's stuck output restarted by hand (booth.revive's pair of silent streams), off the main loop."""
@@ -206,6 +209,7 @@ class HeadphonesPage(Adw.PreferencesPage):
         if not self.quiet:
             p = round(scale.get_value())
             self.writer.want("volume", lambda dump: headset.volume_cmd(dump, p))
+            self.writer.want("unmute", headset.unmute_cmd)
 
     def on_default(self, row, _param):
         if not self.quiet:
