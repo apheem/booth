@@ -68,18 +68,29 @@ def percent(volume):
     return round(min(max(volume, 0.0), 1.0) * 100)
 
 
-def volume_cmd(dump, percent, name=None):
-    """`pw-dump` JSON and the slider's 0..100 → the wpctl command that sets the PRO X sink, or None when it is gone.
-    Clamped to 1.0, and with wpctl's own limit as well: Booth never sets more than 100 %. `name`: the backup slider's
-    sink (state()'s output) instead, set only while it is still the default: never an output sound has left."""
+def _sink_id(dump, name):
+    """The PRO X sink's id, or `name`'s while it is still the default (never an output sound has left); None when gone."""
     sinks, default = devices.parse_sinks(dump)
     if name is None:
         name = devices.find_sink(sinks)
     elif name != default:
         return None
-    if name not in sinks:
-        return None
-    return ["wpctl", "set-volume", "-l", "1.0", str(sinks[name][0]), f"{min(max(percent, 0), 100) / 100:.2f}"]
+    return str(sinks[name][0]) if name in sinks else None
+
+
+def volume_cmd(dump, percent, name=None):
+    """`pw-dump` JSON and the slider's 0..100 → the wpctl command that sets the PRO X sink, or None when it is gone.
+    Clamped to 1.0, and with wpctl's own limit as well: Booth never sets more than 100 %. `name`: the backup slider's
+    sink (state()'s output) instead, set only while it is still the default: never an output sound has left."""
+    sink = _sink_id(dump, name)
+    return ["wpctl", "set-volume", "-l", "1.0", sink, f"{min(max(percent, 0), 100) / 100:.2f}"] if sink else None
+
+
+def unmute_cmd(dump, name=None):
+    """The same sink as volume_cmd's → the wpctl command that unmutes it, or None: a slider moved is a wish to hear it
+    (wpctl set-volume leaves a mute on, so a muted headset stayed silent whatever Booth's slider said)."""
+    sink = _sink_id(dump, name)
+    return ["wpctl", "set-mute", sink, "0"] if sink else None
 
 
 def default_cmd(dump, on, previous=None):
@@ -102,7 +113,7 @@ def default_cmd(dump, on, previous=None):
 
 
 def state(run=devices._run, card=devices.scarlett_card):
-    """The PRO X sink now → {"volume": wpctl volume, "default": whether it is the default sink, "output": the default
+    """The PRO X sink now → {"volume": wpctl volume, "muted", "default": whether it is the default sink, "output": the default
     sink when it is another one (the backup Booth moved sound to, or the user's pick), else None}, or None when the
     PRO X sink is gone. output: {"name", "label": its description, "volume": wpctl's, "direct": the Scarlett's Direct
     Monitor when it is the Scarlett's sink and its card is there, else None}."""
@@ -111,7 +122,8 @@ def state(run=devices._run, card=devices.scarlett_card):
     name = devices.find_sink(sinks)
     if name is None:
         return None
-    volume = parse_volume(run("wpctl", "get-volume", str(sinks[name][0])))
+    text = run("wpctl", "get-volume", str(sinks[name][0]))
+    volume = parse_volume(text)
     if volume is None:
         return None
     output = None
@@ -123,7 +135,7 @@ def state(run=devices._run, card=devices.scarlett_card):
             ctrls = scarlett.parse_contents(run("amixer", "-c", card_id, "contents")) if card_id else {}
             output = {"name": default, "label": props.get("node.description") or default, "volume": heard,
                       "direct": scarlett.value(ctrls, scarlett.DIRECT)}
-    return {"volume": volume, "default": name == default, "output": output}
+    return {"volume": volume, "muted": "[MUTED]" in text, "default": name == default, "output": output}
 
 
 OFF_NOTE = "The headset is off: its sidetone and auto power-off come back when it turns on"
@@ -152,7 +164,7 @@ def status(state, monitor=None):
     Off with sound on another output: that one's volume, the one heard."""
     if state is None:
         return "Not connected"
-    volume = f"Volume {round(state['volume'] * 100)} %"
+    volume = "Muted" if state.get("muted") else f"Volume {round(state['volume'] * 100)} %"
     if monitor is None or monitor.on is None:
         return volume
     if monitor.on:

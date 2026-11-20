@@ -1,4 +1,5 @@
-"""The Scarlett's stuck output, heard and restarted (seen 2026-11-13 on the Solo 4th Gen, firmware 2188).
+"""The Scarlett's stuck output, heard and restarted (seen 2026-11-13 on the Solo 4th Gen, firmware 2188;
+it stops the same way on 2417, the update scarlett2 installed that evening: the stops logged on 11-13 and 11-17).
 
 The fault: the Scarlett stops playing while the computer still says it plays. PipeWire's sink runs, ALSA's pointer
 advances, the kernel logs nothing and the inputs keep working; inside the device nothing arrives (its own Level Meter
@@ -14,7 +15,7 @@ stopping, an underrun, the camera streaming, Direct Monitor, Booth Mic's chain a
 Nothing in front of the sink prevents it: noise added to the tone (up to +-4096 of its 24-bit steps) and a 19 kHz tone
 mixed in only move which levels do it (11 of 33 with the 19 kHz tone), and a high-pass that keeps the bass keeps 40 to
 80 Hz. A 30 Hz high-pass was built and measured for this and dropped: 20 and 25 Hz at full scale went through it and
-stopped the device. So this module is the repair; a prevention would be the device's firmware (2188 here).
+stopped the device. So this module is the repair; a prevention would be the device's firmware (2417 doesn't).
 An earlier reading, "content below 20 Hz", came from test tones that sat on such levels by chance.
 
 Heard (Watch): one stream listens to the Scarlett sink's monitor for as long as the sink lasts. It is passive, so the
@@ -58,7 +59,9 @@ STRIKES = 2
 GAIN_S = 5  # the sink's volume is read again this often while sound plays
 RESTART_S = 0.4
 REVIVED = "The Scarlett's output had stopped — Booth restarted it"
-GAVE_UP = "The Scarlett's output has stopped and restarting it didn't help — unplug it and plug it back in"
+RETRY_S = 10  # a restart that didn't help is tried again this often while it stays stopped: the button, pressed later
+GAVE_UP = (f"The Scarlett's output has stopped and restarting it didn't help yet — Booth tries again every {RETRY_S} s; "
+           "unplugging it and plugging it back in fixes it too")
 LISTEN = ("{ stream.capture.sink = true node.dont-reconnect = true node.passive = true "
           "media.class = Stream/Input/Audio/Internal node.name = booth.output.watch }")
 _VALUES = re.compile(r": values=(\d+(?:,\d+)*)")
@@ -147,14 +150,15 @@ class Watch:
     """ensure() from the service's tick, on a worker: the listener started when the Scarlett's sink is there and none
     runs, and ended when the sink it listens to was replaced (a replug). stop() at quit. say(text) is called on the
     listener's thread with REVIVED once sound is heard inside the device after a restart, or GAVE_UP when it isn't:
-    then nothing is restarted again until the device is heard (a replug)."""
+    said once, then it is restarted again every RETRY_S while it stays stopped (sound that set it off may have ended,
+    as when Restart Output is pressed later), until it is heard. `failed`: when it last gave up, None while it hasn't."""
 
     def __init__(self, say, run=devices._run, card=devices.scarlett_card, restart=restart, listen=listen,
                  clock=time.monotonic, log=lambda text: print(text, file=sys.stderr)):
         self.say, self.run, self.card, self.restart, self.listen = say, run, card, restart, listen
         self.clock, self.log, self.lock = clock, log, threading.Lock()
         self.proc, self.thread, self.found, self.dumped = None, None, None, float("-inf")
-        self.loud, self.strikes, self.skip, self.pending, self.failed = 0, 0, 0, False, False
+        self.loud, self.strikes, self.skip, self.pending, self.failed = 0, 0, 0, False, None
 
     def ensure(self):
         if not self.lock.acquire(blocking=False):  # the last tick's pw-dump still out
@@ -211,9 +215,9 @@ class Watch:
         if len(meters) != POINTS:  # unreadable, or another device's layout
             return None
         if any(meters[i] for i in PLAYBACK):  # heard inside the device
-            said, self.strikes, self.pending, self.failed = REVIVED if self.pending else None, 0, False, False
+            said, self.strikes, self.pending, self.failed = REVIVED if self.pending else None, 0, False, None
             return said
-        if not self.strikes and not self.failed:  # the first silent read: the volume as it is right now, first
+        if not self.strikes and self.failed is None:  # the first silent read: the volume as it is right now, first
             self.refresh()
             if level * self.found["gain"] < SENT_MIN:
                 self.loud = 0
@@ -222,10 +226,10 @@ class Watch:
         if self.strikes < STRIKES:
             return None
         self.loud = self.strikes = 0
-        if self.pending:  # the restart didn't help
-            self.pending, self.failed = False, True
-            return GAVE_UP
-        if self.failed:
+        if self.pending:  # the restart didn't help: said the first time only
+            said, self.pending, self.failed = GAVE_UP if self.failed is None else None, False, self.clock()
+            return said
+        if self.failed is not None and self.clock() - self.failed < RETRY_S:
             return None
         self.log(f"Booth: the Scarlett's output was stuck (sent {level * self.found['gain']:.3f}, its meter {meters}); "
                  f"restarting it. Streams running: {', '.join(self.found['apps']) or 'none'}")  # to find what starts it
